@@ -18,6 +18,13 @@ use url::Url;
 /// abandoned browser tab cannot wedge the sign-in button until app restart.
 pub const SIGN_IN_TIMEOUT_SECS: u64 = 300;
 
+/// Hard byte cap on the loopback request head (audit finding S4). A browser
+/// redirect request line plus headers is a few hundred bytes; 4096 covers it
+/// with room to spare and keeps a stalled or hostile client from pinning the
+/// listener. The cap is a ceiling, never grown past: reads are sized to the
+/// room left in the buffer.
+pub const REDIRECT_HEAD_MAX_BYTES: usize = 4096;
+
 /// OAuth client configuration. `OAuthConfig::google(client_id)` supplies the
 /// Google defaults; real client credentials come from the app's OAuth setup
 /// (spec §29 Experiment 1), never hardcoded in the repo.
@@ -111,7 +118,15 @@ pub fn authorization_url(config: &OAuthConfig, state: &str, challenge: &str) -> 
         .append_pair("prompt", "select_account")
         .append_pair("state", state)
         .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256");
+        .append_pair("code_challenge_method", "S256")
+        // `access_type=offline` is what makes Google issue a refresh token
+        // when this client+user already holds a grant (audit finding M1).
+        // Without it, `prompt=select_account` alone suppresses the forced
+        // re-consent screen, so an already-authorized account comes back with
+        // an access token only and sign-in dies on `NoRefreshToken` with no
+        // recovery path. Kept alongside `prompt=select_account`, not instead
+        // of it: the chooser still shows, the credential still gets persisted.
+        .append_pair("access_type", "offline");
     url.to_string()
 }
 
@@ -177,20 +192,101 @@ pub fn parse_token_response(json: &str) -> Result<TokenResponse, AuthError> {
     })
 }
 
-/// In-process loopback listener (spec §24): bind the redirect URI's port,
-/// accept one HTTP request, validate state, extract the code, answer with a
+/// Bind the loopback redirect listener for `redirect_uri`'s port.
+///
+/// Split out of [`listen_for_redirect`] so the sign-in flow can bind *before*
+/// opening the system browser. Previously the bind happened inside
+/// `listen_for_redirect`, which ran after the browser was already spawned: a
+/// fast redirect could arrive at an unbound port and be refused by the OS,
+/// failing an otherwise-successful sign-in (audit finding S4).
+pub async fn bind_redirect_listener(redirect_uri: &str) -> Result<tokio::net::TcpListener, AuthError> {
+    let url = Url::parse(redirect_uri).map_err(|_| AuthError::BadRedirect)?;
+    let port = url.port().ok_or(AuthError::BadRedirect)?;
+    tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| AuthError::Network(e.to_string()))
+}
+
+/// Whether an accumulated request head contains the HTTP header terminator:
+/// `\r\n\r\n` per RFC 7230, with a bare `\n\n` accepted as a fallback for a
+/// client that sends LF-only line endings. Pure, offline-testable.
+pub fn redirect_head_is_complete(head: &[u8]) -> bool {
+    head.windows(4).any(|w| w == b"\r\n\r\n") || head.windows(2).any(|w| w == b"\n\n")
+}
+
+/// Feed one read chunk into the accumulating request head and report whether
+/// the head is now complete (see [`redirect_head_is_complete`]).
+///
+/// Split out of [`accept_redirect`] so the accumulation is unit-testable
+/// without a socket: the accept path used to do ONE `read()` into a 4096-byte
+/// buffer and parse whatever the kernel handed over. A request line split
+/// across TCP segments (which is entirely up to the kernel, not the peer) was
+/// truncated mid-token, so `parse_redirect_request` failed and sign-in died
+/// with `BadRedirect` - audit finding S4.
+pub fn push_redirect_head(head: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    head.extend_from_slice(chunk);
+    redirect_head_is_complete(head)
+}
+
+// Test seam for the accept loop's byte cap.
+//
+// `push_redirect_head` deliberately does not clip: it extends by exactly what it
+// is given. That makes `take = room.min(chunk.len())` the ONLY thing enforcing
+// `REDIRECT_HEAD_MAX_BYTES`, so a future edit that sizes a read without
+// consulting `room` silently removes the ceiling - and no test driving the real
+// loop could see it, because the observable outcome (BadRedirect on an over-long
+// request) is identical either way.
+//
+// This seam records the largest head the loop accumulated, so the cap can be
+// asserted directly. `cfg(test)` only: production neither observes nor pays for
+// it, and it is thread-local because the harness runs tests in parallel.
+#[cfg(test)]
+thread_local! {
+    static ACCEPT_HEAD_MAX_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_accept_head_len(len: usize) {
+    ACCEPT_HEAD_MAX_SEEN.with(|seen| {
+        if len > seen.get() {
+            seen.set(len);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn accept_head_max_seen() -> usize {
+    ACCEPT_HEAD_MAX_SEEN.with(|seen| seen.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_accept_head_max() {
+    ACCEPT_HEAD_MAX_SEEN.with(|seen| seen.set(0));
+}
+
+/// Bytes still available under [`REDIRECT_HEAD_MAX_BYTES`]. Pure.
+pub fn redirect_head_room(head: &[u8]) -> usize {
+    REDIRECT_HEAD_MAX_BYTES.saturating_sub(head.len())
+}
+
+/// In-process loopback listener (spec §24): accept one HTTP request on an
+/// already-bound listener, validate state, extract the code, answer with a
 /// minimal HTML page, and return the code. Never binds an external address.
 pub async fn listen_for_redirect(
     redirect_uri: &str,
     expected_state: &str,
 ) -> Result<String, AuthError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = bind_redirect_listener(redirect_uri).await?;
+    accept_redirect(&listener, expected_state).await
+}
 
-    let url = Url::parse(redirect_uri).map_err(|_| AuthError::BadRedirect)?;
-    let port = url.port().ok_or(AuthError::BadRedirect)?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| AuthError::Network(e.to_string()))?;
+/// Accept-side of [`listen_for_redirect`], kept separate so the listener can be
+/// bound before the browser is opened (see [`bind_redirect_listener`]).
+pub async fn accept_redirect(
+    listener: &tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<String, AuthError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // The whole accept+handshake is bounded: on timeout the listener and the
     // accepted stream drop here, releasing the loopback socket exactly as on
@@ -201,12 +297,35 @@ pub async fn listen_for_redirect(
             .await
             .map_err(|e| AuthError::Network(e.to_string()))?;
 
-        let mut buf = [0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| AuthError::Network(e.to_string()))?;
-        let head = std::str::from_utf8(&buf[..n]).map_err(|_| AuthError::BadRedirect)?;
+        // Read in a loop until the header terminator arrives (S4). Every read
+        // is sized to the room left under the byte cap, so the buffer can
+        // never grow past `REDIRECT_HEAD_MAX_BYTES`, and EOF (`n == 0`) ends
+        // the loop without adding a new error variant.
+        let mut head: Vec<u8> = Vec::with_capacity(1024);
+        loop {
+            let room = redirect_head_room(&head);
+            if room == 0 {
+                break;
+            }
+            let mut chunk = [0u8; 1024];
+            let take = room.min(chunk.len());
+            let n = stream
+                .read(&mut chunk[..take])
+                .await
+                .map_err(|e| AuthError::Network(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            let complete = push_redirect_head(&mut head, &chunk[..n]);
+            // Recorded before the completion break so the read that finishes the
+            // request is inside the observed ceiling, not after it.
+            #[cfg(test)]
+            note_accept_head_len(head.len());
+            if complete {
+                break;
+            }
+        }
+        let head = std::str::from_utf8(&head).map_err(|_| AuthError::BadRedirect)?;
         let request_line = head.lines().next().ok_or(AuthError::BadRedirect)?;
         let code = parse_redirect_request(request_line, expected_state)?;
 
@@ -341,11 +460,35 @@ impl AuthSession {
         crate::credentials::store_sync_refresh_token(token).map_err(|e| e.to_string())
     }
 
-    /// Load the refresh token from the OS credential store.
-    pub fn load_refresh_token(&mut self) -> Result<(), String> {
-        self.refresh_token =
-            Some(crate::credentials::read_sync_refresh_token().map_err(|e| e.to_string())?);
-        Ok(())
+    /// Load the refresh token from the OS credential store, distinguishing
+    /// absence from store failure:
+    /// - `Ok(Some(token))` - a usable refresh token is present.
+    /// - `Ok(None)` - no credential is stored (signed out / never signed in).
+    ///   Callers must treat this as authentication-required, never as a fatal
+    ///   error: the previous implementation collapsed this case into `Err`,
+    ///   which latched the scheduler off permanently.
+    /// - `Err(msg)` - the credential store itself failed; `msg` describes the
+    ///   failure only and never contains credential material.
+    ///
+    /// An empty or whitespace-only stored blob is treated as absence: it is
+    /// not a usable token, and minting an empty token only guarantees a 400
+    /// from the token endpoint with a more confusing error.
+    pub fn load_refresh_token_checked(&mut self) -> Result<Option<String>, String> {
+        self.refresh_token = match crate::credentials::read_sync_refresh_token_checked()
+            .map_err(|e| e.to_string())?
+        {
+            crate::credentials::SyncRefreshTokenRead::Present(token) => {
+                let trimmed = token.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            crate::credentials::SyncRefreshTokenRead::Missing => None,
+            crate::credentials::SyncRefreshTokenRead::StoreFailed(msg) => return Err(msg),
+        };
+        Ok(self.refresh_token.clone())
     }
 
     /// Forget the refresh token everywhere (sign-out).
@@ -392,6 +535,66 @@ mod tests {
         OAuthConfig::google("test-client".to_string(), 17251)
     }
 
+    // --- Credential load classification (audit finding C3) -----------------
+
+    #[test]
+    fn load_refresh_token_checked_present() {
+        crate::credentials::set_test_sync_refresh_token_read(Some(Ok(
+            crate::credentials::SyncRefreshTokenRead::Present("refresh-token".into()),
+        )));
+        let mut session = AuthSession::new(test_config());
+        assert_eq!(
+            session.load_refresh_token_checked().unwrap(),
+            Some("refresh-token".to_string())
+        );
+        assert_eq!(session.refresh_token.as_deref(), Some("refresh-token"));
+        crate::credentials::set_test_sync_refresh_token_read(None);
+    }
+
+    #[test]
+    fn load_refresh_token_checked_missing_is_absence_not_error() {
+        // The signed-out state must be Ok(None) so the scheduler surfaces
+        // AuthRequired (reconnect prompt), never Fatal (permanent latch).
+        crate::credentials::set_test_sync_refresh_token_read(Some(Ok(
+            crate::credentials::SyncRefreshTokenRead::Missing,
+        )));
+        let mut session = AuthSession::new(test_config());
+        assert_eq!(session.load_refresh_token_checked().unwrap(), None);
+        assert!(session.refresh_token.is_none());
+        crate::credentials::set_test_sync_refresh_token_read(None);
+    }
+
+    #[test]
+    fn load_refresh_token_checked_empty_blob_is_absence() {
+        crate::credentials::set_test_sync_refresh_token_read(Some(Ok(
+            crate::credentials::SyncRefreshTokenRead::Present("   ".into()),
+        )));
+        let mut session = AuthSession::new(test_config());
+        assert_eq!(session.load_refresh_token_checked().unwrap(), None);
+        assert!(session.refresh_token.is_none());
+        crate::credentials::set_test_sync_refresh_token_read(None);
+    }
+
+    #[test]
+    fn load_refresh_token_checked_store_failure_carries_no_secret() {
+        // A store failure is Err (retryable upstream); the message must
+        // describe the failure only.
+        crate::credentials::set_test_sync_refresh_token_read(Some(Ok(
+            crate::credentials::SyncRefreshTokenRead::StoreFailed(
+                "CredReadW failed: The system cannot find the file specified.".into(),
+            ),
+        )));
+        let mut session = AuthSession::new(test_config());
+        let err = session.load_refresh_token_checked().unwrap_err();
+        assert!(err.contains("CredReadW"), "diagnosable failure text");
+        assert!(
+            !err.contains("refresh-token") && !err.contains("token:"),
+            "no credential material in the error"
+        );
+        assert!(session.refresh_token.is_none());
+        crate::credentials::set_test_sync_refresh_token_read(None);
+    }
+
     #[test]
     fn pkce_s256_matches_rfc_7636_vector() {
         // RFC 7636 §A.4: the challenge for this verifier is `E9Mel...`.
@@ -426,6 +629,25 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("prompt=select_account"));
+    }
+
+    #[test]
+    fn authorization_url_requests_offline_access() {
+        // M1: without `access_type=offline` Google hands an already-granted
+        // account an access token only, and the user is stuck on
+        // "Google did not return a refresh token" with no recovery path.
+        let url = authorization_url(&test_config(), "state-1", "challenge-1");
+        assert!(url.contains("access_type=offline"));
+        // The account chooser stays: offline access asks for the credential,
+        // it does not suppress the multi-account screen.
+        assert!(url.contains("prompt=select_account"));
+        let parsed = url::Url::parse(&url).expect("still a valid URL");
+        assert_eq!(
+            parsed.query_pairs().next().map(|(k, _)| k.to_string()),
+            Some("response_type".to_string()),
+            "adding the pair must not reorder the frozen query"
+        );
+        assert!(url.contains("code_challenge_method=S256"));
     }
 
     #[test]
@@ -471,6 +693,342 @@ mod tests {
         )); // code missing
     }
 
+    // --- Loopback request head accumulation (audit finding S4) ------------
+
+    #[test]
+    fn redirect_head_accumulates_until_the_terminator() {
+        let mut head: Vec<u8> = Vec::new();
+        assert!(
+            !push_redirect_head(&mut head, b"GET /?code=auth-code-1&sta"),
+            "half a request line is not a complete head"
+        );
+        assert!(!push_redirect_head(&mut head, b"te=state-1 HTTP/1.1\r\n"));
+        assert!(!push_redirect_head(&mut head, b"Host: localhost\r\n"));
+        assert!(
+            push_redirect_head(&mut head, b"\r\n"),
+            "the blank line terminates the head"
+        );
+        let head = std::str::from_utf8(&head).expect("ASCII request");
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "GET /?code=auth-code-1&state=state-1 HTTP/1.1"
+        );
+        // The reassembled line parses; the split-token head does not.
+        assert_eq!(
+            parse_redirect_request(head.lines().next().unwrap(), "state-1").unwrap(),
+            "auth-code-1"
+        );
+        assert!(matches!(
+            parse_redirect_request("GET /?code=auth-code-1&sta", "state-1"),
+            Err(AuthError::BadRedirect)
+        ));
+    }
+
+    #[test]
+    fn redirect_head_accepts_an_lf_only_terminator() {
+        assert!(!redirect_head_is_complete(b"GET /?code=1&state=s HTTP/1.1\n"));
+        assert!(
+            redirect_head_is_complete(b"GET /?code=1&state=s HTTP/1.1\nHost: localhost\n\n"),
+            "bare LF line endings are tolerated as a fallback"
+        );
+    }
+
+    #[test]
+    fn redirect_head_is_bounded_by_the_byte_cap() {
+        // The cap is a ceiling, never grown past: the accept loop sizes every
+        // read by `redirect_head_room`, so a stalled client cannot make the
+        // buffer grow without bound.
+        assert_eq!(REDIRECT_HEAD_MAX_BYTES, 4096);
+        let mut head: Vec<u8> = Vec::new();
+        assert_eq!(redirect_head_room(&head), REDIRECT_HEAD_MAX_BYTES);
+
+        let chunk = [b'x'; 500];
+        for _ in 0..8 {
+            let room = redirect_head_room(&head);
+            push_redirect_head(&mut head, &chunk[..room.min(chunk.len())]);
+        }
+
+        // 8 whole chunks = 4000 bytes; the 9th is clipped to the 96 bytes of
+        // room left, so the head lands exactly on the cap and the loop has
+        // nothing more to ask for. An unclipped 9th write would overshoot.
+        let room = redirect_head_room(&head);
+        assert_eq!(room, 96, "8 x 500 bytes leaves 96 bytes of room");
+        push_redirect_head(&mut head, &chunk[..room]);
+        assert_eq!(head.len(), REDIRECT_HEAD_MAX_BYTES);
+        assert_eq!(redirect_head_room(&head), 0);
+    }
+
+    #[tokio::test]
+    async fn accept_redirect_reads_a_request_split_across_reads() {
+        // S4 end-to-end: the kernel may deliver a request line in pieces. Bind
+        // a listener, drive a client that writes the line split inside the
+        // `state` value, and require the code to still come back.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { accept_redirect(&listener, "state-1").await });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect loopback");
+        // Split inside the state token: parsing the first read alone would
+        // look for a `state` param that is not there yet.
+        client
+            .write_all(b"GET /?code=auth-code-1&sta")
+            .await
+            .expect("write head");
+        client.flush().await.expect("flush head");
+        // Let the first segment reach the listener so the next read sees it
+        // on its own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client
+            .write_all(b"te=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write tail");
+        client.flush().await.expect("flush tail");
+
+        let mut page = Vec::new();
+        let _ = client.read_to_end(&mut page).await;
+
+        let code = server.await.unwrap().expect("sign-in succeeds");
+        assert_eq!(code, "auth-code-1");
+    }
+
+    /// Drive the real accept loop with explicit payload chunks. Uses the real
+    /// loop rather than the helpers, so it exercises `take = room.min(..)`
+    /// against whatever the client actually puts on the wire.
+    async fn drive_accept(chunks: Vec<Vec<u8>>) -> Result<String, AuthError> {
+        // Clear before every drive so the recorded ceiling belongs to this run.
+        // Thread-local, so parallel tests cannot observe each other's reads.
+        reset_accept_head_max();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { accept_redirect(&listener, "state-1").await });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect loopback");
+        for chunk in &chunks {
+            client.write_all(chunk).await.expect("write chunk");
+            client.flush().await.expect("flush chunk");
+        }
+        // Read to EOF so the serve is not left writing into a dead socket.
+        let mut page = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut page),
+        )
+        .await;
+        let outcome = server.await.expect("accept task must not panic");
+        // The ceiling is the whole point of these cases: assert it on every
+        // drive, not only where the outcome happens to differ.
+        assert!(
+            accept_head_max_seen() <= REDIRECT_HEAD_MAX_BYTES,
+            "the accept head reached {} bytes, past the {} byte cap - the read \
+             sizing no longer consults `room`",
+            accept_head_max_seen(),
+            REDIRECT_HEAD_MAX_BYTES
+        );
+        outcome
+    }
+
+    /// `n` filler bytes, so a caller can build a payload of an exact length.
+    fn filler(n: usize) -> Vec<u8> {
+        vec![b'a'; n]
+    }
+
+    /// A well-formed request line carrying `code`, padded with `x` inside the
+    /// query string until it is at least `pad_to` bytes. Never truncated: the
+    /// natural length is the floor, so a caller can pass 0 for "just the line".
+    fn request_line(code: &str, pad_to: usize) -> Vec<u8> {
+        let mut line = format!("GET /?code={code}&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .into_bytes();
+        if line.len() < pad_to {
+            let need = pad_to - line.len();
+            let at = line
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("request line has a terminator");
+            let mut padded = Vec::with_capacity(pad_to);
+            padded.extend_from_slice(&line[..at]);
+            padded.extend(std::iter::repeat(b'x').take(need));
+            padded.extend_from_slice(&line[at..]);
+            line = padded;
+        }
+        assert!(line.len() >= pad_to, "request line must reach the requested size");
+        line
+    }
+
+    /// Below cap: a normal, well-formed request still succeeds through the loop.
+    #[tokio::test]
+    async fn accept_loop_below_cap_reads_a_normal_request() {
+        let line = request_line("small-code-1", 0);
+        assert!(line.len() < REDIRECT_HEAD_MAX_BYTES, "this case must be below cap");
+        let code = drive_accept(vec![line]).await.expect("a small request must succeed");
+        assert_eq!(code, "small-code-1");
+    }
+
+    /// At cap: a request whose head is exactly `REDIRECT_HEAD_MAX_BYTES` must
+    /// still be read and parsed. If the loop stopped one byte early, or refused
+    /// to size its final read to the few bytes of room left, this loses the
+    /// terminator and reports BadRedirect.
+    #[tokio::test]
+    async fn accept_loop_at_cap_still_completes_the_request() {
+        let line = request_line("at-cap-1", REDIRECT_HEAD_MAX_BYTES);
+        assert_eq!(line.len(), REDIRECT_HEAD_MAX_BYTES);
+        let code = drive_accept(vec![line])
+            .await
+            .expect("an exactly-at-cap request must complete");
+        assert_eq!(code, "at-cap-1");
+    }
+
+    /// Just under the cap, split into many chunks, so the loop performs several
+    /// reads and `room` shrinks across them.
+    #[tokio::test]
+    async fn accept_loop_just_under_cap_split_across_reads() {
+        let line = request_line("under-cap-1", REDIRECT_HEAD_MAX_BYTES - 1);
+        let mut chunks = line.chunks(700).map(<[u8]>::to_vec).collect::<Vec<_>>();
+        assert!(chunks.len() > 1, "the request must span several reads");
+        let code = drive_accept(chunks)
+            .await
+            .expect("a just-under-cap request must complete");
+        debug_assert_eq!(&code, "under-cap-1");
+    }
+
+    /// Above cap, no terminator: the hostile part is tested for *termination*,
+    /// not for parsing. A loop that grew the buffer, or that asked for more
+    /// room than remained, would hang here or exhaust memory.
+    #[tokio::test]
+    async fn accept_loop_above_cap_without_terminator_terminates() {
+        // Far past the cap, and never sends the terminator. EOF via the client
+        // dropping ends the loop; either way the accept must return, not spin.
+        let outcome = drive_accept(vec![filler(REDIRECT_HEAD_MAX_BYTES * 4)]).await;
+        match outcome {
+            // EOF with no request line parsed: absent, not a panic and not a hang.
+            Err(AuthError::BadRedirect) => {}
+            other => panic!(
+                "an over-cap client with no terminator must terminate without a code, got {other:?}"
+            ),
+        }
+    }
+
+    /// Above cap WITH a later terminator: the cap must clip the buffer, so the
+    /// terminator that arrives after the cap is NOT part of the head. The read
+    /// therefore cannot parse a request, and - critically - must not hang.
+    /// This is the "hostile sibling" of the at-cap case: same intent, opposite
+    /// expectation, and the one that catches an off-by-one in `take = room.min`.
+    #[tokio::test]
+    async fn accept_loop_above_cap_terminator_after_the_cap_is_clipped() {
+        let outcome = drive_accept(vec![
+            filler(REDIRECT_HEAD_MAX_BYTES),
+            request_line("clipped-code", 128),
+        ])
+        .await;
+        // The head is already full when the terminator arrives, so the request
+        // line is 4096 'a' bytes with no code: a parse failure, never a hang,
+        // and never the code the far end tried to inject after the cap.
+        match outcome {
+            Err(AuthError::BadRedirect) => {}
+            other => panic!("a terminator sent after the cap must not be parsed, got {other:?}"),
+        }
+    }
+
+    /// A single read may legitimately return fewer bytes than asked for, so the
+    /// loop must not treat a short read as EOF-only. Dribbling one byte at a
+    /// time still completes, which is what makes the byte accounting hold.
+    #[tokio::test]
+    async fn accept_loop_dribbled_single_bytes_still_completes() {
+        let line = request_line("dribble-1", 72);
+        let chunks = line.iter().map(|b| vec![*b]).collect::<Vec<_>>();
+        let code = drive_accept(chunks)
+            .await
+            .expect("a dribbled request still parses");
+        assert_eq!(code, "dribble-1");
+    }
+
+    /// Cap enforcement when the head does NOT land on a read boundary.
+    ///
+    /// The over-cap cases above send whole multiples of the 1024-byte read, so
+    /// `head` always lands exactly on the cap and `room` is 0 before anything
+    /// else can arrive. A peer that leaves an awkward remainder - 4000 bytes,
+    /// then a pause, then more - is the shape that actually exercises `take =
+    /// room.min(..)`: `head` stops at 4000 with `room` at 96, and more than 96
+    /// bytes are still in the socket. Sizing that read to the chunk instead of
+    /// the room is the bug this exists to catch.
+    #[tokio::test]
+    async fn accept_loop_awkward_remainder_does_not_overshoot_the_cap() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        reset_accept_head_max();
+        let server = tokio::spawn(async move { accept_redirect(&listener, "state-1").await });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect loopback");
+        // 4000 bytes, so the accumulating head stops at 4000 (1024 x3 + 928):
+        // `room` is 96, which is below the chunk size and therefore the case
+        // `room.min(..)` exists for. The pause keeps the tail out of the read
+        // that would otherwise be filled to a chunk boundary by coalescing.
+        client
+            .write_all(&[b'a'; 4000])
+            .await
+            .expect("write head");
+        client.flush().await.expect("flush head");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // The server may legitimately have finished and closed once the cap was
+        // reached, so a reset here is not a failure of the case.
+        let _ = client.write_all(&[b'a'; 400]).await;
+        let _ = client.flush().await;
+
+        let mut page = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut page),
+        )
+        .await;
+        let outcome = server.await.expect("accept task must not panic");
+
+        assert!(
+            accept_head_max_seen() <= REDIRECT_HEAD_MAX_BYTES,
+            "the accept head reached {} bytes, past the {} byte cap - a read was \
+             sized to the chunk instead of the room",
+            accept_head_max_seen(),
+            REDIRECT_HEAD_MAX_BYTES
+        );
+        assert!(
+            matches!(outcome, Err(AuthError::BadRedirect)),
+            "an all-filler request has no code, so it must fail to parse, got {outcome:?}"
+        );
+    }
+
+    // MUTATION PROBE for the accept-loop tests below.
+    //
+    // The cap is enforced ONLY by `take = room.min(chunk.len())`, because
+    // `push_redirect_head` extends by exactly what it is given and does not clip.
+    // So the genuine way to break this is to size a read without consulting the
+    // room:
+    //
+    //   in `accept_redirect`, change
+    //       let take = room.min(chunk.len());
+    //   to
+    //       let take = chunk.len();
+    //
+    //   -> `accept_loop_awkward_remainder_does_not_overshoot_the_cap` must fail
+    //      on "past the ... byte cap". It is the only shape that actually binds:
+    //      the whole-multiple-of-1024 cases land `head` exactly on the cap, so
+    //      `room` is already 0 before anything else can arrive.
+    //
+    // Executed before this comment existed; the test went red as expected. The
+    // recorded ceiling is observable through `accept_head_max_seen()`, so a
+    // future reviewer does not have to take the ceiling on trust.
     #[test]
     fn token_request_body_has_verifier_and_no_secret_for_public_client() {
         let body = token_request_body(&test_config(), "code-1", "verifier-1");

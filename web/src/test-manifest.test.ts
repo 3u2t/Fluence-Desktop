@@ -40,4 +40,12 @@ test('the test glob matches the test files that exist', () => {
     names.some((n) => n.endsWith('ipc/claim-boundary.test.ts')),
     'claim IPC boundary tests are missing from the glob',
   );
+  assert.ok(
+    names.some((n) => n.endsWith('ipc/sync-boundary.test.ts')),
+    'sync IPC boundary tests are missing from the glob',
+  );
+  assert.ok(
+    names.some((n) => n.endsWith('ipc/dictionary-boundary.test.ts')),
+    'dictionary IPC boundary tests are missing from the glob',
+  );
 });

@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 #[cfg(target_os = "windows")]
 use windows::{
     core::{PCWSTR, PWSTR},
+    Win32::Foundation::ERROR_NOT_FOUND,
     Win32::Security::Credentials::{
         CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
         CRED_PERSIST_ENTERPRISE, CRED_TYPE_GENERIC,
@@ -149,16 +150,202 @@ pub const SYNC_REFRESH_TOKEN_TARGET: &str = "Fluence/Sync/RefreshToken";
 
 /// Persist the sync refresh token (overwrites the previous one, if any).
 pub fn store_sync_refresh_token(token: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        // Test seam for the write path, mirroring the read seam: unit tests must
+        // never write to the real OS credential vault, and they need to be able
+        // to make a write FAIL on demand to cover the persistence boundaries of
+        // the sign-in flow (audit finding S5).
+        if let Some(result) = test_sync_refresh_token_write() {
+            // Always record the attempt, so a test can assert *whether* the
+            // credential write was reached - which is the ordering property S5-a
+            // depends on.
+            let recorded = token.to_string();
+            TEST_SYNC_TOKEN_WRITTEN.with(|o| *o.borrow_mut() = Some(recorded));
+            return result.map_err(anyhow::Error::msg);
+        }
+    }
     store_credential(SYNC_REFRESH_TOKEN_TARGET, "fluence", token)
 }
 
-/// Read the sync refresh token. `Err` means the user must sign in again.
-pub fn read_sync_refresh_token() -> Result<String> {
-    read_credential(SYNC_REFRESH_TOKEN_TARGET)
+/// Outcome of a sync refresh-token read. The three states are deliberately
+/// distinct: **absence** (nothing stored - the normal signed-out state) must
+/// not be conflated with a **store failure** (the credential vault could not
+/// be read at all), because the first asks the user to reconnect while the
+/// second is a transient OS condition that should simply be retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRefreshTokenRead {
+    /// A stored blob was read. May be empty/whitespace (see
+    /// [`AuthSession::load_refresh_token_checked`](crate::sync::auth::AuthSession)).
+    Present(String),
+    /// No credential is stored for the target (signed out / never signed in).
+    Missing,
+    /// The credential store could not be read. The message describes the
+    /// failure only - it never contains credential material.
+    StoreFailed(String),
+}
+
+/// Read the sync refresh token, distinguishing absence from store failure.
+///
+/// `ERROR_NOT_FOUND` from `CredReadW` is the documented "no such credential"
+/// result and maps to [`SyncRefreshTokenRead::Missing`]; every other Win32
+/// error (vault locked, session gone, access denied) is a store failure and is
+/// surfaced verbatim for diagnosis.
+///
+/// TODO(follow-up): `StoreFailed` is classified `Retryable` by the sync pass,
+/// so a *permanently* unavailable vault (Credential Manager service stopped,
+/// a roaming profile that unregisters the vault) would back off to the 60 s
+/// cap and retry forever without ever surfacing `AuthRequired`. Pre-fix this
+/// latched instead, so the change is strictly better, but the permanent case
+/// is still silent. Follow-up: split the non-`ERROR_NOT_FOUND` codes into
+/// transient (`ERROR_ACCESS_DENIED`-style lock) vs. permanent
+/// (`ERROR_INVALID_PARAMETER`, `ERROR_BAD_USERNAME`,
+/// `ERROR_NO_SUCH_LOGON_SESSION`) and map the permanent class to
+/// `AuthRequired`.
+#[cfg(target_os = "windows")]
+pub fn read_sync_refresh_token_checked() -> Result<SyncRefreshTokenRead> {
+    #[cfg(test)]
+    if let Some(v) = test_sync_refresh_token_read() {
+        return v.map_err(anyhow::Error::msg);
+    }
+    let target_wide = to_wide(SYNC_REFRESH_TOKEN_TARGET);
+    let mut pcred: *mut CREDENTIALW = std::ptr::null_mut();
+
+    unsafe {
+        if let Err(e) = CredReadW(
+            PCWSTR(target_wide.as_ptr()),
+            CRED_TYPE_GENERIC,
+            0,
+            &mut pcred,
+        ) {
+            // ERROR_NOT_FOUND (1168): no credential stored. Everything else
+            // is a genuine store failure that must stay diagnosable.
+            if e.code() == ERROR_NOT_FOUND.to_hresult() {
+                return Ok(SyncRefreshTokenRead::Missing);
+            }
+            return Ok(SyncRefreshTokenRead::StoreFailed(format!(
+                "CredReadW failed: {}",
+                e
+            )));
+        }
+        if pcred.is_null() {
+            return Ok(SyncRefreshTokenRead::Missing);
+        }
+
+        let cred = &*pcred;
+        let blob =
+            std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
+        let secret = String::from_utf8_lossy(blob).to_string();
+        CredFree(pcred as *mut _);
+        Ok(SyncRefreshTokenRead::Present(secret))
+    }
+}
+
+/// Non-Windows builds have no credential vault: report a (permanent,
+/// diagnosable) store failure rather than pretending the user is signed out.
+#[cfg(not(target_os = "windows"))]
+pub fn read_sync_refresh_token_checked() -> Result<SyncRefreshTokenRead> {
+    #[cfg(test)]
+    if let Some(v) = test_sync_refresh_token_read() {
+        return v.map_err(anyhow::Error::msg);
+    }
+    Err(anyhow!("Credential Manager not supported on this platform"))
+}
+
+// Test seam: unit tests override the OS credential read so they never touch
+// the real vault. Thread-local, so parallel tests stay isolated.
+#[cfg(test)]
+thread_local! {
+    static TEST_SYNC_TOKEN_READ: std::cell::RefCell<
+        Option<Result<SyncRefreshTokenRead, String>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_sync_refresh_token_read(v: Option<Result<SyncRefreshTokenRead, String>>) {
+    TEST_SYNC_TOKEN_READ.with(|o| *o.borrow_mut() = v);
+}
+
+#[cfg(test)]
+fn test_sync_refresh_token_read() -> Option<Result<SyncRefreshTokenRead, String>> {
+    TEST_SYNC_TOKEN_READ.with(|o| o.borrow().clone())
+}
+
+// Write-path test seam, deliberately symmetric with the read seam above.
+// Thread-local so parallel tests stay isolated; `None` means "not armed", which
+// falls through to the real store.
+#[cfg(test)]
+thread_local! {
+    static TEST_SYNC_TOKEN_WRITE: std::cell::RefCell<Option<Result<(), String>>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_SYNC_TOKEN_WRITTEN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm or disarm the write seam. `Some(Ok(()))` succeeds without the vault,
+/// `Some(Err(msg))` fails with `msg`, `None` uses the real store.
+#[cfg(test)]
+pub(crate) fn set_test_sync_refresh_token_write(v: Option<Result<(), String>>) {
+    TEST_SYNC_TOKEN_WRITE.with(|o| *o.borrow_mut() = v);
+    TEST_SYNC_TOKEN_WRITTEN.with(|o| *o.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn test_sync_refresh_token_write() -> Option<Result<(), String>> {
+    TEST_SYNC_TOKEN_WRITE.with(|o| o.borrow().clone())
+}
+
+/// The token value the seam last recorded, or `None` if no write was attempted.
+/// Lets a test assert that a code path did or did not reach the credential write.
+#[cfg(test)]
+pub(crate) fn test_sync_refresh_token_written() -> Option<String> {
+    TEST_SYNC_TOKEN_WRITTEN.with(|o| o.borrow().clone())
+}
+
+// Delete-path test seam, symmetric with the read/write seams above.
+#[cfg(test)]
+thread_local! {
+    static TEST_SYNC_TOKEN_DELETE: std::cell::RefCell<Option<Result<(), String>>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_SYNC_TOKEN_DELETED: std::cell::RefCell<Option<()>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm or disarm the delete seam. `Some(Ok(()))` succeeds without the vault,
+/// `Some(Err(msg))` fails, `None` uses the real store.
+#[cfg(test)]
+pub(crate) fn set_test_sync_refresh_token_delete(v: Option<Result<(), String>>) {
+    TEST_SYNC_TOKEN_DELETE.with(|o| *o.borrow_mut() = v);
+    TEST_SYNC_TOKEN_DELETED.with(|o| *o.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn test_sync_refresh_token_delete() -> Option<Result<(), String>> {
+    TEST_SYNC_TOKEN_DELETE.with(|o| o.borrow().clone())
+}
+
+/// Whether a credential delete was attempted while the seam was armed. This is
+/// what makes a "must not destroy the credential" assertion observable: reading
+/// the read seam cannot see a delete, because the seam is just a thread-local
+/// value the vault never touches.
+#[cfg(test)]
+pub(crate) fn test_sync_refresh_token_deleted() -> bool {
+    TEST_SYNC_TOKEN_DELETED.with(|o| o.borrow().is_some())
 }
 
 /// Forget the sync refresh token (sign-out).
 pub fn delete_sync_refresh_token() -> Result<()> {
+    #[cfg(test)]
+    {
+        // Test seam for the delete path. Two reasons: unit tests must never
+        // delete a real vault credential, and a test asserting that some recovery
+        // path is *non-destructive* needs an observable signal that a delete was
+        // even attempted - reading the read seam says nothing about it.
+        if let Some(result) = test_sync_refresh_token_delete() {
+            TEST_SYNC_TOKEN_DELETED.with(|o| *o.borrow_mut() = Some(()));
+            return result.map_err(anyhow::Error::msg);
+        }
+    }
     delete_credential(SYNC_REFRESH_TOKEN_TARGET)
 }
 
@@ -303,6 +490,42 @@ mod tests {
     fn get_stt_target_spaces_to_underscores() {
         let t = get_stt_target("My Provider");
         assert_eq!(t, "Fluence/STT_ApiKey/my_provider");
+    }
+
+    // --- Sync refresh-token read classification (audit finding C3) ---------
+
+    #[test]
+    fn sync_token_read_seam_distinguishes_present_missing_and_store_failure() {
+        // Present
+        set_test_sync_refresh_token_read(Some(Ok(SyncRefreshTokenRead::Present(
+            "token-blob".into(),
+        ))));
+        assert_eq!(
+            read_sync_refresh_token_checked().unwrap(),
+            SyncRefreshTokenRead::Present("token-blob".into())
+        );
+
+        // Missing (the normal signed-out state)
+        set_test_sync_refresh_token_read(Some(Ok(SyncRefreshTokenRead::Missing)));
+        assert_eq!(
+            read_sync_refresh_token_checked().unwrap(),
+            SyncRefreshTokenRead::Missing
+        );
+
+        // Store failure, surfaced without credential material
+        set_test_sync_refresh_token_read(Some(Ok(SyncRefreshTokenRead::StoreFailed(
+            "CredReadW failed: Element not found.".into(),
+        ))));
+        assert_eq!(
+            read_sync_refresh_token_checked().unwrap(),
+            SyncRefreshTokenRead::StoreFailed("CredReadW failed: Element not found.".into())
+        );
+
+        // Hard error (e.g. unsupported platform) propagates as Err.
+        set_test_sync_refresh_token_read(Some(Err("vault unavailable".into())));
+        assert!(read_sync_refresh_token_checked().is_err());
+
+        set_test_sync_refresh_token_read(None);
     }
 
     // FIX-02: canonical slug matrix. Every generated target must pass the

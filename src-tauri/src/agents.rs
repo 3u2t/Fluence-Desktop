@@ -577,11 +577,15 @@ pub fn claim_legacy_agent(
     // already keeps its legacy row. Accepted cost, stated plainly: signing out
     // re-exposes the row as device-local and runnable, which is the user's own
     // pre-existing data and is already true today for skipped and refused rows.
-    Ok(crate::account_scope::claim_legacy_account_agents(
+    //
+    // S6: the claim returns `Err` when the durable save fails, so a failed
+    // claim surfaces as an error toast. It never returns an empty Ok that the
+    // UI would render as "Nothing to add".
+    crate::account_scope::claim_legacy_account_agents(
         Some(&hash),
         &legacy,
         Some(&only),
-    ))
+    )
 }
 
 #[tauri::command]

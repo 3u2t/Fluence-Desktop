@@ -104,7 +104,17 @@ custom-protocol = ["tauri/custom-protocol"]
 opt-level = "s"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Release MUST unwind. `finish_guarded` in src/sync/scheduler.rs wraps a sync
+# pass in `std::panic::catch_unwind` and maps a mid-pass panic to a fatal
+# outcome (single-flight latch released, scheduling waits for a manual
+# command). That guard is a no-op when panics abort: under `panic = "abort"`
+# `catch_unwind` can never catch anything in a release build, so a bug
+# mid-pass terminates the whole process instead of latching the scheduler -
+# and the guard's tests (`panic_in_pass_releases_single_flight_latch`,
+# `successful_pass_after_crash_resets_state`) only prove anything under
+# panic=unwind. The size/speed settings above are what buy the release win,
+# so keep them and unwind.
+panic = "unwind"
 strip = true
 
 [profile.dev]

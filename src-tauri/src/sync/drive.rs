@@ -345,6 +345,25 @@ impl GoogleDriveStore {
             client: reqwest::blocking::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(8))
                 .timeout(std::time::Duration::from_secs(30))
+                // S3: explicit redirect policy. Chosen: `Policy::none()`.
+                //
+                // Every request this client makes is a `bearer_auth` call to
+                // the Drive metadata/upload hosts, so the strongest safe
+                // default is to follow nothing at all - a redirect can then
+                // never carry the token anywhere. reqwest 0.12.28's default
+                // (`limited(10)`, `https_only = false`) follows a same-host
+                // `https` -> `http` hop with `Authorization` still attached,
+                // because it only strips that header when the HOST changes.
+                //
+                // Drive's appDataFolder CRUD never legitimately redirects, so
+                // nothing production-shaped is lost. A stray 3xx is not an
+                // error: `stop()` semantics mean it surfaces as a response,
+                // which the existing classification maps to a permanent
+                // `SyncError::Rejected` (see the redirect test below and
+                // `classify_status_maps_per_sec_23`) - never the opaque
+                // transport error that `transport_err` would report as
+                // `Retryable` and back off on forever.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Failed to build blocking Drive client"),
             access_token,
@@ -540,7 +559,7 @@ fn list_files_query(folder_id: &str, page_token: Option<&str>, spaces: &str) -> 
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("q", &q);
         pairs.append_pair("spaces", spaces);
-        pairs.append_pair("fields", "files(id,name,version),nextPageToken");
+        pairs.append_pair("fields", "files(id,name,version,size),nextPageToken");
         pairs.append_pair("pageSize", "1000");
         if let Some(token) = page_token {
             pairs.append_pair("pageToken", token);
@@ -579,12 +598,16 @@ pub fn parse_version_from_response(json: &str) -> Option<String> {
 
 /// Metadata for a domain file inside appDataFolder/fluence/v1. `version` is
 /// Drive's monotonically increasing per-file revision used for staleness
-/// detection (v1.2 concurrency model).
+/// detection (v1.2 concurrency model). `size` is the Drive-reported byte
+/// size when the listing carries it (F5: lets the engine skip downloading an
+/// oversized file it would only discard); `None` for folders, Google-native
+/// files, and listings that omit it — callers then download and check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainFileMeta {
     pub file_id: String,
     pub name: String,
     pub version: Option<String>,
+    pub size: Option<u64>,
 }
 
 /// Domain drive seam - one file per domain (dictionary, snippets, stats,
@@ -651,6 +674,18 @@ pub trait DomainDriveStore {
     fn drive_account_email(&mut self) -> Result<Option<String>, SyncError>;
 }
 
+/// Extract Drive's `size` field (int64 serialized as a string; bare numbers
+/// tolerated defensively, like `version`). `None` when absent or unparseable
+/// (folders, Google-native files, trimmed listings) — never an error: the
+/// caller downloads and checks the bytes instead (F5).
+pub fn parse_size_from_response(value: &serde_json::Value) -> Option<u64> {
+    match value.get("size") {
+        Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        _ => None,
+    }
+}
+
 /// Parse a domain listing page extracting `id`, `name` and `version`.
 /// Corrupt or partial pages are treated as failures (caller aborts before mutation).
 pub fn parse_domain_listing(
@@ -681,6 +716,7 @@ pub fn parse_domain_listing(
                         file_id: id.to_string(),
                         name: name.to_string(),
                         version,
+                        size: parse_size_from_response(item),
                     })
                 }
                 _ => return Err(SyncError::Rejected("partial domain listing".to_string())),
@@ -782,6 +818,7 @@ impl GoogleDriveStore {
                             file_id: id.to_string(),
                             name: name.to_string(),
                             version: None,
+                            size: parse_size_from_response(item),
                         })
                     }
                     _ => return Err(SyncError::Rejected("partial listing response".to_string())),
@@ -918,6 +955,7 @@ impl DomainDriveStore for GoogleDriveStore {
                     file_id: format!("{}-dup", first.file_id),
                     name: first.name.clone(),
                     version: Some("999".to_string()),
+                    size: first.size,
                 };
                 log::warn!(
                     "FAULT INJECTED duplicate list_v1_files: cloning {} -> {}",
@@ -931,6 +969,7 @@ impl DomainDriveStore for GoogleDriveStore {
                     file_id: format!("{}-dup", first.file_id),
                     name: first.name.clone(),
                     version: Some("999".to_string()),
+                    size: first.size,
                 };
                 log::warn!(
                     "FAULT INJECTED duplicate list_v1_files: cloning {} -> {}",
@@ -945,11 +984,13 @@ impl DomainDriveStore for GoogleDriveStore {
                     file_id: "dup-1".to_string(),
                     name: DICT_FILE.to_string(),
                     version: Some("1".to_string()),
+                    size: None,
                 };
                 let dup2 = DomainFileMeta {
                     file_id: "dup-2".to_string(),
                     name: DICT_FILE.to_string(),
                     version: Some("2".to_string()),
+                    size: None,
                 };
                 log::warn!("FAULT INJECTED duplicate list_v1_files: synthetic pair dup-1/dup-2");
                 all.push(dup1);
@@ -1384,6 +1425,62 @@ mod tests {
         assert_eq!(calls.get(), 0, "refresh is reserved for 401 responses");
     }
 
+    /// Serves exactly one request with a `302` and a `Location` header, then
+    /// closes. Used to prove the Drive blocking client really carries an
+    /// explicit redirect policy: reqwest's default would follow this hop.
+    fn redirecting_server(location: String) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        addr
+    }
+
+    #[test]
+    fn send_surfaces_a_redirect_instead_of_following_it() {
+        // S3: the Drive client follows NOTHING (`redirect::Policy::none()`), so
+        // the bearer token can never ride a redirect. The 3xx is handed back
+        // as a response instead of an error, which is what lets the existing
+        // classification map it to a permanent `Rejected` - and it must not
+        // panic or reach the `Location` target.
+        let (target_addr, target_server) = loopback_server(vec![(200, "must-not-be-fetched")]);
+        let origin = redirecting_server(format!("http://{target_addr}/redirected"));
+        let mut store = GoogleDriveStore::with_upload_base(
+            "live-token".to_string(),
+            "http://127.0.0.1:0".to_string(),
+        );
+        let resp = store
+            .send(|client, token| {
+                client
+                    .request(reqwest::Method::GET, format!("http://{origin}/file?alt=media"))
+                    .bearer_auth(token)
+            })
+            .expect("a refused redirect is a response, not a transport error");
+        let status = resp.status().as_u16();
+        drop(resp);
+
+        assert_eq!(status, 302, "the redirect target is not requested");
+        assert!(
+            matches!(
+                classify_status_with_retry_after(status, None, ""),
+                Err(SyncError::Rejected(_))
+            ),
+            "a refused hop must classify as permanent, not retryable"
+        );
+        assert!(
+            !target_server.is_finished(),
+            "the Location target was never contacted"
+        );
+    }
+
     #[test]
     fn backoff_doubles_up_to_cap_and_resets() {
         let mut b = Backoff::default();
@@ -1557,6 +1654,9 @@ mod tests {
         assert!(q.contains("q=%27folder-1%27+in+parents+and+trashed+%3D+false"));
         assert!(q.contains("spaces=appDataFolder"));
         assert!(q.contains("version"));
+        // F5: the listing must carry sizes so oversized files can be skipped
+        // without downloading them every pass.
+        assert!(q.contains("size"));
         assert!(q.contains("pageSize=1000"));
         let q2 = list_v1_files_query("folder-1", Some("next-1"));
         assert!(q2.contains("pageToken=next-1"));
@@ -1577,6 +1677,26 @@ mod tests {
             parse_domain_listing(r#"{"files":[{"id":"a","name":"x.json","version":42}]}"#)
                 .expect("numeric version parses");
         assert_eq!(numeric[0].version.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn parse_domain_listing_extracts_sizes() {
+        // F5: Drive serializes int64 sizes as strings; bare numbers tolerated.
+        // Absent or garbage sizes are None (folders, trimmed listings) — never
+        // a listing failure: the caller downloads and checks instead.
+        let (files, _) = parse_domain_listing(
+            r#"{"files":[{"id":"a","name":"dictionary.json","version":"7","size":"123"},{"id":"b","name":"stats.json","size":456},{"id":"c","name":"snippets.json"}]}"#,
+        )
+        .expect("valid listing");
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].size, Some(123));
+        assert_eq!(files[1].size, Some(456));
+        assert_eq!(files[2].size, None);
+
+        let (garbage, _) =
+            parse_domain_listing(r#"{"files":[{"id":"a","name":"x.json","size":"huge"}]}"#)
+                .expect("garbage size must not fail the listing");
+        assert_eq!(garbage[0].size, None);
     }
 
     #[test]

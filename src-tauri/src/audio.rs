@@ -1285,7 +1285,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_resample_perf() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        // Poison-tolerant on purpose: if the other perf test panics while
+        // holding TEST_LOCK it poisons the mutex, and `.unwrap()` here turns one
+        // real failure into a second, unrelated-looking "PoisonError" that hides
+        // the actual cause. Recovering the guard keeps the failure diagnosed as
+        // what it was.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sample_rate = 48000;
         NATIVE_SAMPLE_RATE.store(sample_rate, Ordering::SeqCst);
         NATIVE_CHANNELS.store(2, Ordering::SeqCst);
@@ -1303,7 +1310,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_flac_encoding_perf() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        // Same poison-tolerant policy as test_resample_perf above, so a failure
+        // in one perf test is not reported here as a misleading lock error.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sample_rate = 48000;
         NATIVE_SAMPLE_RATE.store(sample_rate, Ordering::SeqCst);
         NATIVE_CHANNELS.store(2, Ordering::SeqCst);

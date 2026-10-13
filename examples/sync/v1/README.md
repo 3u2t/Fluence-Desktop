@@ -90,3 +90,24 @@ All fixture files are compact JSON with fixed key order and deterministic sorts 
 - Frozen v1.2.1 — no breaking changes without a major version bump.
 - Additive fields must be OPTIONAL and ignored by old readers.
 - Never reorder keys; never change sort order; never change envelope shape without bumping `v`.
+
+## Stats time shards (monthly per-event envelopes)
+
+The Stats ledger is one LOGICAL set of per-dictation events stored as
+SEVERAL physical v1 envelopes so no single file hits the 8 MiB / 50k caps:
+
+- `stats.json` — legacy file, FROZEN: new clients read it, never write or
+  delete it. Old released clients own it (exact-name listing).
+- `stats-YYYY-MM.json` — month shard (UTC month of each record's `day`),
+  part 1. Overflow parts: `stats-YYYY-MM-pNN.json` (`NN >= 02`).
+
+Every shard is a complete v1 envelope: same shape, same `StatsItem`
+schema, same `(day, eventId)` sort, same validation, same per-file caps,
+same union-dedup-by-`eventId` merge with the same LWW tiebreak, same CAS
+and upload-liveness per file. Storage location changes; record meaning
+never does (sessions = record count, totals = field sums).
+
+Shard content rule: a shard holds exactly the merged rows of its month
+that are NOT byte-identical to the legacy `stats.json` version — history
+is never recopied, moved, or deleted. Old clients list `stats.json` by
+exact name and never see shard siblings.

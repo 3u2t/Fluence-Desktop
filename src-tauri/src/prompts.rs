@@ -739,11 +739,14 @@ pub fn claim_legacy_prompt_style(
     let only = std::collections::HashSet::from([id.clone()]);
     // NO legacy cleanup — the claim COPIES, never MOVES. See `claim_legacy_agent`
     // for the full rationale; it applies identically here.
-    Ok(crate::account_scope::claim_legacy_account_styles(
+    //
+    // S6: the claim returns `Err` when the durable save fails, so a failed
+    // claim surfaces as an error toast, never "Nothing to add".
+    crate::account_scope::claim_legacy_account_styles(
         Some(&hash),
         &legacy,
         Some(&only),
-    ))
+    )
 }
 
 #[tauri::command]
@@ -1096,6 +1099,14 @@ mod admitted_projection {
     #[test]
     #[cfg(windows)]
     fn a_failed_tombstone_does_not_strip_package_overrides() {
+        // Serialized against every other test that mutates the shared per-process
+        // settings file. This test writes `sync_account_key` and then resolves
+        // the delete branch through that same file; a parallel `save_settings`
+        // between the two flips the branch to legacy, the legacy delete
+        // succeeds, and the test flakes (~8% in full-suite runs). The restore
+        // at the end only repairs the key — it cannot repair a branch already
+        // taken — so the guard must cover the whole test, not just the write.
+        let _guard = crate::sync::stores::store_test_guard();
         let hash = qa_account("durability-gate");
         let id = "custom:qa-durability-0001";
         let exe = "qa-durability-app.exe";

@@ -266,10 +266,16 @@ pub(crate) fn save_account_styles(
 /// where the monotonic clock and this device's id live. Refuses an invalid
 /// hash: a record must never be written somewhere without a verified
 /// identity behind it.
+///
+/// The read-modify-write runs under `io_lock`, which is the same lock the sync
+/// pass holds while reconciling its merge result (audit finding H5). Without
+/// it a pass that snapshotted the file before its Drive round trip could
+/// overwrite this write; with it, the pass sees the mutation and preserves it.
 pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hint: &str) {
     if !valid_account_hash(account_hash) {
         return;
     }
+    let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_account_agents(account_hash);
     if let Some(e) = store.custom_agents.iter_mut().find(|e| e.id == id) {
         e.name = name.to_string();
@@ -298,10 +304,15 @@ pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hin
 /// Callers drop the same-id legacy shadow only on success: a failed tombstone
 /// write must preserve the legacy copy, or the record ends up in neither
 /// store with no tombstone to propagate the loss.
+///
+/// Holds `io_lock` for the read-modify-write, matching the sync pass's
+/// reconcile step: a delete that lands mid-pass must be seen by that step,
+/// not overwritten by its pre-network snapshot (audit finding H5).
 pub(crate) fn delete_account_agent(account_hash: &str, id: &str) -> bool {
     if !valid_account_hash(account_hash) {
         return false;
     }
+    let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_account_agents(account_hash);
     let Some(e) = store.custom_agents.iter_mut().find(|e| e.id == id) else {
         return false;
@@ -380,9 +391,9 @@ pub(crate) fn claim_legacy_account_agents(
     account_hash: Option<&str>,
     legacy: &[crate::agents::CustomAgent],
     only_ids: Option<&std::collections::HashSet<String>>,
-) -> ClaimOutcome {
+) -> Result<ClaimOutcome, String> {
     let Some(hash) = account_hash.filter(|h| valid_account_hash(h)) else {
-        return ClaimOutcome::default();
+        return Ok(ClaimOutcome::default());
     };
     // CLAIM-SPECIFIC CRITICAL SECTION.
     //
@@ -406,7 +417,7 @@ pub(crate) fn claim_legacy_account_agents(
 
     let mut outcome = ClaimOutcome::default();
     if legacy.is_empty() {
-        return outcome;
+        return Ok(outcome);
     }
     let mut store = load_account_agents(hash);
     // Each id is DECIDED once, so a duplicated legacy id yields exactly one
@@ -465,13 +476,19 @@ pub(crate) fn claim_legacy_account_agents(
         // Ownership MUST be durable before the caller is allowed to drop the
         // legacy copy. If this write fails the record still exists in the legacy
         // store and nowhere else, so reporting it as claimed would let the caller
-        // delete the only copy — a silent data loss. Report nothing claimed and
-        // let the legacy row stand; the user can retry.
-        if save_account_agents(hash, &store).is_err() {
-            outcome.claimed_ids.clear();
+        // delete the only copy — a silent data loss.
+        //
+        // S6: the old code cleared `claimed_ids` here and returned an empty
+        // outcome, which the UI rendered as "Nothing to add" — mislabeling a
+        // failed save as "nothing to do". A failed save is not an empty
+        // outcome; it is an error, so it is returned as one. The command layer
+        // surfaces it as an error toast (never "Nothing to add"), and the
+        // legacy row stands for a retry.
+        if let Err(e) = save_account_agents(hash, &store) {
+            return Err(format!("could not save the claimed record: {e}"));
         }
     }
-    outcome
+    Ok(outcome)
 }
 
 /// Style counterpart of [`claim_legacy_account_agents`], with identical rules.
@@ -479,9 +496,9 @@ pub(crate) fn claim_legacy_account_styles(
     account_hash: Option<&str>,
     legacy: &[crate::prompts::CustomStyle],
     only_ids: Option<&std::collections::HashSet<String>>,
-) -> ClaimOutcome {
+) -> Result<ClaimOutcome, String> {
     let Some(hash) = account_hash.filter(|h| valid_account_hash(h)) else {
-        return ClaimOutcome::default();
+        return Ok(ClaimOutcome::default());
     };
     // Same claim-specific critical section as the agent path, contending with the
     // already-locked `StyleDirtyStore::stamp_account`. Still not B2/R1.
@@ -489,7 +506,7 @@ pub(crate) fn claim_legacy_account_styles(
 
     let mut outcome = ClaimOutcome::default();
     if legacy.is_empty() {
-        return outcome;
+        return Ok(outcome);
     }
     let mut store = load_account_styles(hash);
     // Each id decided once — see the agent counterpart.
@@ -537,18 +554,24 @@ pub(crate) fn claim_legacy_account_styles(
     if !outcome.claimed_ids.is_empty() {
         // Same fail-safe as agents: ownership must be durable before the caller
         // drops the legacy copy, or a failed write loses the only copy.
-        if save_account_styles(hash, &store).is_err() {
-            outcome.claimed_ids.clear();
+        // S6, same as agents: a failed save is an error, never an empty
+        // outcome, so it can never render as "Nothing to add".
+        if let Err(e) = save_account_styles(hash, &store) {
+            return Err(format!("could not save the claimed record: {e}"));
         }
     }
-    outcome
+    Ok(outcome)
 }
 
-/// Style counterpart of [`upsert_account_agent`].
+/// Style counterpart of [`upsert_account_agent`]. Holds `io_lock` for the same
+/// reason: the sync pass reconciles its merge result under that lock, so an
+/// upsert landing mid-pass must not be overwritten by its pre-network
+/// snapshot (audit finding H5).
 pub(crate) fn upsert_account_style(account_hash: &str, id: &str, name: &str, hint: &str) {
     if !valid_account_hash(account_hash) {
         return;
     }
+    let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_account_styles(account_hash);
     if let Some(e) = store.custom_styles.iter_mut().find(|e| e.id == id) {
         e.name = name.to_string();
@@ -572,11 +595,13 @@ pub(crate) fn upsert_account_style(account_hash: &str, id: &str, name: &str, hin
 /// Style counterpart of [`delete_account_agent`]: tombstone, never removal.
 ///
 /// Same durability contract: true only when the tombstone persisted, so the
-/// caller keeps the legacy shadow on any failure.
+/// caller keeps the legacy shadow on any failure. Holds `io_lock` across the
+/// read-modify-write for the same reason as [`delete_account_agent`].
 pub(crate) fn delete_account_style(account_hash: &str, id: &str) -> bool {
     if !valid_account_hash(account_hash) {
         return false;
     }
+    let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_account_styles(account_hash);
     let Some(e) = store.custom_styles.iter_mut().find(|e| e.id == id) else {
         return false;
@@ -2348,7 +2373,7 @@ mod legacy_claim_tests {
     fn explicit_claim_transfers_ownership_into_the_ordinary_lifecycle() {
         let h = fresh_agents("lc_claim_owned");
         let legacy = vec![la("agent:1", "Legacy")];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:1".to_string()]);
         assert!(out.skipped_ids.is_empty());
 
@@ -2365,7 +2390,7 @@ mod legacy_claim_tests {
     fn claimed_record_becomes_runnable_known_and_syncable() {
         let h = fresh_agents("lc_claim_capabilities");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         let snap = snap_for(&h, &legacy);
         let rec = &snap.union[0];
@@ -2381,7 +2406,7 @@ mod legacy_claim_tests {
     fn claimed_record_resolves_a_hint_for_execution() {
         let h = fresh_agents("lc_claim_hint");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         let snap = snap_for(&h, &legacy);
         assert_eq!(
             snap.resolve(Some("agent:1")).hint.as_deref(),
@@ -2393,7 +2418,7 @@ mod legacy_claim_tests {
     fn claimed_record_becomes_deletable_and_delete_writes_a_tombstone() {
         let h = fresh_agents("lc_claim_delete");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         delete_account_agent(&h, "agent:1");
         let row = &load_account_agents(&h).custom_agents[0];
@@ -2414,7 +2439,7 @@ mod legacy_claim_tests {
     fn ownership_survives_a_restart() {
         let h = fresh_agents("lc_claim_restart");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         // A cold start re-reads from disk; the claim must still be there.
         let reloaded = load_account_agents(&h);
@@ -2428,8 +2453,8 @@ mod legacy_claim_tests {
     #[test]
     fn signed_out_claim_is_refused_and_writes_nothing() {
         let legacy = vec![la("agent:1", "Legacy")];
-        assert!(claim_legacy_account_agents(None, &legacy, None).is_empty());
-        assert!(claim_legacy_account_agents(Some(""), &legacy, None).is_empty());
+        assert!(claim_legacy_account_agents(None, &legacy, None).expect("claim must succeed in test").is_empty());
+        assert!(claim_legacy_account_agents(Some(""), &legacy, None).expect("claim must succeed in test").is_empty());
     }
 
     #[test]
@@ -2438,7 +2463,7 @@ mod legacy_claim_tests {
         // A non-blank value that is not a valid hash is an UNVERIFIABLE identity,
         // not an absent one: fail closed rather than adopt.
         for bad in ["not-a-hash", "ZZZ", &"A".repeat(64), &"a".repeat(63)] {
-            let out = claim_legacy_account_agents(Some(bad), &legacy, None);
+            let out = claim_legacy_account_agents(Some(bad), &legacy, None).expect("claim must succeed in test");
             assert!(
                 out.is_empty(),
                 "invalid identity {bad:?} must claim nothing"
@@ -2458,7 +2483,7 @@ mod legacy_claim_tests {
         assert!(load_account_agents(&b_hash).custom_agents.is_empty());
 
         // B claims it: ownership lands in B, and nowhere else.
-        claim_legacy_account_agents(Some(&b_hash), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&b_hash), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(load_account_agents(&b_hash).custom_agents.len(), 1);
         assert!(load_account_agents(&a_hash).custom_agents.is_empty());
     }
@@ -2468,7 +2493,7 @@ mod legacy_claim_tests {
         let a_hash = fresh_agents("lc_iso_a");
         let b_hash = fresh_agents("lc_iso_b");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&a_hash), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&a_hash), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         let b = snap_for(&b_hash, &legacy);
         assert_eq!(b.union.len(), 1);
@@ -2495,7 +2520,7 @@ mod legacy_claim_tests {
         .unwrap();
         let legacy = vec![la("agent:1", "Legacy version")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.skipped_ids, vec!["agent:1".to_string()]);
         assert!(out.claimed_ids.is_empty());
 
@@ -2550,7 +2575,7 @@ mod legacy_claim_tests {
     fn a_stale_merge_that_drops_the_claim_leaves_the_record_recoverable() {
         let h = fresh_agents("lc_stale_merge");
         let legacy = vec![la("agent:1", "Legacy")];
-        let claim = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let claim = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(claim.claimed_ids, vec!["agent:1".to_string()]);
 
         // The sync pass now writes the snapshot it captured BEFORE the claim: no
@@ -2582,13 +2607,13 @@ mod legacy_claim_tests {
         let h = fresh_agents("lc_idempotent");
         let legacy = vec![la("agent:1", "Legacy")];
 
-        let first = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let first = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(first.claimed_ids.len(), 1);
 
         // The user taps again. Either the legacy row is gone (empty no-op) or it
         // is still there and now collides (skipped). Both are safe; neither may
         // create a second row or rewrite the first.
-        let second = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let second = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(
             second.claimed_ids.is_empty(),
             "a second claim must not re-add"
@@ -2600,9 +2625,9 @@ mod legacy_claim_tests {
     #[test]
     fn empty_and_unmatched_claims_are_no_ops() {
         let h = fresh_agents("lc_noop");
-        assert!(claim_legacy_account_agents(Some(&h), &[], None).is_empty());
+        assert!(claim_legacy_account_agents(Some(&h), &[], None).expect("claim must succeed in test").is_empty());
         let legacy = vec![la("agent:1", "Legacy")];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:absent"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:absent"]))).expect("claim must succeed in test");
         assert!(out.is_empty());
         assert!(load_account_agents(&h).custom_agents.is_empty());
     }
@@ -2616,7 +2641,7 @@ mod legacy_claim_tests {
             la("agent:3", "Three"),
         ];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:2".to_string()]);
         let owned = load_account_agents(&h).custom_agents;
         assert_eq!(owned.len(), 1);
@@ -2628,7 +2653,7 @@ mod legacy_claim_tests {
         let h = fresh_agents("lc_multi");
         let legacy = vec![la("agent:1", "One"), la("agent:2", "Two")];
         let out =
-            claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1", "agent:2"])));
+            claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1", "agent:2"]))).expect("claim must succeed in test");
         let mut got = out.claimed_ids.clone();
         got.sort();
         assert_eq!(got, vec!["agent:1".to_string(), "agent:2".to_string()]);
@@ -2637,8 +2662,15 @@ mod legacy_claim_tests {
 
     // ── 6. fail-safe: never lose the only copy ─────────────────────────────
 
+    /// S6: a failed ownership write is an error, never an empty outcome.
+    ///
+    /// This test previously pinned the opposite (`..._reports_nothing_claimed`):
+    /// a failed save cleared `claimed_ids` and returned empty, which the UI
+    /// rendered as "Nothing to add". That mislabeled a failure as "nothing to
+    /// do". The save failure is now returned as `Err`, so the command layer
+    /// surfaces an error toast and the caller keeps the legacy copy.
     #[test]
-    fn a_failed_ownership_write_reports_nothing_claimed() {
+    fn a_failed_ownership_write_is_an_error_never_an_empty_outcome() {
         let h = hash_for("lc_write_fail");
         let path = account_path(&agents_base_dir(), "agents", &h);
         let _ = std::fs::remove_file(&path);
@@ -2649,11 +2681,9 @@ mod legacy_claim_tests {
         let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:only"])));
 
         assert!(
-            out.claimed_ids.is_empty(),
-            "must not report a claim whose write never landed, or the caller would \
-             delete the legacy copy and lose the record entirely"
+            out.is_err(),
+            "must report the failed write as an error, or the UI renders it as \"Nothing to add\""
         );
-        assert!(out.skipped_ids.is_empty());
         // Prove the ownership write really did not land by re-reading the account
         // store: no row for that id exists. THAT is what forces the caller to keep
         // the legacy copy.
@@ -2807,7 +2837,7 @@ mod legacy_claim_tests {
         assert!(!before.is_runnable(&before.union[0]));
         assert!(!before.admission_of(&before.union[0]).is_syncable());
 
-        let out = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        let out = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["style:1".to_string()]);
 
         let after = styles_snap_for(&h, &legacy);
@@ -2827,10 +2857,10 @@ mod legacy_claim_tests {
         let h = fresh_styles("lc_style_safety");
         let legacy = vec![ls("style:1", "Legacy")];
 
-        assert!(claim_legacy_account_styles(None, &legacy, None).is_empty());
+        assert!(claim_legacy_account_styles(None, &legacy, None).expect("claim must succeed in test").is_empty());
 
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
-        let again = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
+        let again = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert!(again.claimed_ids.is_empty());
         assert_eq!(load_account_styles(&h).custom_styles.len(), 1);
 
@@ -2841,7 +2871,7 @@ mod legacy_claim_tests {
             },
         )
         .unwrap();
-        let skip = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        let skip = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert_eq!(skip.skipped_ids, vec!["style:1".to_string()]);
         assert_eq!(load_account_styles(&h).custom_styles[0].name, "Owned");
     }
@@ -2850,7 +2880,7 @@ mod legacy_claim_tests {
     fn style_delete_after_claim_tombstones() {
         let h = fresh_styles("lc_style_delete");
         let legacy = vec![ls("style:1", "Legacy")];
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         delete_account_style(&h, "style:1");
         assert!(load_account_styles(&h).custom_styles[0]
             .deleted_at
@@ -2873,7 +2903,7 @@ mod legacy_claim_tests {
     fn deleting_a_claimed_agent_does_not_resurrect_it_on_sign_out() {
         let h = fresh_agents("lc_delete_resurrect");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         // Tombstone in the account store (what the routed delete writes first).
         delete_account_agent(&h, "agent:1");
@@ -2906,7 +2936,7 @@ mod legacy_claim_tests {
     fn agents_view_marks_only_signed_in_unclaimed_rows_claimable() {
         let h = fresh_agents("lc_view");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         save_account_agents(
             &h,
             &AccountAgentsStore {
@@ -2932,7 +2962,7 @@ mod legacy_claim_tests {
     fn styles_view_lists_unclaimed_rows_so_a_claim_is_possible() {
         let h = fresh_styles("lc_style_view");
         let legacy = vec![ls("style:1", "Legacy")];
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
 
         let view = styles_snap_for(&h, &legacy).into_view_list();
         assert_eq!(view.len(), 1);
@@ -2970,7 +3000,7 @@ mod legacy_claim_tests {
         let legacy = vec![la("agent:1", "Legacy")];
 
         // Normal claim: owned.
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:1".to_string()]);
         assert!(load_account_agents(&h)
             .custom_agents
@@ -2979,12 +3009,20 @@ mod legacy_claim_tests {
 
         // Failed ownership write: not owned, and the caller therefore keeps the
         // legacy copy, so the record still exists.
+        //
+        // S6: the blocked claim is an `Err`, not an empty outcome. The record
+        // survives because it was never removed from the legacy store — the
+        // caller keeps it on any error, which is exactly what the `Err` tells
+        // it to do.
         let h2 = fresh_agents("lc_never_neither2");
         let path = account_path(&agents_base_dir(), "agents", &h2);
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir_all(&path).unwrap();
         let out2 = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only(&["agent:1"])));
-        assert!(out2.claimed_ids.is_empty());
+        assert!(
+            out2.is_err(),
+            "a blocked ownership write must be an error so the caller keeps the legacy copy"
+        );
         let in_account2 = load_account_agents(&h2)
             .custom_agents
             .iter()
@@ -3014,7 +3052,7 @@ mod legacy_claim_tests {
         .unwrap();
         let legacy = vec![la("agent:1", "Legacy")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(
             out.claimed_ids.is_empty(),
             "a delete must never be resurrected"
@@ -3051,7 +3089,7 @@ mod legacy_claim_tests {
             Some(&h),
             &[ls("style:1", "Legacy")],
             Some(&only(&["style:1"])),
-        );
+        ).expect("claim must succeed in test");
         assert!(out.claimed_ids.is_empty());
         assert!(out
             .refused_ids
@@ -3069,7 +3107,7 @@ mod legacy_claim_tests {
         // reporting one adopted.
         let legacy = vec![la("agent:1", "Version A"), la("agent:1", "Version B")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(out.claimed_ids.is_empty());
         assert_eq!(
             out.refused_ids,
@@ -3089,7 +3127,7 @@ mod legacy_claim_tests {
             la("agent:1", "Version B"),
             la("agent:2", "Fine"),
         ];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:2".to_string()]);
         assert!(out.refused_ids.is_empty());
     }
@@ -3103,7 +3141,7 @@ mod legacy_claim_tests {
             Some(&h),
             &[la(crate::agents::ID_BUILT_IN, "Builtin")],
             Some(&only(&[crate::agents::ID_BUILT_IN])),
-        );
+        ).expect("claim must succeed in test");
         assert!(
             out.claimed_ids.is_empty(),
             "a reserved id must never be ownable"
@@ -3117,7 +3155,7 @@ mod legacy_claim_tests {
         let hs = fresh_styles("lc_builtin_style");
         let bid = crate::prompts::ID_PROOFREAD;
         let outs =
-            claim_legacy_account_styles(Some(&hs), &[ls(bid, "Proofread")], Some(&only(&[bid])));
+            claim_legacy_account_styles(Some(&hs), &[ls(bid, "Proofread")], Some(&only(&[bid]))).expect("claim must succeed in test");
         assert!(outs.claimed_ids.is_empty());
         assert!(outs
             .refused_ids
@@ -3148,8 +3186,83 @@ mod legacy_claim_tests {
                 la(crate::agents::ID_BUILT_IN, "Builtin"),
             ],
             None,
-        );
+        ).expect("claim must succeed in test");
         assert!(!out.is_empty());
         assert!(out.claimed_ids.is_empty());
+    }
+
+    /// S6: a claim whose durable save fails must be an `Err`, never an empty
+    /// `Ok`. The old code cleared `claimed_ids` on a save failure and returned
+    /// an empty outcome, which the UI rendered as "Nothing to add" —
+    /// mislabeling a failed save as "nothing to do".
+    ///
+    /// Made deterministic by blocking exactly the target account file with a
+    /// directory, so the atomic rename lands on a directory and fails. Scoped
+    /// to one hash's file on purpose: blocking the whole shared base dir broke
+    /// concurrent claim tests that do not hold the store guard.
+    #[test]
+    fn s6_failed_save_is_an_error_never_an_empty_outcome() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("s6-save-fails@example.com");
+        let legacy = vec![la("agent:1", "Legacy")];
+        let only = only(&["agent:1"]);
+
+        // Healthy first: a claim with a writable store succeeds.
+        let ok = claim_legacy_account_agents(Some(&h), &legacy, Some(&only))
+            .expect("healthy claim must succeed");
+        assert_eq!(ok.claimed_ids, vec!["agent:1".to_string()]);
+
+        // Block exactly this hash's target file with a directory. `write_json`
+        // renames a tmp onto it, which cannot replace a directory, so the save
+        // fails deterministically while every other hash stays writable.
+        let h2 = crate::sync::metadata::account_hash_from_email("s6-blocked@example.com");
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h2);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let failed = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only));
+        assert!(
+            failed.is_err(),
+            "a claim whose save fails must be Err, never Ok(empty): {:?}",
+            failed.ok().map(|o| (o.claimed_ids, o.skipped_ids, o.refused_ids))
+        );
+        let msg = failed.unwrap_err();
+        assert!(
+            msg.contains("could not save"),
+            "the error must say the save failed, not vanish: {msg}"
+        );
+
+        // Unblock and prove the same call recovers: the failure was the
+        // injection, not a permanent condition.
+        let _ = std::fs::remove_dir_all(&target);
+        let recovered = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only))
+            .expect("unblocked claim must succeed");
+        assert_eq!(recovered.claimed_ids, vec!["agent:1".to_string()]);
+    }
+
+    /// S6, styles counterpart: same rule, same shape.
+    #[test]
+    fn s6_failed_style_save_is_an_error_never_an_empty_outcome() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("s6-style-blocked@example.com");
+        let legacy = vec![ls("custom:1", "Legacy")];
+        let only = only(&["custom:1"]);
+
+        let target = account_path_for_test(&prompts_base_dir(), "styles", &h);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let failed = claim_legacy_account_styles(Some(&h), &legacy, Some(&only));
+        assert!(
+            failed.is_err(),
+            "a style claim whose save fails must be Err, never Ok(empty)"
+        );
+
+        let _ = std::fs::remove_dir_all(&target);
+        let recovered = claim_legacy_account_styles(Some(&h), &legacy, Some(&only))
+            .expect("unblocked style claim must succeed");
+        assert_eq!(recovered.claimed_ids, vec!["custom:1".to_string()]);
     }
 }

@@ -190,9 +190,20 @@ export function DictionaryPage() {
 
   const onImport = async () => {
     try {
-      const count = await importDictionaryFile();
-      if (count === null) return;
-      toast(`Imported ${count} entries`, 'success');
+      const result = await importDictionaryFile();
+      if (result === null) return;
+      toast(`Imported ${result.added} entries`, 'success');
+      // Entries with an unrecognized type cannot sync (the frozen wire format
+      // has no `kind` field), so they were imported as plain corrections.
+      // Say so rather than silently changing what the user imported.
+      if (result.coerced_kind > 0) {
+        toast(
+          `${result.coerced_kind} ${result.coerced_kind === 1 ? 'entry had' : 'entries had'} an unrecognized type and ${
+            result.coerced_kind === 1 ? 'was' : 'were'
+          } imported as a correction`,
+          'info',
+        );
+      }
       await loadDict();
     } catch (err) {
       toast('Import failed: ' + String(err), 'error');

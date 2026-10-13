@@ -10,6 +10,15 @@ export interface SyncStatus {
   running?: boolean;
   last_sync_at?: string | number | null;
   next_attempt_ms?: number | null;
+  /** Automatic scheduling is paused after a fatal error; a user-triggered
+   *  pass (Sync Now / re-enable) is required to resume. */
+  waiting_for_retry?: boolean;
+  /** F4 Success-with-warning: the latest pass converged with skipped remote
+   *  state. Render as a warning alongside the (advanced) last_sync_at —
+   *  never as an error and never as "not synced". */
+  degraded?: boolean;
+  /** Human-readable warning carried while `degraded` is set. */
+  degraded_detail?: string | null;
 }
 
 // Command names + argument shapes reproduced exactly from vanilla.
@@ -23,9 +32,10 @@ export const signInWithGoogle = () =>
 
 export const signOutGoogle = () => invokeCmd<void>('sync_sign_out');
 
-/** Vanilla "Sync Now" reuses sync_toggle with the current enabled value. */
-export const triggerSyncNow = (enabled: boolean) =>
-  invokeCmd<SyncStatus>('sync_toggle', { enabled });
+/** Explicit "Sync Now": requests a pass and clears any fatal latch.
+ *  Deliberately NOT `sync_toggle` — toggling is an enable/disable action and
+ *  cannot re-arm a latched scheduler. */
+export const runSyncNow = () => invokeCmd<SyncStatus>('sync_run_now');
 
 export const subscribeSyncStatus = (handler: (status: SyncStatus) => void) =>
   listenEvent<SyncStatus>('sync-status', handler);

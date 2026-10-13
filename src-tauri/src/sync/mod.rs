@@ -11,5 +11,7 @@ pub mod frozen;
 pub mod io_lock;
 pub mod merge;
 pub mod metadata;
+pub mod recover;
 pub mod scheduler;
+pub mod stats_shards;
 pub mod stores;

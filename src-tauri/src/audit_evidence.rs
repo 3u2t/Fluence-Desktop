@@ -400,16 +400,24 @@ mod tests {
         // This would fail against the old buggy implementation (direct fs::write, Err return)
         let src = include_str!("settings.rs");
         assert!(
-            src.contains("json.tmp"),
-            "H3 REGRESSION: save_settings must use atomic tmp file (json.tmp)"
-        );
-        assert!(
             src.contains("sync_all"),
             "H3 REGRESSION: atomic save must fsync tmp file"
         );
         assert!(
             src.contains("fs::rename(&tmp_path, &path)"),
             "H3 REGRESSION: atomic save must rename tmp to final"
+        );
+        // The tmp path must ALSO be unique per caller. The original assertion here
+        // pinned the literal filename "json.tmp", which checked an implementation
+        // detail rather than the atomicity property. A shared tmp name let two
+        // concurrent writers both write the same tmp and then both rename it: the
+        // loser renamed a tmp the winner had already consumed (os error 2), or
+        // renamed a torn write onto the destination. That race is what made the
+        // audio perf tests flake, and it was reachable in production because the
+        // scheduler thread and the settings UI can both persist settings.
+        assert!(
+            src.contains("TMP_SEQ") && src.contains("fetch_add"),
+            "H3 REGRESSION: save_settings tmp path must be unique per caller (TMP_SEQ)"
         );
         assert!(
             src.contains("json.corrupt.json"),

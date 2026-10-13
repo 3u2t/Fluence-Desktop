@@ -79,12 +79,14 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
-      - name: run frontend + security test suite
-        shell: pwsh
-        run: |
-          node --test "tests/*.test.mjs"
-          pwsh -File tests/verify-security.ps1
-
+      # Ordering: the node frontend suite must run AFTER the dependency installs
+      # below, not before. tests/credential-target-parity.test.mjs does
+      # `require('../web/node_modules/typescript')`, which only resolves once
+      # `npm ci --prefix web` has populated web/node_modules. Run the tests
+      # first and a fresh checkout fails with "Cannot find module
+      # '../web/node_modules/typescript'" — green on a developer machine that
+      # already has web/node_modules, red in CI. `cargo test --lib` stays above
+      # because it has no web dependency.
       - name: install frontend dependencies
         run: npm ci
 
@@ -93,8 +95,30 @@ jobs:
       # (tsc, vite). Root `npm ci` does not install them (no workspaces),
       # and a fresh checkout has no node_modules — without this step the
       # build fails instantly with `'tsc' is not recognized` (v1.20.0 run 54).
+      # It must also land before the node test suite below, which compiles
+      # web/src/ipc/providers.ts through web/node_modules/typescript.
       - name: install web frontend dependencies
         run: npm ci --prefix web
+
+      # Fresh-checkout guard: the node suite silently depends on the web
+      # frontend's typescript. If that install ever regresses again, fail
+      # loudly here instead of reporting a confusing module-not-found.
+      - name: verify web typescript is installed
+        shell: pwsh
+        run: |
+          $ts = "web/node_modules/typescript"
+          if (-not (Test-Path -LiteralPath $ts)) {
+            throw "Missing web/node_modules/typescript: the node test suite requires it. Run `npm ci --prefix web` before `node --test tests/*.test.mjs`."
+          }
+          $pkg = Get-Content -LiteralPath "$ts/package.json" -Raw | ConvertFrom-Json
+          Write-Host "typescript $($pkg.version) present at web/node_modules/typescript"
+
+      - name: run frontend + security test suite
+        shell: pwsh
+        run: |
+          node --test "tests/*.test.mjs"
+          npm test --prefix web
+          pwsh -File tests/verify-security.ps1
 
       - name: build and release
         uses: tauri-apps/tauri-action@v0.6.2
@@ -140,8 +164,8 @@ jobs:
 
             ### Verification
 
-            - Full Rust suite green (`cargo test --lib`, 614 tests).
-            - Web claim suite green (17 tests), including a boundary test asserting the claim command carries only a record id.
+            - Full Rust suite green (`cargo test --lib`, 780 tests).
+            - Web claim suite green (26 tests), including a boundary test asserting the claim command carries only a record id.
             - Web typecheck and production build clean; no new dependencies, no sync/schema changes.
 
             ---

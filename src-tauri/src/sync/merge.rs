@@ -17,7 +17,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::sync::clock::cmp_keyed_winner;
-use crate::sync::clock::cmp_winner;
 use crate::sync::domain::*;
 
 #[derive(Debug, Clone)]
@@ -75,6 +74,53 @@ where
         }
         merged.push(winner);
     }
+    // Cross-key sync_id collapse (audit finding H3 / Phase D): a rename moves
+    // a record's business key while keeping its sync_id, so the pre-rename key
+    // (usually remote) and the post-rename key (local) each contribute a winner
+    // for the SAME logical record. Without this step both survive every future
+    // merge as a permanent duplicate. Collapse to the `cmp_keyed_winner` max —
+    // the same total order as the per-key pick — so the outcome is independent
+    // of merge side/order. Tombstones ride the same comparator (`deleted_at`
+    // is never compared), preserving delete-vs-edit semantics across keys:
+    // the newest record wins regardless of which key it sits under.
+    //
+    // Residual-tie determinism: inside one sync_id group the sync_id tiebreak
+    // is inert, reducing the order to (updated_at, device_id). Winners arrive
+    // here in ascending business-key order (`grouped` is a BTreeMap), and only
+    // `Greater` replaces, so a genuine full tie keeps the smallest business
+    // key — the same record Android keeps via its pre-collapse sort.
+    let mut by_sync_id: HashMap<String, T> = HashMap::new();
+    for item in merged {
+        let sid = sync_id(&item).to_string();
+        match by_sync_id.get(&sid) {
+            None => {
+                by_sync_id.insert(sid, item);
+            }
+            Some(incumbent) => {
+                if cmp_keyed_winner(
+                    updated_at(&item),
+                    device_id(&item),
+                    sync_id(&item),
+                    updated_at(incumbent),
+                    device_id(incumbent),
+                    sync_id(incumbent),
+                ) == std::cmp::Ordering::Greater
+                {
+                    by_sync_id.insert(sid, item);
+                }
+                // The collapsed set differs from any store still holding the
+                // dropped row, so wholesale-replace stores (dictionary,
+                // snippets) rewrite the local file with the collapsed set on
+                // the `changed` write-back. Business-key-keyed reconciles
+                // (agents/styles) retain winnerless local rows by design; the
+                // collapse cannot fire there today because agent/style sync_ids
+                // are 1:1 with their keys (`stable_sync_id`), so no heal gap
+                // exists — only corrupt input could produce one.
+                changed = true;
+            }
+        }
+    }
+    let mut merged: Vec<T> = by_sync_id.into_values().collect();
     sort_by(&mut merged);
     MergeOutcome { merged, changed }
 }
@@ -174,7 +220,11 @@ fn effective_settings_time(updated_at: i64) -> i64 {
     }
 }
 
-/// Settings merge: per-key LWW over the allowed keys only.
+/// Settings merge: per-key LWW over the allowed keys only. Full ties resolve
+/// by value, larger wins (H2: total order coordinated with Android
+/// `Merge.mergeSettings`, so both platforms pick the same winner when
+/// updatedAt and deviceId tie); output is canonically sorted by key,
+/// matching Android exactly.
 pub fn merge_settings(
     local: &[SettingsItem],
     remote: &[SettingsItem],
@@ -193,15 +243,27 @@ pub fn merge_settings(
                 let existing_at = effective_settings_time(existing.updated_at);
                 let item_at = effective_settings_time(item.updated_at);
                 let winner_is_item = if existing_at == 0 && item_at == 0 {
-                    cmp_winner(item_at, &item.device_id, existing_at, &existing.device_id)
-                        == std::cmp::Ordering::Greater
+                    super::clock::cmp_settings_winner(
+                        item_at,
+                        &item.device_id,
+                        &item.value,
+                        existing_at,
+                        &existing.device_id,
+                        &existing.value,
+                    ) == std::cmp::Ordering::Greater
                 } else if existing_at == 0 {
                     true
                 } else if item_at == 0 {
                     false
                 } else {
-                    cmp_winner(item_at, &item.device_id, existing_at, &existing.device_id)
-                        == std::cmp::Ordering::Greater
+                    super::clock::cmp_settings_winner(
+                        item_at,
+                        &item.device_id,
+                        &item.value,
+                        existing_at,
+                        &existing.device_id,
+                        &existing.value,
+                    ) == std::cmp::Ordering::Greater
                 };
                 if winner_is_item {
                     e.insert(item.clone());
@@ -233,7 +295,11 @@ pub fn merge_settings(
 
 /// Stats merge: union dedup by eventId. Normally duplicate event ids carry the
 /// same immutable fact; if damaged/old data disagrees, use the same deterministic
-/// LWW rule as Android so both platforms converge to one record.
+/// LWW rule as Android so both platforms converge to one record. Full ties
+/// resolve by (day, timestamp_ms, words, chars, duration_ms), larger wins
+/// (H2: total order coordinated with Android `Merge.mergeStats`); identical
+/// rows still tie so fold order keeps deciding true duplicates. Output is
+/// canonically sorted by (day, eventId), matching Android exactly.
 pub fn merge_stats(local: &[StatsItem], remote: &[StatsItem]) -> MergeOutcome<StatsItem> {
     let mut map: HashMap<String, StatsItem> = HashMap::new();
     for item in local.iter().chain(remote.iter()) {
@@ -245,11 +311,21 @@ pub fn merge_stats(local: &[StatsItem], remote: &[StatsItem]) -> MergeOutcome<St
                 let existing = entry.get();
                 let existing_time = existing.updated_at.unwrap_or(0);
                 let item_time = item.updated_at.unwrap_or(0);
-                if cmp_winner(
+                if super::clock::cmp_stats_winner(
                     item_time,
                     item.device_id.as_deref().unwrap_or(""),
+                    &item.day,
+                    item.timestamp_ms,
+                    item.words.unwrap_or(0),
+                    item.chars.unwrap_or(0),
+                    item.duration_ms.unwrap_or(0),
                     existing_time,
                     existing.device_id.as_deref().unwrap_or(""),
+                    &existing.day,
+                    existing.timestamp_ms,
+                    existing.words.unwrap_or(0),
+                    existing.chars.unwrap_or(0),
+                    existing.duration_ms.unwrap_or(0),
                 ) == std::cmp::Ordering::Greater
                 {
                     entry.insert(item.clone());
@@ -433,6 +509,243 @@ mod tests {
         assert!(outcome2.merged[0].deleted_at.is_some());
     }
 
+    // ── Cross-key sync_id dedup (audit finding H3 / Phase D) ─────────────
+    //
+    // A rename moves a record's business key while keeping its sync_id, so the
+    // pre-rename key (usually remote) and the post-rename key (local) can each
+    // contribute a winner for the SAME logical record. These tests pin the
+    // defect first: without the collapse both survive forever as a permanent
+    // duplicate.
+
+    #[test]
+    fn rename_same_sync_id_different_snippet_keys_collapses_to_newest() {
+        // Real-world shape (observed in production data): device B renamed
+        // "my email" -> "my primary email", keeping the record id. The remote
+        // still holds it under the old trigger.
+        let old = snippet("my email", "a@x.com", false, 100, "a");
+        let mut new = snippet("my primary email", "a@x.com", false, 200, "a");
+        new.sync_id = old.sync_id.clone();
+        let outcome = merge_snippets(&[new], &[old]);
+        assert_eq!(
+            outcome.merged.len(),
+            1,
+            "same sync_id under two keys must collapse to one record"
+        );
+        assert_eq!(outcome.merged[0].trigger, "my primary email");
+    }
+
+    #[test]
+    fn rename_same_sync_id_different_dictionary_keys_collapses_to_newest() {
+        let old = dict("oldword", "Old", "correction", false, 100, "a");
+        let mut new = dict("newword", "Old", "correction", false, 200, "a");
+        new.sync_id = old.sync_id.clone();
+        let outcome = merge_dictionary(&[new], &[old]);
+        assert_eq!(
+            outcome.merged.len(),
+            1,
+            "same sync_id under two keys must collapse to one record"
+        );
+        assert_eq!(outcome.merged[0].spoken, "newword");
+    }
+
+    #[test]
+    fn rename_collapse_is_independent_of_merge_side() {
+        // The collapse uses the same total order as the per-key pick, so which
+        // side a record arrived on must not matter.
+        let old = dict("oldword", "Old", "correction", false, 100, "a");
+        let mut new = dict("newword", "Old", "correction", false, 200, "a");
+        new.sync_id = old.sync_id.clone();
+        let ab = merge_dictionary(&[new.clone()], &[old.clone()]);
+        let ba = merge_dictionary(&[old], &[new]);
+        assert_eq!(ab.merged.len(), 1);
+        assert_eq!(ba.merged.len(), 1);
+        assert_eq!(ab.merged[0], ba.merged[0]);
+    }
+
+    #[test]
+    fn rename_collapse_keeps_newer_tombstone_over_older_live() {
+        // Delete-vs-rename uses the same newest-wins rule as delete-vs-edit:
+        // deleted_at is never compared, only recency.
+        let live = dict("newword", "Old", "correction", false, 100, "a");
+        let mut tomb = dict("oldword", "Old", "correction", true, 200, "b");
+        tomb.sync_id = live.sync_id.clone();
+        let outcome = merge_dictionary(&[live], &[tomb]);
+        assert_eq!(outcome.merged.len(), 1);
+        assert!(
+            outcome.merged[0].deleted_at.is_some(),
+            "the newer tombstone must win even across keys"
+        );
+    }
+
+    #[test]
+    fn rename_collapse_keeps_newer_live_over_older_tombstone() {
+        let tomb = dict("oldword", "Old", "correction", true, 100, "a");
+        let mut live = dict("newword", "Old", "correction", false, 200, "b");
+        live.sync_id = tomb.sync_id.clone();
+        let outcome = merge_dictionary(&[tomb], &[live]);
+        assert_eq!(outcome.merged.len(), 1);
+        assert!(
+            outcome.merged[0].deleted_at.is_none(),
+            "the newer live record must win even across keys"
+        );
+        assert_eq!(outcome.merged[0].spoken, "newword");
+    }
+
+    #[test]
+    fn distinct_sync_ids_still_yield_distinct_records() {
+        // The collapse must ONLY fire on shared sync_id: two genuinely
+        // different records (different ids) under different keys both survive.
+        let a = dict("alpha", "A", "correction", false, 100, "a");
+        let b = dict("beta", "B", "correction", false, 200, "a");
+        let outcome = merge_dictionary(&[a, b], &[]);
+        assert_eq!(outcome.merged.len(), 2);
+    }
+
+    #[test]
+    fn rename_collapse_is_stable_across_repeated_passes() {
+        // First pass collapses the rename; later passes — including one
+        // against a stale pre-rename copy from a device that never saw the
+        // rename — must stay collapsed and converge, never flap back to two.
+        let old = dict("oldword", "Old", "correction", false, 100, "a");
+        let mut new = dict("newword", "Old", "correction", false, 200, "a");
+        new.sync_id = old.sync_id.clone();
+        let first = merge_dictionary(&[new.clone()], &[old]);
+        assert_eq!(first.merged.len(), 1);
+
+        let mut stale = dict("oldword", "Old", "correction", false, 50, "c");
+        stale.sync_id = new.sync_id.clone();
+        let second = merge_dictionary(&first.merged, &[stale]);
+        assert_eq!(
+            second.merged.len(),
+            1,
+            "a stale pre-rename copy must not resurrect the duplicate"
+        );
+        assert_eq!(second.merged[0].spoken, "newword");
+
+        let third = merge_dictionary(&second.merged, &[]);
+        assert_eq!(third.merged.len(), 1);
+        assert!(
+            !third.changed,
+            "a converged set re-merges clean with no spurious change"
+        );
+    }
+
+    #[test]
+    fn rename_full_tie_keeps_smallest_business_key() {
+        // Same sync_id, same updated_at, same device_id under two keys: the
+        // sync_id tiebreak is inert inside the group, so determinism comes
+        // from key order — smallest business key wins, matching Android's
+        // pre-collapse sort. Practically unreachable (a rename restamps
+        // updated_at), pinned so the order is total by construction.
+        let old = dict("oldword", "Old", "correction", false, 100, "a");
+        let mut new = dict("newword", "Old", "correction", false, 100, "a");
+        new.sync_id = old.sync_id.clone();
+        let ab = merge_dictionary(&[new.clone()], &[old.clone()]);
+        let ba = merge_dictionary(&[old], &[new]);
+        assert_eq!(ab.merged.len(), 1);
+        assert_eq!(ba.merged.len(), 1);
+        assert_eq!(ab.merged[0].spoken, "newword");
+        assert_eq!(ba.merged[0].spoken, "newword");
+    }
+
+    // ── H3 rename (delete-old + create-new) ──────────────────────────────
+    //
+    // A rename retires the old row (tombstone under the OLD key when pushed,
+    // hard-deleted when never pushed) and creates a new row with a FRESH
+    // sync_id under the NEW key. These tests pin the merge consequences both
+    // platforms must agree on (mirrored in Android MergeTest): the old entry
+    // stays dead, the new entry wins, and every scenario is side-independent.
+
+    fn dict_with_id(
+        sync_id: &str,
+        spoken: &str,
+        corrected: &str,
+        deleted: bool,
+        updated_at: i64,
+        device_id: &str,
+    ) -> DictionaryItem {
+        let mut item = dict(spoken, corrected, "correction", deleted, updated_at, device_id);
+        item.sync_id = sync_id.to_string();
+        item
+    }
+
+    #[test]
+    fn rename_tombstone_plus_new_converges_both_orders() {
+        // Device A renamed hello→hallo: tombstone(S, t=200) under "hello" +
+        // live(S', t=200) under "hallo". Device B still holds live(S, t=100)
+        // under "hello". Both merge orders must converge to: dead old key,
+        // live new key — never a resurrection, never a duplicate.
+        let old_live = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 100, "b");
+        let old_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
+        let new_live = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
+        for (local, remote) in [
+            (vec![old_dead.clone(), new_live.clone()], vec![old_live.clone()]),
+            (vec![old_live.clone()], vec![old_dead.clone(), new_live.clone()]),
+        ] {
+            let out = merge_dictionary(&local, &remote);
+            assert_eq!(out.merged.len(), 2, "tombstone(old) + live(new), nothing else");
+            let old = out.merged.iter().find(|i| i.business_key() == "hello").unwrap();
+            assert!(old.deleted_at.is_some(), "the old entry stays dead");
+            let new = out.merged.iter().find(|i| i.business_key() == "hallo").unwrap();
+            assert!(new.deleted_at.is_none());
+            assert_eq!(new.corrected, "Hello");
+        }
+    }
+
+    #[test]
+    fn rename_repeated_merge_is_stable_and_stale_copies_do_not_resurrect() {
+        let old_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
+        let new_live = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
+        let converged = merge_dictionary(&[old_dead.clone(), new_live.clone()], &[]).merged;
+        // A stale pre-rename copy arriving late must not resurrect anything.
+        let stale = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 50, "c");
+        let second = merge_dictionary(&converged, &[stale]);
+        assert_eq!(second.merged.len(), 2);
+        assert!(second.merged.iter().find(|i| i.business_key() == "hello").unwrap().deleted_at.is_some());
+        assert!(second.merged.iter().find(|i| i.business_key() == "hallo").unwrap().deleted_at.is_none());
+        let third = merge_dictionary(&second.merged, &[]);
+        assert!(!third.changed, "a converged set re-merges clean");
+    }
+
+    #[test]
+    fn rename_concurrent_same_target_is_deterministic() {
+        // Two devices rename hello→hallo concurrently with different fresh
+        // sync_ids. Both sides must pick the SAME winner: per-key LWW falls
+        // through (updated_at, device_id) to the sync_id tiebreak.
+        let a_new = dict_with_id("11111111-1111-4111-8111-111111111111", "hallo", "A", false, 200, "a");
+        let b_new = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "B", false, 200, "a");
+        let ab = merge_dictionary(&[a_new.clone()], &[b_new.clone()]);
+        let ba = merge_dictionary(&[b_new], &[a_new]);
+        assert_eq!(ab.merged.len(), 1);
+        assert_eq!(ba.merged.len(), 1);
+        assert_eq!(ab.merged[0].corrected, ba.merged[0].corrected, "both orders agree");
+        assert_eq!(ab.merged[0].corrected, "B", "larger sync_id wins the full tie");
+    }
+
+    #[test]
+    fn rename_delete_vs_rename_is_deterministic() {
+        // Deleter tombstones the old key at t=300; renamer tombstoned it at
+        // t=200 and created the new entry at t=200. Outcome, both orders: the
+        // newer tombstone holds the old key dead, the new entry lives. The
+        // delete does NOT kill the renamed entry (different key), and the
+        // rename does NOT resurrect the old key — deterministic, documented.
+        let old_live = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 100, "b");
+        let rename_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
+        let rename_new = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
+        let delete_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 300, "c");
+        for (local, remote) in [
+            (vec![rename_dead.clone(), rename_new.clone()], vec![old_live.clone(), delete_dead.clone()]),
+            (vec![old_live, delete_dead], vec![rename_dead, rename_new]),
+        ] {
+            let out = merge_dictionary(&local, &remote);
+            let old = out.merged.iter().find(|i| i.business_key() == "hello").unwrap();
+            assert!(old.deleted_at.is_some());
+            assert_eq!(old.updated_at, 300, "the newest tombstone wins the old key");
+            let new = out.merged.iter().find(|i| i.business_key() == "hallo").unwrap();
+            assert!(new.deleted_at.is_none(), "the renamed entry survives the delete");
+        }
+    }
+
     // ── Settings ────────────────────────────────────────────────────────
 
     fn setting(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsItem {
@@ -459,6 +772,41 @@ mod tests {
         let remote = vec![setting("language", "fr", 100, "a")];
         let outcome = merge_settings(&local, &remote);
         assert_eq!(outcome.merged[0].value, "en");
+    }
+
+    /// H2 (coordinated with Android): a full settings tie — same key, same
+    /// updatedAt, same deviceId, different value — resolves by value, larger
+    /// wins, identically on both platforms. Both merge orders must yield the
+    /// SAME winner; side-dependent outcomes would re-push forever.
+    #[test]
+    fn settings_full_tie_resolves_by_value_larger_wins() {
+        let local = vec![setting("language", "en", 100, "a")];
+        let remote = vec![setting("language", "fr", 100, "a")];
+        let outcome = merge_settings(&local, &remote);
+        assert_eq!(outcome.merged.len(), 1);
+        assert_eq!(outcome.merged[0].value, "fr");
+        // Side-independent: both orders pick the same winner.
+        let flipped = merge_settings(&remote, &local);
+        assert_eq!(flipped.merged.len(), 1);
+        assert_eq!(flipped.merged[0].value, "fr");
+    }
+
+    /// H2: a full tie that reaches the value level through the adoption
+    /// sentinel class also resolves by value — the sentinel maps to the
+    /// adoption class for comparison but the value discriminator still
+    /// applies, identically on both platforms.
+    #[test]
+    fn settings_sentinel_full_tie_resolves_by_value() {
+        let local = vec![setting("language", "en", SETTINGS_ADOPTION_EPOCH_MS, "d")];
+        let remote = vec![setting("language", "fr", SETTINGS_ADOPTION_EPOCH_MS, "d")];
+        let outcome = merge_settings(&local, &remote);
+        assert_eq!(outcome.merged.len(), 1);
+        assert_eq!(
+            outcome.merged[0].value, "fr",
+            "same sentinel, same device: larger value wins"
+        );
+        let flipped = merge_settings(&remote, &local);
+        assert_eq!(flipped.merged[0].value, "fr");
     }
 
     #[test]
@@ -624,5 +972,55 @@ mod tests {
         assert_eq!(outcome2.merged.len(), 2, "distinct events union");
         let total_words: i64 = outcome2.merged.iter().filter_map(|s| s.words).sum();
         assert_eq!(total_words, 20, "display-time summation over merged set");
+    }
+
+    /// H2 (coordinated with Android): a full stats tie — same eventId, same
+    /// updatedAt, same deviceId, different payload — resolves by
+    /// (day, timestamp_ms, words, chars, duration_ms), larger wins,
+    /// identically on both platforms. Both merge orders must yield the SAME
+    /// winner. Output order is canonical (day, eventId) on both sides.
+    #[test]
+    fn stats_full_tie_resolves_by_payload_larger_wins() {
+        let local = StatsItem {
+            event_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            day: "2026-01-01".to_string(),
+            timestamp_ms: 100,
+            words: Some(10),
+            chars: Some(40),
+            duration_ms: Some(5000),
+            updated_at: Some(1000),
+            device_id: Some("d".to_string()),
+        };
+        let mut remote = local.clone();
+        remote.words = Some(99);
+        let outcome = merge_stats(&[local.clone()], &[remote.clone()]);
+        assert_eq!(outcome.merged.len(), 1);
+        assert_eq!(outcome.merged[0].words, Some(99));
+        // Side-independent: both orders pick the same winner.
+        let flipped = merge_stats(&[remote], &[local]);
+        assert_eq!(flipped.merged.len(), 1);
+        assert_eq!(flipped.merged[0].words, Some(99));
+    }
+
+    /// H2: a stats full tie on day resolves further down the payload —
+    /// timestamp_ms before words — identically regardless of merge order.
+    #[test]
+    fn stats_full_tie_same_day_resolves_by_timestamp_then_words() {
+        let base = StatsItem {
+            event_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            day: "2026-03-01".to_string(),
+            timestamp_ms: 100,
+            words: Some(10),
+            chars: Some(40),
+            duration_ms: Some(5000),
+            updated_at: Some(1000),
+            device_id: Some("d".to_string()),
+        };
+        let mut later_ts = base.clone();
+        later_ts.timestamp_ms = 200;
+        let out = merge_stats(&[base.clone()], &[later_ts.clone()]);
+        assert_eq!(out.merged[0].timestamp_ms, 200);
+        let flipped = merge_stats(&[later_ts], &[base]);
+        assert_eq!(flipped.merged[0].timestamp_ms, 200);
     }
 }

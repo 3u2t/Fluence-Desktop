@@ -10,7 +10,7 @@ import {
   signInWithGoogle,
   signOutGoogle,
   subscribeSyncStatus,
-  triggerSyncNow,
+  runSyncNow,
   type SyncStatus,
 } from '@/ipc/sync';
 
@@ -36,11 +36,23 @@ export function SyncPage() {
 
   useEffect(() => {
     void load();
+    // S7: guard against unmount-before-resolve — without `disposed`, an
+    // unmount in this window leaks the subscription (cleanup sees undefined).
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    void subscribeSyncStatus((s) => setStatus(s)).then((u) => {
-      unlisten = u;
+    void subscribeSyncStatus((s) => {
+      if (!disposed) setStatus(s);
+    }).then((u) => {
+      if (disposed) {
+        u();
+      } else {
+        unlisten = u;
+      }
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [load]);
 
   const onToggle = async (enabled: boolean) => {
@@ -93,18 +105,16 @@ export function SyncPage() {
   };
 
   const onSyncNow = async () => {
-    const enabled = !!status?.enabled;
-    if (!enabled) {
+    if (!status?.enabled) {
       toast('Enable background sync first', 'error');
       return;
     }
     try {
-      const s = await triggerSyncNow(enabled);
-      if (s.next_attempt_ms != null) {
-        toast('Sync started', 'success');
-      } else {
-        toast('Sync will run shortly', 'success');
-      }
+      await runSyncNow();
+      // The status snapshot returned by a command is taken before the
+      // scheduler thread applies it, so it cannot prove the latch is cleared
+      // yet; the follow-up sync-status event is the source of truth.
+      toast('Sync requested', 'success');
     } catch (err) {
       toast(
         'Failed to start sync: ' + String(err).replace(/^Error:\s*/, ''),
@@ -146,9 +156,11 @@ export function SyncPage() {
     ? 'Sync is off.'
     : s.running
       ? 'Syncing right now…'
-      : s.last_sync_at
-        ? `Last synced ${formatSyncStamp(s.last_sync_at)}${syncErr(s.last_error) ? ` · ${syncErr(s.last_error)}` : ''}`
-        : (syncErr(s.last_error) ?? 'Ready to sync.');
+      : s.waiting_for_retry
+        ? 'Automatic sync paused after an error. Press Sync now to retry.'
+        : s.last_sync_at
+          ? `Last synced ${formatSyncStamp(s.last_sync_at)}${syncSuffix(s)}`
+          : (syncErr(s.last_error) ?? 'Ready to sync.');
 
   const showSignInError = !signedIn && !!s.last_error;
 
@@ -241,6 +253,14 @@ export function SyncPage() {
 }
 
 // Raw backend sync errors are never rendered; users get a friendly one-liner.
+/** F4 Success-with-warning: a degraded pass converged, so the stamp stands
+ *  and the suffix is a warning — never an error rendering. */
+function syncSuffix(s: SyncStatus): string {
+  if (s.degraded) return ' · Partial sync — some items were skipped';
+  const err = syncErr(s.last_error);
+  return err ? ` · ${err}` : '';
+}
+
 function syncErr(raw: unknown): string | null {
   if (!raw) return null;
   const m = String(raw).toLowerCase();
