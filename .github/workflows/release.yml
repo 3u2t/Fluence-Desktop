@@ -137,6 +137,13 @@ jobs:
             could quietly lose your data or leave sync silently broken. All of
             them are fixed here.
 
+            > **Why this is v1.27.1:** the `v1.27.0` tag was cut from the same
+            > code but never produced a download. Its release pipeline stopped
+            > at its own test gate before anything was built or published, and a
+            > regression test for these very fixes was the step that failed.
+            > Nothing was ever released under `v1.27.0`, so this is the first
+            > public build of the sync reliability work.
+
             ### Data safety
 
             - **A corrupt snippet file can no longer delete your other snippets.**
