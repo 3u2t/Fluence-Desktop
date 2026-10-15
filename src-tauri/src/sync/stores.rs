@@ -5127,7 +5127,32 @@ let snippets = super::data_dir().join("snippets.json");
         // `unwrap_or(false)` produced `snippets_enabled=false`, which the pass
         // stamped with `edit_now` (the account's highest timestamp) and
         // uploaded - winning LWW fleet-wide and disabling expansion everywhere.
-        std::fs::write(&snippets, b"{ unreadable snippets store {{").unwrap();
+        //
+        // The store is made unreadable by putting a DIRECTORY at its path, not
+        // by writing corrupt bytes. `recover::read_json_file` PRESERVES CORRUPT
+        // BYTES ASIDE on the first read, so the very next reader sees a MISSING
+        // file, gets `SnippetStore::default()` (enabled = false), and
+        // `live_values_strict` SUCCEEDS - which is exactly the fabricated
+        // `false` this test exists to catch. Writing corrupt bytes therefore
+        // only held while this test happened to be the first reader of that
+        // file; under any other ordering the premise silently evaporated and
+        // the suite went red on CI with "no baseline may be recorded for a
+        // value that was never observed". A directory fails `fs::read` with an
+        // IO error on EVERY read and is never rotated aside, so "unreadable" is
+        // a stable property here rather than a single-use one.
+        std::fs::remove_file(&snippets).ok();
+        std::fs::create_dir_all(&snippets).expect("replace the store with a directory");
+        // Assert the premise is durable, so this test can never pass vacuously
+        // again by reading a store that merely looks unreadable once.
+        assert!(
+            load_snippets_internal().is_err(),
+            "precondition: the snippets store must be unreadable"
+        );
+        assert!(
+            load_snippets_internal().is_err(),
+            "precondition: unreadability must survive repeated reads instead of \
+             being consumed by rotating the corrupt bytes aside"
+        );
         let items = SettingsDirtyStore.load(&hash);
         assert!(
             items.iter().all(|i| i.key != "snippets_enabled"),
@@ -5144,6 +5169,10 @@ let snippets = super::data_dir().join("snippets.json");
             "no baseline may be recorded for a value that was never observed"
         );
 
+        // Restore the shared store: drop the directory stand-in BEFORE writing
+        // bytes back, otherwise the restore fails and leaks a directory that
+        // every later settings/snippets test would read as an unreadable store.
+        std::fs::remove_dir(&snippets).ok();
         match original {
             Some(bytes) => std::fs::write(&snippets, bytes).unwrap(),
             None => {
