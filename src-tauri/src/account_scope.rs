@@ -84,6 +84,11 @@ pub(crate) fn prompts_base_dir_for_test() -> PathBuf {
     prompts_base_dir()
 }
 
+#[cfg(test)]
+pub(crate) fn agents_base_dir_for_test() -> PathBuf {
+    agents_base_dir()
+}
+
 /// Strictly the documented convention: the account hash is SHA-256 hex, so
 /// exactly 64 lowercase hex characters.
 ///
@@ -175,33 +180,90 @@ pub struct AccountStylesStore {
     pub custom_styles: Vec<AccountStyle>,
 }
 
+/// Read one account store, failing CLOSED to `T::default()`.
+///
+/// Delegates to `sync::recover::read_json_file` rather than re-implementing the
+/// read. That reader is the repo's single bounded store reader: it stats the file
+/// and refuses anything over its 8 MB cap BEFORE pulling a single byte in (the
+/// previous `std::fs::read_to_string` here was the only reader in the codebase
+/// with no cap, so a pathological or hostile file could OOM the process at load),
+/// and it quarantines an unparseable file under a unique `json.corrupt[.N].json`
+/// sibling. Reusing it also deletes this module's duplicate of that helper.
+///
+/// Oversized is deliberately classified as CORRUPT rather than as a distinct
+/// error, matching `recover::read_json_file` and therefore the rest of the
+/// codebase. Reasons, not convenience:
+///   - a store this app wrote cannot reach that size, so the bytes are not a
+///     store we can ever read back — every launch would repeat the failure
+///     forever with the file still in place;
+///   - the file may still hold the user's only copy, so it must never be deleted
+///     or truncated — quarantine preserves it under a sibling path, exactly as a
+///     parse failure already did;
+///   - the legacy file is a different path and is never touched, so a quarantined
+///     account file still cannot damage device-local data.
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
-    match std::fs::read_to_string(path) {
-        Ok(data) => match serde_json::from_str::<T>(&data) {
-            Ok(v) => v,
-            Err(e) => {
-                // Back up ONLY this account file. The legacy file is a different
-                // path and is never touched here, so a corrupt account file
-                // cannot damage device-local data.
-                log::warn!("Corrupt account store {}: {e:?}", path.display());
-                backup_corrupt_account(path);
-                T::default()
-            }
-        },
-        Err(_) => T::default(),
+    match crate::sync::recover::read_json_file(path) {
+        Ok(Some(v)) => v,
+        // Absent: a store this account has never written. Not an error.
+        Ok(None) => T::default(),
+        // Unparseable, oversized, or unreadable. The reader has already preserved
+        // the bytes when it could; log what it did rather than discarding the
+        // reason, so an unusable account store is diagnosable after the fact.
+        Err(e) => {
+            log::error!("Unusable account store {}: {e}", path.display());
+            T::default()
+        }
     }
 }
 
-fn backup_corrupt_account(path: &Path) {
-    let mut target = path.with_extension("json.corrupt.json");
-    let mut counter = 1;
-    while target.exists() {
-        target = path.with_extension(format!("json.corrupt.{counter}.json"));
-        counter += 1;
+/// [`read_json`], but refusing to silently degrade an UNUSABLE file to an empty
+/// store.
+///
+/// `read_json`'s `T::default()` is correct for a READER: the UI shows nothing,
+/// and the bytes survive as `.corrupt.json`. It is wrong for a WRITER, because
+/// every write path here does load → mutate → save. So a corrupt account store
+/// was loaded as "no agents", the user created one agent, and that single
+/// write persisted the empty view over their data — turning a recoverable
+/// corruption into permanent loss. The dictionary/snippet/stats stores already
+/// fail closed this way (`load_strict`); agents and styles were the outliers.
+///
+/// `Ok(None)` (absent) still yields an empty store: an account that has never
+/// written one is legitimately empty, and refusing there would make the first
+/// agent un-creatable.
+fn read_json_checked<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
+    match crate::sync::recover::read_json_file(path) {
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Ok(T::default()),
+        Err(e) => {
+            log::error!("Unusable account store {}: {e}", path.display());
+            Err(format!(
+                "account store {} is unreadable ({e}); refusing to overwrite it",
+                path.display()
+            ))
+        }
     }
-    if std::fs::rename(path, &target).is_err() && std::fs::copy(path, &target).is_ok() {
-        let _ = std::fs::remove_file(path);
-    }
+}
+
+/// A tmp path that is unique to THIS WRITER, not merely to this destination.
+///
+/// The name must never be a fixed `<store>.json.tmp`. Two concurrent writers to
+/// one account file — the sync pass reconciling its merge and a UI create racing
+/// it, both under `io_lock` in some paths and not all — then both wrote the same
+/// tmp and both renamed it: the loser either renamed a tmp the winner had already
+/// consumed, or renamed a PARTIALLY written tmp onto the destination, turning a
+/// crash-looped write into a corrupt store. `settings.rs` documents this exact
+/// failure; there it surfaced as an intermittent audio perf-test flake.
+///
+/// `pid` + `seq` is the proven pattern from `settings::save_settings`: unique
+/// within the process, unique across processes, and same-directory so the rename
+/// stays a same-volume atomic operation.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Same directory as the destination so the rename stays same-volume atomic.
+    let mut name = path.to_path_buf().into_os_string();
+    name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+    PathBuf::from(name)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -209,12 +271,25 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let data = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
-    if let Ok(f) = std::fs::File::open(&tmp) {
-        let _ = f.sync_all();
+    // Atomic write: unique tmp + sync_all + rename. See `unique_tmp_path`.
+    let tmp = unique_tmp_path(path);
+    let result = (|| -> Result<(), String> {
+        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+        // Flush via a WRITE handle: `File::open` is O_RDONLY and on Windows
+        // `sync_all` -> `FlushFileBuffers` requires `GENERIC_WRITE`, so the old
+        // read-only idiom performed no flush at all despite the comment above.
+        // Best effort and non-fatal, so this can only add durability.
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        // Best effort: never leave a stray tmp behind on the failure path.
+        // Its name is unpredictable now, so nothing else can clean it up.
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    result
 }
 
 pub(crate) fn load_account_agents(account_hash: &str) -> AccountAgentsStore {
@@ -222,6 +297,27 @@ pub(crate) fn load_account_agents(account_hash: &str) -> AccountAgentsStore {
         return AccountAgentsStore::default();
     }
     read_json(&account_path(&agents_base_dir(), "agents", account_hash))
+}
+
+/// [`load_account_agents`] for WRITE paths — fails closed on an unusable store
+/// rather than degrading it to empty. See [`read_json_checked`] for why.
+pub(crate) fn load_account_agents_checked(
+    account_hash: &str,
+) -> Result<AccountAgentsStore, String> {
+    if !valid_account_hash(account_hash) {
+        return Err("invalid account hash".to_string());
+    }
+    read_json_checked(&account_path(&agents_base_dir(), "agents", account_hash))
+}
+
+/// [`load_account_styles`] for WRITE paths — fails closed. See [`read_json_checked`].
+pub(crate) fn load_account_styles_checked(
+    account_hash: &str,
+) -> Result<AccountStylesStore, String> {
+    if !valid_account_hash(account_hash) {
+        return Err("invalid account hash".to_string());
+    }
+    read_json_checked(&account_path(&prompts_base_dir(), "styles", account_hash))
 }
 
 pub(crate) fn save_account_agents(
@@ -266,11 +362,44 @@ pub(crate) fn save_account_styles(
 /// where the monotonic clock and this device's id live. Refuses an invalid
 /// hash: a record must never be written somewhere without a verified
 /// identity behind it.
-pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hint: &str) {
+///
+/// The read-modify-write runs under `io_lock`, which is the same lock the sync
+/// pass holds while reconciling its merge result (audit finding H5). Without
+/// it a pass that snapshotted the file before its Drive round trip could
+/// overwrite this write; with it, the pass sees the mutation and preserves it.
+///
+/// # Durability contract
+///
+/// Returns true ONLY when the row reached the disk. This is the same contract
+/// [`delete_account_agent`] already honours, for the same reason: an unwritable
+/// store is routine on Windows (full volume, `%LOCALAPPDATA%` ACL, an
+/// indexer/AV holding the file) and swallowing the error here made a create or
+/// rename LOOK successful to the caller — the UI renders the new agent and the
+/// user sees it, then it is gone on the next launch, with nothing on disk and
+/// nothing logged. The caller must therefore be able to tell a real save from a
+/// lost one.
+///
+/// Returns `false` for an invalid hash as well. A routed caller cannot reach
+/// that branch (`active_account_hash` filters through `valid_account_hash`), so
+/// the two causes need not be distinguished upward; a refusal is still a
+/// non-save and must never be reported as one.
+pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hint: &str) -> bool {
     if !valid_account_hash(account_hash) {
-        return;
+        log::error!(
+            "Refusing to write agent {id}: account hash is not 64 lowercase hex characters"
+        );
+        return false;
     }
-    let mut store = load_account_agents(account_hash);
+    let _io = crate::sync::io_lock::io_lock_guard();
+    // Fail closed: an unusable store must NOT be loaded as "no agents" and then
+    // written back over the user's data by this upsert.
+    let mut store = match load_account_agents_checked(account_hash) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Agent {id} was NOT saved: {e}");
+            return false;
+        }
+    };
     if let Some(e) = store.custom_agents.iter_mut().find(|e| e.id == id) {
         e.name = name.to_string();
         e.hint = hint.to_string();
@@ -287,7 +416,13 @@ pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hin
             dirty: true,
         });
     }
-    let _ = save_account_agents(account_hash, &store);
+    match save_account_agents(account_hash, &store) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("Agent {id} was NOT saved: the account store rejected the write: {e}");
+            false
+        }
+    }
 }
 
 /// Soft-delete an agent in the account's own store: writes a tombstone so the
@@ -298,11 +433,24 @@ pub(crate) fn upsert_account_agent(account_hash: &str, id: &str, name: &str, hin
 /// Callers drop the same-id legacy shadow only on success: a failed tombstone
 /// write must preserve the legacy copy, or the record ends up in neither
 /// store with no tombstone to propagate the loss.
+///
+/// Holds `io_lock` for the read-modify-write, matching the sync pass's
+/// reconcile step: a delete that lands mid-pass must be seen by that step,
+/// not overwritten by its pre-network snapshot (audit finding H5).
 pub(crate) fn delete_account_agent(account_hash: &str, id: &str) -> bool {
     if !valid_account_hash(account_hash) {
         return false;
     }
-    let mut store = load_account_agents(account_hash);
+    let _io = crate::sync::io_lock::io_lock_guard();
+    // Fail closed — a delete must never be recorded as a clean "nothing to do"
+    // against an empty view of an unusable store.
+    let mut store = match load_account_agents_checked(account_hash) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Agent delete {id} was NOT applied: {e}");
+            return false;
+        }
+    };
     let Some(e) = store.custom_agents.iter_mut().find(|e| e.id == id) else {
         return false;
     };
@@ -380,9 +528,9 @@ pub(crate) fn claim_legacy_account_agents(
     account_hash: Option<&str>,
     legacy: &[crate::agents::CustomAgent],
     only_ids: Option<&std::collections::HashSet<String>>,
-) -> ClaimOutcome {
+) -> Result<ClaimOutcome, String> {
     let Some(hash) = account_hash.filter(|h| valid_account_hash(h)) else {
-        return ClaimOutcome::default();
+        return Ok(ClaimOutcome::default());
     };
     // CLAIM-SPECIFIC CRITICAL SECTION.
     //
@@ -406,9 +554,11 @@ pub(crate) fn claim_legacy_account_agents(
 
     let mut outcome = ClaimOutcome::default();
     if legacy.is_empty() {
-        return outcome;
+        return Ok(outcome);
     }
-    let mut store = load_account_agents(hash);
+    // Fail closed: claiming into a store we failed to read would persist an
+    // empty view over the user's existing agents. Refuse the whole claim.
+    let mut store = load_account_agents_checked(hash)?;
     // Each id is DECIDED once, so a duplicated legacy id yields exactly one
     // refusal rather than one per row.
     let mut decided = std::collections::HashSet::new();
@@ -465,13 +615,19 @@ pub(crate) fn claim_legacy_account_agents(
         // Ownership MUST be durable before the caller is allowed to drop the
         // legacy copy. If this write fails the record still exists in the legacy
         // store and nowhere else, so reporting it as claimed would let the caller
-        // delete the only copy — a silent data loss. Report nothing claimed and
-        // let the legacy row stand; the user can retry.
-        if save_account_agents(hash, &store).is_err() {
-            outcome.claimed_ids.clear();
+        // delete the only copy — a silent data loss.
+        //
+        // S6: the old code cleared `claimed_ids` here and returned an empty
+        // outcome, which the UI rendered as "Nothing to add" — mislabeling a
+        // failed save as "nothing to do". A failed save is not an empty
+        // outcome; it is an error, so it is returned as one. The command layer
+        // surfaces it as an error toast (never "Nothing to add"), and the
+        // legacy row stands for a retry.
+        if let Err(e) = save_account_agents(hash, &store) {
+            return Err(format!("could not save the claimed record: {e}"));
         }
     }
-    outcome
+    Ok(outcome)
 }
 
 /// Style counterpart of [`claim_legacy_account_agents`], with identical rules.
@@ -479,9 +635,9 @@ pub(crate) fn claim_legacy_account_styles(
     account_hash: Option<&str>,
     legacy: &[crate::prompts::CustomStyle],
     only_ids: Option<&std::collections::HashSet<String>>,
-) -> ClaimOutcome {
+) -> Result<ClaimOutcome, String> {
     let Some(hash) = account_hash.filter(|h| valid_account_hash(h)) else {
-        return ClaimOutcome::default();
+        return Ok(ClaimOutcome::default());
     };
     // Same claim-specific critical section as the agent path, contending with the
     // already-locked `StyleDirtyStore::stamp_account`. Still not B2/R1.
@@ -489,9 +645,10 @@ pub(crate) fn claim_legacy_account_styles(
 
     let mut outcome = ClaimOutcome::default();
     if legacy.is_empty() {
-        return outcome;
+        return Ok(outcome);
     }
-    let mut store = load_account_styles(hash);
+    // Fail closed — see the agent counterpart.
+    let mut store = load_account_styles_checked(hash)?;
     // Each id decided once — see the agent counterpart.
     let mut decided = std::collections::HashSet::new();
     for rec in legacy {
@@ -537,19 +694,39 @@ pub(crate) fn claim_legacy_account_styles(
     if !outcome.claimed_ids.is_empty() {
         // Same fail-safe as agents: ownership must be durable before the caller
         // drops the legacy copy, or a failed write loses the only copy.
-        if save_account_styles(hash, &store).is_err() {
-            outcome.claimed_ids.clear();
+        // S6, same as agents: a failed save is an error, never an empty
+        // outcome, so it can never render as "Nothing to add".
+        if let Err(e) = save_account_styles(hash, &store) {
+            return Err(format!("could not save the claimed record: {e}"));
         }
     }
-    outcome
+    Ok(outcome)
 }
 
-/// Style counterpart of [`upsert_account_agent`].
-pub(crate) fn upsert_account_style(account_hash: &str, id: &str, name: &str, hint: &str) {
+/// Style counterpart of [`upsert_account_agent`]. Holds `io_lock` for the same
+/// reason: the sync pass reconciles its merge result under that lock, so an
+/// upsert landing mid-pass must not be overwritten by its pre-network
+/// snapshot (audit finding H5).
+///
+/// Same durability contract, for the same reason: true only when the style
+/// reached the disk, so a caller can never render a style the user will not
+/// have after a restart.
+pub(crate) fn upsert_account_style(account_hash: &str, id: &str, name: &str, hint: &str) -> bool {
     if !valid_account_hash(account_hash) {
-        return;
+        log::error!(
+            "Refusing to write style {id}: account hash is not 64 lowercase hex characters"
+        );
+        return false;
     }
-    let mut store = load_account_styles(account_hash);
+    let _io = crate::sync::io_lock::io_lock_guard();
+    // Fail closed — see `upsert_account_agent`.
+    let mut store = match load_account_styles_checked(account_hash) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Style {id} was NOT saved: {e}");
+            return false;
+        }
+    };
     if let Some(e) = store.custom_styles.iter_mut().find(|e| e.id == id) {
         e.name = name.to_string();
         e.hint = hint.to_string();
@@ -566,18 +743,33 @@ pub(crate) fn upsert_account_style(account_hash: &str, id: &str, name: &str, hin
             dirty: true,
         });
     }
-    let _ = save_account_styles(account_hash, &store);
+    match save_account_styles(account_hash, &store) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("Style {id} was NOT saved: the account store rejected the write: {e}");
+            false
+        }
+    }
 }
 
 /// Style counterpart of [`delete_account_agent`]: tombstone, never removal.
 ///
 /// Same durability contract: true only when the tombstone persisted, so the
-/// caller keeps the legacy shadow on any failure.
+/// caller keeps the legacy shadow on any failure. Holds `io_lock` across the
+/// read-modify-write for the same reason as [`delete_account_agent`].
 pub(crate) fn delete_account_style(account_hash: &str, id: &str) -> bool {
     if !valid_account_hash(account_hash) {
         return false;
     }
-    let mut store = load_account_styles(account_hash);
+    let _io = crate::sync::io_lock::io_lock_guard();
+    // Fail closed — see `delete_account_agent`.
+    let mut store = match load_account_styles_checked(account_hash) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Style delete {id} was NOT applied: {e}");
+            return false;
+        }
+    };
     let Some(e) = store.custom_styles.iter_mut().find(|e| e.id == id) else {
         return false;
     };
@@ -2348,7 +2540,7 @@ mod legacy_claim_tests {
     fn explicit_claim_transfers_ownership_into_the_ordinary_lifecycle() {
         let h = fresh_agents("lc_claim_owned");
         let legacy = vec![la("agent:1", "Legacy")];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:1".to_string()]);
         assert!(out.skipped_ids.is_empty());
 
@@ -2365,7 +2557,7 @@ mod legacy_claim_tests {
     fn claimed_record_becomes_runnable_known_and_syncable() {
         let h = fresh_agents("lc_claim_capabilities");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         let snap = snap_for(&h, &legacy);
         let rec = &snap.union[0];
@@ -2381,7 +2573,7 @@ mod legacy_claim_tests {
     fn claimed_record_resolves_a_hint_for_execution() {
         let h = fresh_agents("lc_claim_hint");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         let snap = snap_for(&h, &legacy);
         assert_eq!(
             snap.resolve(Some("agent:1")).hint.as_deref(),
@@ -2393,7 +2585,7 @@ mod legacy_claim_tests {
     fn claimed_record_becomes_deletable_and_delete_writes_a_tombstone() {
         let h = fresh_agents("lc_claim_delete");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         delete_account_agent(&h, "agent:1");
         let row = &load_account_agents(&h).custom_agents[0];
@@ -2414,7 +2606,7 @@ mod legacy_claim_tests {
     fn ownership_survives_a_restart() {
         let h = fresh_agents("lc_claim_restart");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         // A cold start re-reads from disk; the claim must still be there.
         let reloaded = load_account_agents(&h);
@@ -2428,8 +2620,8 @@ mod legacy_claim_tests {
     #[test]
     fn signed_out_claim_is_refused_and_writes_nothing() {
         let legacy = vec![la("agent:1", "Legacy")];
-        assert!(claim_legacy_account_agents(None, &legacy, None).is_empty());
-        assert!(claim_legacy_account_agents(Some(""), &legacy, None).is_empty());
+        assert!(claim_legacy_account_agents(None, &legacy, None).expect("claim must succeed in test").is_empty());
+        assert!(claim_legacy_account_agents(Some(""), &legacy, None).expect("claim must succeed in test").is_empty());
     }
 
     #[test]
@@ -2438,7 +2630,7 @@ mod legacy_claim_tests {
         // A non-blank value that is not a valid hash is an UNVERIFIABLE identity,
         // not an absent one: fail closed rather than adopt.
         for bad in ["not-a-hash", "ZZZ", &"A".repeat(64), &"a".repeat(63)] {
-            let out = claim_legacy_account_agents(Some(bad), &legacy, None);
+            let out = claim_legacy_account_agents(Some(bad), &legacy, None).expect("claim must succeed in test");
             assert!(
                 out.is_empty(),
                 "invalid identity {bad:?} must claim nothing"
@@ -2458,7 +2650,7 @@ mod legacy_claim_tests {
         assert!(load_account_agents(&b_hash).custom_agents.is_empty());
 
         // B claims it: ownership lands in B, and nowhere else.
-        claim_legacy_account_agents(Some(&b_hash), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&b_hash), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(load_account_agents(&b_hash).custom_agents.len(), 1);
         assert!(load_account_agents(&a_hash).custom_agents.is_empty());
     }
@@ -2468,7 +2660,7 @@ mod legacy_claim_tests {
         let a_hash = fresh_agents("lc_iso_a");
         let b_hash = fresh_agents("lc_iso_b");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&a_hash), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&a_hash), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         let b = snap_for(&b_hash, &legacy);
         assert_eq!(b.union.len(), 1);
@@ -2495,7 +2687,7 @@ mod legacy_claim_tests {
         .unwrap();
         let legacy = vec![la("agent:1", "Legacy version")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.skipped_ids, vec!["agent:1".to_string()]);
         assert!(out.claimed_ids.is_empty());
 
@@ -2550,7 +2742,7 @@ mod legacy_claim_tests {
     fn a_stale_merge_that_drops_the_claim_leaves_the_record_recoverable() {
         let h = fresh_agents("lc_stale_merge");
         let legacy = vec![la("agent:1", "Legacy")];
-        let claim = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let claim = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(claim.claimed_ids, vec!["agent:1".to_string()]);
 
         // The sync pass now writes the snapshot it captured BEFORE the claim: no
@@ -2582,13 +2774,13 @@ mod legacy_claim_tests {
         let h = fresh_agents("lc_idempotent");
         let legacy = vec![la("agent:1", "Legacy")];
 
-        let first = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let first = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(first.claimed_ids.len(), 1);
 
         // The user taps again. Either the legacy row is gone (empty no-op) or it
         // is still there and now collides (skipped). Both are safe; neither may
         // create a second row or rewrite the first.
-        let second = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let second = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(
             second.claimed_ids.is_empty(),
             "a second claim must not re-add"
@@ -2600,9 +2792,9 @@ mod legacy_claim_tests {
     #[test]
     fn empty_and_unmatched_claims_are_no_ops() {
         let h = fresh_agents("lc_noop");
-        assert!(claim_legacy_account_agents(Some(&h), &[], None).is_empty());
+        assert!(claim_legacy_account_agents(Some(&h), &[], None).expect("claim must succeed in test").is_empty());
         let legacy = vec![la("agent:1", "Legacy")];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:absent"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:absent"]))).expect("claim must succeed in test");
         assert!(out.is_empty());
         assert!(load_account_agents(&h).custom_agents.is_empty());
     }
@@ -2616,7 +2808,7 @@ mod legacy_claim_tests {
             la("agent:3", "Three"),
         ];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:2".to_string()]);
         let owned = load_account_agents(&h).custom_agents;
         assert_eq!(owned.len(), 1);
@@ -2628,7 +2820,7 @@ mod legacy_claim_tests {
         let h = fresh_agents("lc_multi");
         let legacy = vec![la("agent:1", "One"), la("agent:2", "Two")];
         let out =
-            claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1", "agent:2"])));
+            claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1", "agent:2"]))).expect("claim must succeed in test");
         let mut got = out.claimed_ids.clone();
         got.sort();
         assert_eq!(got, vec!["agent:1".to_string(), "agent:2".to_string()]);
@@ -2637,8 +2829,15 @@ mod legacy_claim_tests {
 
     // ── 6. fail-safe: never lose the only copy ─────────────────────────────
 
+    /// S6: a failed ownership write is an error, never an empty outcome.
+    ///
+    /// This test previously pinned the opposite (`..._reports_nothing_claimed`):
+    /// a failed save cleared `claimed_ids` and returned empty, which the UI
+    /// rendered as "Nothing to add". That mislabeled a failure as "nothing to
+    /// do". The save failure is now returned as `Err`, so the command layer
+    /// surfaces an error toast and the caller keeps the legacy copy.
     #[test]
-    fn a_failed_ownership_write_reports_nothing_claimed() {
+    fn a_failed_ownership_write_is_an_error_never_an_empty_outcome() {
         let h = hash_for("lc_write_fail");
         let path = account_path(&agents_base_dir(), "agents", &h);
         let _ = std::fs::remove_file(&path);
@@ -2649,11 +2848,9 @@ mod legacy_claim_tests {
         let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:only"])));
 
         assert!(
-            out.claimed_ids.is_empty(),
-            "must not report a claim whose write never landed, or the caller would \
-             delete the legacy copy and lose the record entirely"
+            out.is_err(),
+            "must report the failed write as an error, or the UI renders it as \"Nothing to add\""
         );
-        assert!(out.skipped_ids.is_empty());
         // Prove the ownership write really did not land by re-reading the account
         // store: no row for that id exists. THAT is what forces the caller to keep
         // the legacy copy.
@@ -2711,10 +2908,13 @@ mod legacy_claim_tests {
         )
         .unwrap();
         let path = account_path(&agents_base_dir(), "agents", &h);
-        let tmp = path.with_extension("json.tmp");
         // Read-only account file: the load succeeds (the row is there) but the
         // tombstone write cannot land. Windows-only semantics: renaming onto a
         // read-only file fails, which is exactly the failure under test.
+        //
+        // The BLOCKER is the read-only destination, not any tmp name — writers
+        // name their tmp per caller (`<store>.json.tmp.<pid>.<seq>`), so
+        // occupying a fixed tmp path would block nothing at all.
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();
@@ -2726,7 +2926,6 @@ mod legacy_claim_tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
-        let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&path);
 
         assert!(
@@ -2771,7 +2970,8 @@ mod legacy_claim_tests {
         )
         .unwrap();
         let path = account_path(&prompts_base_dir(), "styles", &h);
-        let tmp = path.with_extension("json.tmp");
+        // Blocker is the read-only DESTINATION; writers name their tmp per
+        // caller, so a fixed tmp path would block nothing.
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();
@@ -2782,7 +2982,6 @@ mod legacy_claim_tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
-        let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&path);
 
         assert!(
@@ -2807,7 +3006,7 @@ mod legacy_claim_tests {
         assert!(!before.is_runnable(&before.union[0]));
         assert!(!before.admission_of(&before.union[0]).is_syncable());
 
-        let out = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        let out = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["style:1".to_string()]);
 
         let after = styles_snap_for(&h, &legacy);
@@ -2827,10 +3026,10 @@ mod legacy_claim_tests {
         let h = fresh_styles("lc_style_safety");
         let legacy = vec![ls("style:1", "Legacy")];
 
-        assert!(claim_legacy_account_styles(None, &legacy, None).is_empty());
+        assert!(claim_legacy_account_styles(None, &legacy, None).expect("claim must succeed in test").is_empty());
 
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
-        let again = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
+        let again = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert!(again.claimed_ids.is_empty());
         assert_eq!(load_account_styles(&h).custom_styles.len(), 1);
 
@@ -2841,7 +3040,7 @@ mod legacy_claim_tests {
             },
         )
         .unwrap();
-        let skip = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        let skip = claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         assert_eq!(skip.skipped_ids, vec!["style:1".to_string()]);
         assert_eq!(load_account_styles(&h).custom_styles[0].name, "Owned");
     }
@@ -2850,7 +3049,7 @@ mod legacy_claim_tests {
     fn style_delete_after_claim_tombstones() {
         let h = fresh_styles("lc_style_delete");
         let legacy = vec![ls("style:1", "Legacy")];
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
         delete_account_style(&h, "style:1");
         assert!(load_account_styles(&h).custom_styles[0]
             .deleted_at
@@ -2873,7 +3072,7 @@ mod legacy_claim_tests {
     fn deleting_a_claimed_agent_does_not_resurrect_it_on_sign_out() {
         let h = fresh_agents("lc_delete_resurrect");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
 
         // Tombstone in the account store (what the routed delete writes first).
         delete_account_agent(&h, "agent:1");
@@ -2906,7 +3105,7 @@ mod legacy_claim_tests {
     fn agents_view_marks_only_signed_in_unclaimed_rows_claimable() {
         let h = fresh_agents("lc_view");
         let legacy = vec![la("agent:1", "Legacy")];
-        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         save_account_agents(
             &h,
             &AccountAgentsStore {
@@ -2932,7 +3131,7 @@ mod legacy_claim_tests {
     fn styles_view_lists_unclaimed_rows_so_a_claim_is_possible() {
         let h = fresh_styles("lc_style_view");
         let legacy = vec![ls("style:1", "Legacy")];
-        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"])));
+        claim_legacy_account_styles(Some(&h), &legacy, Some(&only(&["style:1"]))).expect("claim must succeed in test");
 
         let view = styles_snap_for(&h, &legacy).into_view_list();
         assert_eq!(view.len(), 1);
@@ -2970,7 +3169,7 @@ mod legacy_claim_tests {
         let legacy = vec![la("agent:1", "Legacy")];
 
         // Normal claim: owned.
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:1".to_string()]);
         assert!(load_account_agents(&h)
             .custom_agents
@@ -2979,12 +3178,20 @@ mod legacy_claim_tests {
 
         // Failed ownership write: not owned, and the caller therefore keeps the
         // legacy copy, so the record still exists.
+        //
+        // S6: the blocked claim is an `Err`, not an empty outcome. The record
+        // survives because it was never removed from the legacy store — the
+        // caller keeps it on any error, which is exactly what the `Err` tells
+        // it to do.
         let h2 = fresh_agents("lc_never_neither2");
         let path = account_path(&agents_base_dir(), "agents", &h2);
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir_all(&path).unwrap();
         let out2 = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only(&["agent:1"])));
-        assert!(out2.claimed_ids.is_empty());
+        assert!(
+            out2.is_err(),
+            "a blocked ownership write must be an error so the caller keeps the legacy copy"
+        );
         let in_account2 = load_account_agents(&h2)
             .custom_agents
             .iter()
@@ -3014,7 +3221,7 @@ mod legacy_claim_tests {
         .unwrap();
         let legacy = vec![la("agent:1", "Legacy")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(
             out.claimed_ids.is_empty(),
             "a delete must never be resurrected"
@@ -3051,7 +3258,7 @@ mod legacy_claim_tests {
             Some(&h),
             &[ls("style:1", "Legacy")],
             Some(&only(&["style:1"])),
-        );
+        ).expect("claim must succeed in test");
         assert!(out.claimed_ids.is_empty());
         assert!(out
             .refused_ids
@@ -3069,7 +3276,7 @@ mod legacy_claim_tests {
         // reporting one adopted.
         let legacy = vec![la("agent:1", "Version A"), la("agent:1", "Version B")];
 
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:1"]))).expect("claim must succeed in test");
         assert!(out.claimed_ids.is_empty());
         assert_eq!(
             out.refused_ids,
@@ -3089,7 +3296,7 @@ mod legacy_claim_tests {
             la("agent:1", "Version B"),
             la("agent:2", "Fine"),
         ];
-        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"])));
+        let out = claim_legacy_account_agents(Some(&h), &legacy, Some(&only(&["agent:2"]))).expect("claim must succeed in test");
         assert_eq!(out.claimed_ids, vec!["agent:2".to_string()]);
         assert!(out.refused_ids.is_empty());
     }
@@ -3103,7 +3310,7 @@ mod legacy_claim_tests {
             Some(&h),
             &[la(crate::agents::ID_BUILT_IN, "Builtin")],
             Some(&only(&[crate::agents::ID_BUILT_IN])),
-        );
+        ).expect("claim must succeed in test");
         assert!(
             out.claimed_ids.is_empty(),
             "a reserved id must never be ownable"
@@ -3117,7 +3324,7 @@ mod legacy_claim_tests {
         let hs = fresh_styles("lc_builtin_style");
         let bid = crate::prompts::ID_PROOFREAD;
         let outs =
-            claim_legacy_account_styles(Some(&hs), &[ls(bid, "Proofread")], Some(&only(&[bid])));
+            claim_legacy_account_styles(Some(&hs), &[ls(bid, "Proofread")], Some(&only(&[bid]))).expect("claim must succeed in test");
         assert!(outs.claimed_ids.is_empty());
         assert!(outs
             .refused_ids
@@ -3148,8 +3355,515 @@ mod legacy_claim_tests {
                 la(crate::agents::ID_BUILT_IN, "Builtin"),
             ],
             None,
-        );
+        ).expect("claim must succeed in test");
         assert!(!out.is_empty());
         assert!(out.claimed_ids.is_empty());
+    }
+
+    /// S6: a claim whose durable save fails must be an `Err`, never an empty
+    /// `Ok`. The old code cleared `claimed_ids` on a save failure and returned
+    /// an empty outcome, which the UI rendered as "Nothing to add" —
+    /// mislabeling a failed save as "nothing to do".
+    ///
+    /// Made deterministic by blocking exactly the target account file with a
+    /// directory, so the atomic rename lands on a directory and fails. Scoped
+    /// to one hash's file on purpose: blocking the whole shared base dir broke
+    /// concurrent claim tests that do not hold the store guard.
+    #[test]
+    fn s6_failed_save_is_an_error_never_an_empty_outcome() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("s6-save-fails@example.com");
+        let legacy = vec![la("agent:1", "Legacy")];
+        let only = only(&["agent:1"]);
+
+        // Healthy first: a claim with a writable store succeeds.
+        let ok = claim_legacy_account_agents(Some(&h), &legacy, Some(&only))
+            .expect("healthy claim must succeed");
+        assert_eq!(ok.claimed_ids, vec!["agent:1".to_string()]);
+
+        // Block exactly this hash's target file with a directory. `write_json`
+        // renames a tmp onto it, which cannot replace a directory, so the save
+        // fails deterministically while every other hash stays writable.
+        let h2 = crate::sync::metadata::account_hash_from_email("s6-blocked@example.com");
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h2);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let failed = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only));
+        assert!(
+            failed.is_err(),
+            "a claim whose persistence fails must be Err, never Ok(empty): {:?}",
+            failed.ok().map(|o| (o.claimed_ids, o.skipped_ids, o.refused_ids))
+        );
+        let msg = failed.unwrap_err();
+        // The failure now surfaces at LOAD, not save, and that is the point of
+        // `load_account_agents_checked`: a target blocked by a directory is
+        // unreadable, so the claim is refused BEFORE it mutates or saves
+        // anything, instead of loading an empty view, mutating it, and only then
+        // discovering the write would fail. The assertion is still "the error
+        // must explain itself, not vanish" — only the wording it expects moved.
+        assert!(
+            msg.contains("unreadable"),
+            "the error must say the store is unusable, not vanish: {msg}"
+        );
+
+        // Unblock and prove the same call recovers: the failure was the
+        // injection, not a permanent condition.
+        let _ = std::fs::remove_dir_all(&target);
+        let recovered = claim_legacy_account_agents(Some(&h2), &legacy, Some(&only))
+            .expect("unblocked claim must succeed");
+        assert_eq!(recovered.claimed_ids, vec!["agent:1".to_string()]);
+    }
+
+    /// S6, styles counterpart: same rule, same shape.
+    #[test]
+    fn s6_failed_style_save_is_an_error_never_an_empty_outcome() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("s6-style-blocked@example.com");
+        let legacy = vec![ls("custom:1", "Legacy")];
+        let only = only(&["custom:1"]);
+
+        let target = account_path_for_test(&prompts_base_dir(), "styles", &h);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let failed = claim_legacy_account_styles(Some(&h), &legacy, Some(&only));
+        assert!(
+            failed.is_err(),
+            "a style claim whose save fails must be Err, never Ok(empty)"
+        );
+
+        let _ = std::fs::remove_dir_all(&target);
+        let recovered = claim_legacy_account_styles(Some(&h), &legacy, Some(&only))
+            .expect("unblocked style claim must succeed");
+        assert_eq!(recovered.claimed_ids, vec!["custom:1".to_string()]);
+    }
+
+    // ── 12. create durability: an undurable write is NOT a create ────────────
+    //
+    // The create path used to end `let _ = save_account_agents(..)`. An
+    // unwritable store (full volume, `%LOCALAPPDATA%` ACL, an indexer holding
+    // the file — all routine on Windows) therefore produced an agent the caller
+    // reported as saved and the UI rendered, which was gone on the next launch
+    // with nothing on disk and nothing logged. `delete_account_agent` had
+    // refused to do that all along; only create swallowed.
+
+    /// Block a NOT-YET-WRITTEN account file with a DIRECTORY. `write_json`
+    /// renames a tmp onto the destination, which cannot replace a directory, so
+    /// the save fails deterministically and cross-platform (a read-only *file*
+    /// only blocks the rename on Windows) while every other hash stays
+    /// writable. Scoped to one hash on purpose: blocking the shared base dir
+    /// would break concurrent tests that do not hold the store guard.
+    ///
+    /// Refuses to touch a path that already holds a store. An earlier draft did
+    /// `remove_file` first — borrowed from the claim test, whose target hash was
+    /// never written — which silently DESTROYED the store it was about to use as
+    /// the "healthy first" precondition. Asserting instead of deleting means the
+    /// precondition can never be destroyed by accident.
+    fn block_fresh_account_path(base: &Path, stem: &str, hash: &str) -> PathBuf {
+        let target = account_path_for_test(base, stem, hash);
+        assert!(
+            !target.exists(),
+            "the blocked hash must be one nothing has written yet"
+        );
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+        target
+    }
+
+    #[test]
+    fn upsert_account_agent_reports_failure_when_the_store_cannot_be_written() {
+        let _guard = crate::sync::stores::store_test_guard();
+
+        // Healthy first, on its OWN hash, so the assertion below cannot pass
+        // vacuously and so blocking cannot destroy this precondition.
+        let healthy = crate::sync::metadata::account_hash_from_email("upsert-healthy@example.com");
+        assert!(
+            upsert_account_agent(&healthy, "agent:1", "Durable", "hint"),
+            "precondition: a writable store reports a real save"
+        );
+        assert!(load_account_agents(&healthy)
+            .custom_agents
+            .iter()
+            .any(|a| a.id == "agent:1"));
+
+        let blocked = crate::sync::metadata::account_hash_from_email("upsert-blocked@example.com");
+        let target = block_fresh_account_path(&agents_base_dir(), "agents", &blocked);
+
+        let failed = upsert_account_agent(&blocked, "agent:2", "Lost", "hint");
+        let _ = std::fs::remove_dir_all(&target);
+
+        assert!(
+            !failed,
+            "a create whose write never landed must report failure, not success"
+        );
+        // Unblocked: the same call recovers, so the false was the injection and
+        // not a permanent refusal.
+        assert!(
+            upsert_account_agent(&blocked, "agent:2", "Recovered", "hint"),
+            "the failure must be the injection, not a permanent condition"
+        );
+        let reloaded = load_account_agents(&blocked);
+        assert_eq!(
+            reloaded
+                .custom_agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent:2"],
+            "the failed create must have left nothing behind for a later save to inherit"
+        );
+        // And the healthy store is untouched: the gate reports failure, it does
+        // not corrupt or delete anything.
+        assert_eq!(load_account_agents(&healthy).custom_agents.len(), 1);
+    }
+
+    /// The style counterpart, same rule, same shape.
+    #[test]
+    fn upsert_account_style_reports_failure_when_the_store_cannot_be_written() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let healthy = crate::sync::metadata::account_hash_from_email("upsert-style-healthy@example.com");
+        assert!(
+            upsert_account_style(&healthy, "custom:1", "Durable", "hint"),
+            "precondition: a writable store reports a real save"
+        );
+
+        let blocked =
+            crate::sync::metadata::account_hash_from_email("upsert-style-blocked@example.com");
+        let target = block_fresh_account_path(&prompts_base_dir(), "styles", &blocked);
+
+        let failed = upsert_account_style(&blocked, "custom:2", "Lost", "hint");
+        let _ = std::fs::remove_dir_all(&target);
+
+        assert!(
+            !failed,
+            "a style create whose write never landed must report failure, not success"
+        );
+        assert!(upsert_account_style(&blocked, "custom:2", "Recovered", "hint"));
+        assert_eq!(
+            load_account_styles(&blocked).custom_styles.len(),
+            1,
+            "the failed create must have left nothing behind"
+        );
+        assert_eq!(load_account_styles(&healthy).custom_styles.len(), 1);
+    }
+
+    /// Block a store that ALREADY EXISTS. The file is set aside (not deleted)
+    /// so the blocked write sees a real, restorable store afterwards — a delete
+    /// needs a row to tombstone, so the precondition cannot be an empty path.
+    /// Returns the blocked path and the sidecar holding the original bytes.
+    fn block_existing_account_path(base: &Path, stem: &str, hash: &str) -> (PathBuf, PathBuf) {
+        let target = account_path_for_test(base, stem, hash);
+        assert!(
+            target.is_file(),
+            "precondition: there is a store to block"
+        );
+        let saved = target.with_extension("json.set-aside-by-test");
+        let _ = std::fs::remove_file(&saved);
+        std::fs::rename(&target, &saved).expect("must be able to set the store aside");
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+        (target, saved)
+    }
+
+    fn unblock_existing_account_path(target: &Path, saved: &Path) {
+        let _ = std::fs::remove_dir_all(target);
+        std::fs::rename(saved, target).expect("must be able to restore the store");
+    }
+
+    /// The delete path already had this contract and must keep it: a tombstone
+    /// that never landed is NOT a delete. Pinned here so the create fix cannot
+    /// be made later by relaxing the shared `write_json` failure handling.
+    #[test]
+    fn delete_still_reports_failure_when_the_tombstone_cannot_be_written() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("delete-gate@example.com");
+        let hs = crate::sync::metadata::account_hash_from_email("delete-gate-style@example.com");
+
+        // Writable: a delete that lands is a durable delete.
+        assert!(upsert_account_agent(&h, "agent:1", "Doomed", "hint"));
+        assert!(upsert_account_style(&hs, "custom:1", "Doomed", "hint"));
+        assert!(
+            delete_account_agent(&h, "agent:1"),
+            "precondition: a writable store deletes"
+        );
+        assert!(delete_account_style(&hs, "custom:1"));
+
+        // Blocked: the stores are set aside, never deleted, so the "still live
+        // and untombstoned" assertions below inspect the REAL bytes.
+        assert!(upsert_account_agent(&h, "agent:2", "Doomed", "hint"));
+        assert!(upsert_account_style(&hs, "custom:2", "Doomed", "hint"));
+        let (target, saved) = block_existing_account_path(&agents_base_dir(), "agents", &h);
+        let (target_style, saved_style) =
+            block_existing_account_path(&prompts_base_dir(), "styles", &hs);
+
+        let agent_deleted = delete_account_agent(&h, "agent:2");
+        let style_deleted = delete_account_style(&hs, "custom:2");
+        unblock_existing_account_path(&target, &saved);
+        unblock_existing_account_path(&target_style, &saved_style);
+
+        assert!(
+            !agent_deleted && !style_deleted,
+            "an undurable tombstone must keep reporting failure"
+        );
+        assert!(
+            load_account_agents(&h)
+                .custom_agents
+                .iter()
+                .any(|a| a.id == "agent:2" && a.deleted_at.is_none()),
+            "an agent whose tombstone never landed must still be live and untombstoned"
+        );
+        assert!(
+            load_account_styles(&hs)
+                .custom_styles
+                .iter()
+                .any(|s| s.id == "custom:2" && s.deleted_at.is_none()),
+            "a style whose tombstone never landed must still be live and untombstoned"
+        );
+        assert!(
+            delete_account_agent(&h, "agent:2"),
+            "the delete must succeed once the store is writable again"
+        );
+    }
+
+    /// An invalid hash is a refusal, never a silent no-op reported as saved.
+    #[test]
+    fn an_invalid_account_hash_is_refused_not_upserted() {
+        assert!(
+            !upsert_account_agent("not-a-hash", "agent:1", "X", "hint"),
+            "an unverifiable identity must never be reported as a save"
+        );
+        assert!(
+            !upsert_account_style("not-a-hash", "custom:1", "X", "hint"),
+            "an unverifiable identity must never be reported as a save"
+        );
+    }
+
+    // ── 13. the write must not be corruptible by a second concurrent writer ──
+
+    /// The tmp name must be unique per WRITER, not just per destination.
+    ///
+    /// A fixed `<store>.json.tmp` let two writers to one account file write the
+    /// same tmp and both rename it; the loser could rename a PARTIALLY written
+    /// tmp onto the destination. `settings.rs` documents the identical bug
+    /// there. Asserted directly on the name so the guard is checked, not raced.
+    #[test]
+    fn concurrent_writers_never_share_a_tmp_name() {
+        let h = crate::sync::metadata::account_hash_from_email("tmp-uniqueness@example.com");
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h);
+        let a = unique_tmp_path(&target);
+        let b = unique_tmp_path(&target);
+        assert_ne!(
+            a, b,
+            "two writers must never be handed the same tmp path"
+        );
+        assert_eq!(
+            a.parent(),
+            target.parent(),
+            "the tmp must sit beside the destination so the rename stays same-volume atomic"
+        );
+        assert!(
+            !a.exists() && !b.exists(),
+            "unique_tmp_path only names a file; it must not create one"
+        );
+    }
+
+    /// End-to-end consequence of a unique tmp: concurrent writers to one account
+    /// store never leave a partial document behind, and never leave stray tmps
+    /// on the failure path.
+    #[test]
+    fn concurrent_upserts_leave_a_parseable_store_and_no_stray_tmp() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("concurrent-upsert@example.com");
+        let _ = std::fs::remove_file(account_path_for_test(&agents_base_dir(), "agents", &h));
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    for round in 0..6 {
+                        upsert_account_agent(&h, &format!("agent:{i}-{round}"), "N", "hint");
+                    }
+                })
+            })
+            .collect();
+        for t in writers {
+            t.join().expect("writer thread must not panic");
+        }
+
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h);
+        // A partial rename would leave bytes that do not parse; the bounded
+        // reader would quarantine them and this load would come back empty.
+        assert_eq!(
+            load_account_agents(&h).custom_agents.len(),
+            48,
+            "a shared tmp name loses rows or lands a partial document"
+        );
+        // Scoped to THIS destination's name prefix, not the whole base dir: the
+        // test harness runs tests in parallel and other tests write account
+        // files in the same directory.
+        let strays = stray_tmps_for(&target);
+        assert!(
+            strays.is_empty(),
+            "a successful write must leave no tmp behind, got {strays:?}"
+        );
+    }
+
+    /// A failed write must not leave its tmp behind either. Its name is now
+    /// unpredictable, so nothing downstream can clean it up — `write_json` has
+    /// to.
+    #[test]
+    fn a_failed_write_leaves_no_stray_tmp() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("failed-write-tmp@example.com");
+        // A hash nothing has written: blocking it must not delete anything.
+        let target = block_fresh_account_path(&agents_base_dir(), "agents", &h);
+
+        assert!(!upsert_account_agent(&h, "agent:2", "N", "hint"));
+        let _ = std::fs::remove_dir_all(&target);
+
+        let strays = stray_tmps_for(&target);
+        assert!(
+            strays.is_empty(),
+            "a failed write must not leave its tmp behind, got {strays:?}"
+        );
+    }
+
+    /// Sibling files of `target` that look like its tmp, e.g.
+    /// `agents.account-<hash>.json.tmp.<pid>.<seq>`. Scoped by the destination's
+    /// own file name so a parallel test writing a DIFFERENT account store in the
+    /// same directory can never make this scan flap.
+    fn stray_tmps_for(target: &Path) -> Vec<String> {
+        let prefix = format!("{}.tmp.", target.file_name().unwrap().to_string_lossy());
+        let Some(dir) = target.parent() else {
+            return Vec::new();
+        };
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .collect()
+    }
+
+    // ── 14. bounded reads: a pathological account file must not OOM us ──────
+
+    /// An account store over the reader's cap is quarantined, not read.
+    ///
+    /// `read_json` used to call `std::fs::read_to_string` with no cap — the only
+    /// uncapped reader in the codebase. Oversized is treated as CORRUPT (and
+    /// the bytes preserved under a `json.corrupt` sibling), matching
+    /// `recover::read_json_file` and therefore the rest of the codebase: a store
+    /// this app wrote cannot reach the cap, so the bytes are not a store we will
+    /// ever read back, while they may still be the user's only copy and so must
+    /// never be deleted.
+    ///
+    /// The cap is read from `recover` rather than hardcoded: another audit raised
+    /// it from 8 MB to 64 MB with a sound reason (local stores grow without
+    /// bound; the 8 MB wire cap was the wrong ceiling), and a test pinned to a
+    /// stale number would fail for the wrong reason or, worse, stop covering the
+    /// gate entirely.
+    ///
+    /// The fixture is deliberately VALID JSON that merely exceeds the cap. A
+    /// zero-filled file would not discriminate: an uncapped reader would fail to
+    /// parse it too, quarantine it too, and the test would pass against the very
+    /// bug it exists to catch. Only a parseable oversized file distinguishes
+    /// "refused before reading" from "read and happened to fail".
+    #[test]
+    fn an_oversized_account_store_is_quarantined_not_loaded() {
+        use std::io::Write;
+        let _guard = crate::sync::stores::store_test_guard();
+        let h = crate::sync::metadata::account_hash_from_email("oversized@example.com");
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h);
+        let cap = crate::sync::recover::MAX_LOCAL_STORE_JSON_LEN;
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(agents_base_dir()).expect("base dir must be creatable");
+
+        // One enormous but perfectly valid row, written in 1 MB chunks so the
+        // test does not allocate the whole fixture twice.
+        let mut written = 0u64;
+        {
+            let mut w = std::io::BufWriter::new(
+                std::fs::File::create(&target).expect("must be able to create the target"),
+            );
+            // `custom_agents` is the real on-disk key: `AccountAgentsStore` carries no
+            // `rename_all`, unlike the rows inside it. A `customAgents` fixture
+            // would deserialize to an EMPTY store and the test would pass for
+            // the wrong reason.
+            let head = br#"{"custom_agents":[{"id":"agent:1","name":"Over","hint":""#;
+            let tail = br#""}]}"#;
+            w.write_all(head).expect("write head");
+            written += head.len() as u64;
+            let chunk = vec![b'x'; 1 << 20];
+            while written <= cap {
+                w.write_all(&chunk).expect("write filler");
+                written += chunk.len() as u64;
+            }
+            w.write_all(tail).expect("write tail");
+            written += tail.len() as u64;
+        }
+        assert!(
+            std::fs::metadata(&target).unwrap().len() > cap,
+            "precondition: the file is over the cap"
+        );
+        let expected_len = written;
+
+        let loaded = load_account_agents(&h);
+        assert!(
+            loaded.custom_agents.is_empty(),
+            "an oversized file must never be loaded into the visible set; a parseable \
+             oversized store is the only fixture that proves the cap is checked \
+             BEFORE the read, rather than after a failed parse"
+        );
+        assert!(
+            !target.exists(),
+            "the oversized file must have been quarantined away from its own name"
+        );
+        let stem = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(agents_base_dir())
+            .expect("base dir must be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            // Scoped by this destination's own file name: another test may be
+            // quarantining its own account store in the same directory right now.
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with(&stem) && n != stem
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the bytes must be preserved aside exactly once, got {quarantined:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&quarantined[0]).unwrap().len(),
+            expected_len,
+            "the quarantined file must keep the user's bytes verbatim"
+        );
+        let _ = std::fs::remove_file(&quarantined[0]);
+    }
+
+    /// A normal store is unaffected by the cap, and the legacy file is never
+    /// touched by any of it: the account path is a different file entirely.
+    #[test]
+    fn an_ordinary_account_store_still_round_trips_under_the_cap() {
+        let h = crate::sync::metadata::account_hash_from_email("ordinary@example.com");
+        assert!(upsert_account_agent(&h, "agent:1", "Kept", "hint"));
+        let loaded = load_account_agents(&h);
+        assert_eq!(loaded.custom_agents.len(), 1);
+        assert_eq!(loaded.custom_agents[0].name, "Kept");
+        let target = account_path_for_test(&agents_base_dir(), "agents", &h);
+        assert!(target.exists(), "the store itself must remain in place");
+        let _ = std::fs::remove_file(&target);
     }
 }

@@ -5,6 +5,14 @@
 // the backend reported), and keeping the mapping here means the messaging rules
 // are unit-testable and cannot drift between the two boards.
 //
+// CONTRACT (audit finding S6): an empty outcome — all three lists absent or
+// empty, rendering as "Nothing to add" — means genuinely nothing happened.
+// It NEVER masks a failure: `claim_legacy_account_agents` and
+// `claim_legacy_account_styles` return `Err` when the durable save fails, so a
+// failed save surfaces through the caller's catch as an error toast, never
+// through this function. If this function ever renders "Nothing to add" for a
+// claim the user just tapped, that is a backend bug, not an expected state.
+//
 // `refusedIds` arrives as `[id, reason]` pairs because the backend serialises
 // `Vec<(String, &'static str)>`. Reasons are fixed strings defined by
 // `account_scope::ClaimOutcome`; an unknown reason degrades to a generic message

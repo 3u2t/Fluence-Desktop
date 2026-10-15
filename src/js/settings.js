@@ -1992,8 +1992,21 @@ async function importDictionary() {
     // File bytes are read server-side (size-bounded); the renderer no
     // longer needs direct filesystem access for imports.
     const json = await invoke('read_import_file', { path });
-    const count = await invoke('import_dictionary', { jsonData: json });
-    showToast(`Imported ${count} entries ✓`, 'success');
+    const result = await invoke('import_dictionary_report', { jsonData: json });
+    const added = result?.added ?? result ?? 0;
+    showToast(`Imported ${added} entries ✓`, 'success');
+    // Entries with an unrecognized type cannot sync (the frozen wire format
+    // has no `kind` field), so they were imported as plain corrections.
+    // Say so rather than silently changing what the user imported.
+    const coerced = result?.coerced_kind ?? 0;
+    if (coerced > 0) {
+      showToast(
+        `${coerced} ${coerced === 1 ? 'entry had' : 'entries had'} an unrecognized type and ${
+          coerced === 1 ? 'was' : 'were'
+        } imported as a correction`,
+        'info'
+      );
+    }
     loadDictionary();
   } catch (err) {
     showToast('Import failed: ' + err, 'error');
@@ -2156,7 +2169,7 @@ function setupSyncPage() {
       loadDictionary();
       loadSnippets();
     } catch (err) {
-      showToast('Sign-in failed: ' + String(err).replace(/^Error:\s*/, ''), 'error');
+      showToast(describeSignInError(err), 'error');
       if (!syncStatus) syncStatus = {};
       syncStatus.last_error = String(err);
       renderSyncStatus();
@@ -2175,7 +2188,10 @@ function setupSyncPage() {
       loadDictionary();
       loadSnippets();
     } catch (err) {
-      showToast('Sign-out failed: ' + err, 'error');
+      // Sign-out failures are local (vault/settings writes), never provider
+      // strings — but they go through the same mapper so no future raw error
+      // can reach a toast if that ever changes.
+      showToast(describeSignInError(err, 'Sign-out'), 'error');
     }
   });
 
@@ -2185,12 +2201,9 @@ function setupSyncPage() {
       return;
     }
     try {
-      const status = await invoke('sync_toggle', { enabled: syncStatus?.enabled ?? false });
-      if (status.next_attempt_ms != null) {
-        showToast('Sync started', 'success');
-      } else {
-        showToast('Sync will run shortly', 'success');
-      }
+      // Dedicated pass request: clears a fatal latch, never touches settings.
+      await invoke('sync_run_now');
+      showToast('Sync requested', 'success');
     } catch (err) {
       showToast('Failed to start sync: ' + String(err).replace(/^Error:\s*/, ''), 'error');
     }
@@ -2212,6 +2225,52 @@ function describeSyncError(raw) {
   if (/rejected|exceeds|too large/.test(m)) return 'Sync data exceeds size limits';
   if (/auth|credential|sign in again/.test(m)) return 'Google Drive access needs reauthorization';
   return 'Sync error. Will retry';
+}
+
+// S7-rem: sign-in/out failure toasts must never render raw provider strings.
+//
+// `invoke('sync_sign_in')` rejects with the Rust command's raw `Err` text, and
+// the old toast code concatenated it verbatim. Most of those strings are
+// internal diagnostics — reqwest errors embed the request URL
+// ("error sending request for url (https://oauth2.googleapis.com/...)"),
+// and token-endpoint failures can carry provider bodies. A URL or a JSON blob
+// in a toast is both a information leak and unreadable.
+//
+// So the toast renders through this mapper, not the raw string. It is
+// deliberately PURE (no DOM, no invoke) so the mapping is unit-testable via
+// the same extract-function harness as `canonicalPresetSlug`.
+//
+// One message MUST survive verbatim: the no-refresh-token error. It is
+// user-facing copy by design (it tells the user to revoke access at
+// myaccount.google.com/permissions and retry), so allowlisting it comes
+// FIRST, before any URL stripping — otherwise its own remedy URL would be
+// cut. Everything else renders as fixed copy; nothing raw ever reaches the
+// toast.
+//
+// `action` ("Sign-in" / "Sign-out") prefixes the generic fallbacks so the same
+// mapper serves both buttons without string surgery at the call site.
+function describeSignInError(raw, action) {
+  const label = action || 'Sign-in';
+  const text = String(raw || '').replace(/^Error:\s*/, '');
+  // The actionable no-refresh-token message is user-facing by design.
+  // Matched on its stable prefix so future copy edits that keep the prefix
+  // keep the allowlist; the myaccount URL inside it is intentional.
+  if (/did not return a refresh token/i.test(text)) return text;
+  const lower = text.toLowerCase();
+  // Browser could not be opened: an OS condition, never a provider string.
+  if (/failed to open the browser/i.test(text)) return 'Could not open the browser for sign-in. Please open it manually and try again.';
+  // Identity lookup and token-exchange failures carry endpoint URLs and
+  // provider bodies. Map them; never render them.
+  if (/account lookup failed/i.test(text)) return 'Could not confirm the Google account. Check your connection and try again.';
+  if (/token endpoint|token exchange|authorization code/i.test(text)) return 'Google sign-in did not complete. Please try again.';
+  if (/timeout|network|connection|dns|offline/i.test(lower)) return 'Connection issue. Check your connection and try signing in again.';
+  if (/access denied|forbidden|401|403/i.test(text)) return 'Google refused the sign-in request. Please try again.';
+  // Anything with a URL or markup is a provider string by construction.
+  if (/https?:\/\/|<[^>]+>/.test(text)) return label + ' failed. Please try again.';
+  // Unknown but short plain text without URLs is safe to show; anything long
+  // is a diagnostic dump, not a message.
+  if (text.length > 0 && text.length <= 160 && !/[{}\[\]"]/.test(text)) return label + ' failed: ' + text;
+  return label + ' failed. Please try again.';
 }
 
 function renderSyncStatus() {
@@ -2283,6 +2342,10 @@ function renderSyncStatus() {
 
   if (s.running) {
     if (statusDesc) statusDesc.textContent = 'Syncing right now…';
+  } else if (s.waiting_for_retry) {
+    // Fatal latch: automatic scheduling is paused and only a user-triggered
+    // pass (Sync now / re-enable) resumes it. Never promise a retry here.
+    if (statusDesc) statusDesc.textContent = 'Automatic sync paused after an error. Press Sync now to retry.';
   } else if (s.last_sync_at) {
     // Time-only looks fresh even after days; include the date once the sync
     // is older than today.
@@ -2290,7 +2353,7 @@ function renderSyncStatus() {
     const stamp = t.toDateString() === new Date().toDateString()
       ? t.toLocaleTimeString()
       : t.toLocaleString();
-    if (statusDesc) statusDesc.textContent = `Last synced ${stamp}${errText ? ` · ${errText}` : ''}`;
+    if (statusDesc) statusDesc.textContent = `Last synced ${stamp}${s.degraded ? ' · Partial sync — some items were skipped' : errText ? ` · ${errText}` : ''}`;
   } else if (errText) {
     if (statusDesc) statusDesc.textContent = errText;
   } else {

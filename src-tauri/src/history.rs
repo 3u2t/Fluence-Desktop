@@ -608,8 +608,12 @@ fn compute_stats(rows: &[(i64, i64, String)], now_ms: i64) -> HistoryStats {
     stats
 }
 
-#[tauri::command]
-pub fn get_history_stats() -> Result<HistoryStats, String> {
+/// Platform-local history statistics, scheduler-free core with no IPC caller
+/// gate. Identical read and aggregation to the command below; the sync
+/// scheduler's platform-local stats fallback (`get_account_stats`, signed out
+/// or before the ledger syncs) calls this from a scheduler thread, where there
+/// is no `tauri::Window` to inspect.
+pub fn get_history_stats_core() -> Result<HistoryStats, String> {
     with_db(|conn| {
         let mut stmt = conn.prepare(
             "SELECT timestamp_ms, duration_ms, text FROM history WHERE deleted_at IS NULL",
@@ -629,6 +633,14 @@ pub fn get_history_stats() -> Result<HistoryStats, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Platform-local history statistics (main window only): the overlay and the
+/// wizard never need aggregate statistics across the whole history table.
+#[tauri::command]
+pub fn get_history_stats(window: tauri::Window) -> Result<HistoryStats, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    get_history_stats_core()
+}
+
 fn weekly_activity(conn: &Connection, week_start_ms: i64) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn
         .prepare("SELECT timestamp FROM history WHERE timestamp_ms >= ?1 AND deleted_at IS NULL")?;
@@ -641,7 +653,11 @@ fn weekly_activity(conn: &Connection, week_start_ms: i64) -> rusqlite::Result<Ve
 }
 
 #[tauri::command]
-pub fn get_weekly_activity(start_of_week_utc: String) -> Result<Vec<String>, String> {
+pub fn get_weekly_activity(
+    window: tauri::Window,
+    start_of_week_utc: String,
+) -> Result<Vec<String>, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let week_start_ms = chrono::DateTime::parse_from_rfc3339(&start_of_week_utc)
         .map_err(|e| format!("invalid start_of_week_utc '{}': {}", start_of_week_utc, e))?
         .timestamp_millis();

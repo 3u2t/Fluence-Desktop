@@ -126,7 +126,16 @@ fn load_from_disk() -> Result<SuggestionDatabase> {
 /// Writes to .tmp file first, then renames to prevent corruption.
 fn save_to_disk(database: &SuggestionDatabase) -> Result<()> {
     let path = suggestions_path();
-    let tmp_path = path.with_extension("json.tmp");
+    // Unique tmp, matching `settings::save_settings` / `agents::save_store`.
+    // A FIXED name let two writers collide on one tmp and rename a partially
+    // written file onto the destination.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -137,10 +146,13 @@ fn save_to_disk(database: &SuggestionDatabase) -> Result<()> {
     // Write to temp file
     fs::write(&tmp_path, &data)?;
 
-    // Flush to disk (best-effort: Windows denies sync on read-only handles,
-    // so a sync failure must never fail the save - matches dictionary.rs,
-    // settings.rs, snippets.rs and audit_evidence.rs).
-    if let Ok(f) = fs::File::open(&tmp_path) {
+    // Flush to disk. The handle must be opened for WRITE: the previous
+    // `fs::File::open` is O_RDONLY, and on Windows `sync_all` maps to
+    // `FlushFileBuffers`, which requires `GENERIC_WRITE` — so the old code
+    // performed NO flush at all. The earlier comment blamed antivirus software;
+    // that was the wrong diagnosis for a deterministic no-op.
+    // Still best-effort (non-fatal) so a flush failure can never fail the save.
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
         let _ = f.sync_all();
     }
 
@@ -621,39 +633,52 @@ pub fn expire_stale_suggestions() -> Result<u32, String> {
 // ── Tauri Commands ───────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_suggestions() -> Result<Vec<SuggestionEntry>, String> {
+pub fn get_suggestions(window: tauri::Window) -> Result<Vec<SuggestionEntry>, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     get_pending_suggestions()
 }
 
 #[tauri::command]
 pub fn accept_suggestion_command(
+    window: tauri::Window,
     id: String,
     scheduler: tauri::State<'_, crate::sync::scheduler::Scheduler>,
 ) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     accept_suggestion(&id, scheduler)
 }
 
 #[tauri::command]
-pub fn dismiss_suggestion_command(id: String) -> Result<(), String> {
+pub fn dismiss_suggestion_command(window: tauri::Window, id: String) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     dismiss_suggestion(&id)
 }
 
 #[tauri::command]
-pub fn clear_dismissed_suggestions_command() -> Result<usize, String> {
+pub fn clear_dismissed_suggestions_command(window: tauri::Window) -> Result<usize, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     clear_dismissed_suggestions()
 }
 
 /// Number of dismissed rows, so the UI can disable "Clear Dismissed" when
 /// there is nothing to clear instead of toasting success for a no-op.
 #[tauri::command]
-pub fn get_dismissed_count() -> Result<usize, String> {
+pub fn get_dismissed_count(window: tauri::Window) -> Result<usize, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
     let database = load_from_disk().map_err(|e| e.to_string())?;
     Ok(count_dismissed(&database))
 }
 
 #[tauri::command]
-pub fn expire_stale_suggestions_command() -> Result<u32, String> {
+pub fn expire_stale_suggestions_command(window: tauri::Window) -> Result<u32, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     expire_stale_suggestions()
 }
 
@@ -661,7 +686,9 @@ pub fn expire_stale_suggestions_command() -> Result<u32, String> {
 /// observed but not yet actionable (below the surface gate). Dismissible
 /// as a permanent per-pair veto before anything can promote.
 #[tauri::command]
-pub fn get_learning_suggestions() -> Result<Vec<SuggestionEntry>, String> {
+pub fn get_learning_suggestions(window: tauri::Window) -> Result<Vec<SuggestionEntry>, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
     let database = load_from_disk().map_err(|e| e.to_string())?;
     let mut learning: Vec<SuggestionEntry> = database
@@ -692,7 +719,9 @@ fn is_auto_added(row: &SuggestionEntry) -> bool {
 /// the file. No UI group renders this; it exists so the dictionary page
 /// can badge auto-added rows without re-deriving trigger state.
 #[tauri::command]
-pub fn get_auto_accepted_suggestions() -> Result<Vec<SuggestionEntry>, String> {
+pub fn get_auto_accepted_suggestions(window: tauri::Window) -> Result<Vec<SuggestionEntry>, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     const AUTO_ADDED_FEED_CAP: usize = 50;
     let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
     let database = load_from_disk().map_err(|e| e.to_string())?;
@@ -715,7 +744,9 @@ pub fn get_auto_accepted_suggestions() -> Result<Vec<SuggestionEntry>, String> {
 /// Restricted to Auto+Accepted rows - manual accepts revert via the normal
 /// dictionary Delete path, unchanged.
 #[tauri::command]
-pub fn revert_auto_accepted_suggestion(id: String) -> Result<(), String> {
+pub fn revert_auto_accepted_suggestion(window: tauri::Window, id: String) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    // Suggestion content is user-authored dictionary data: main-only.
     let (spoken, dict_id) = {
         let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
         let database = load_from_disk().map_err(|e| e.to_string())?;

@@ -12,6 +12,7 @@
 //   (`business_key()` derives from spoken/trigger) - never trusted from wire.
 // - Duplicate domain files on Drive are all fetched and merged by the engine.
 
+use serde::de::DeserializeOwned;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -27,7 +28,13 @@ pub const ENVELOPE_V1: i32 = 1;
 /// data.
 pub fn declared_envelope_version(bytes: &[u8]) -> Option<i32> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    value.get("v")?.as_i64().map(|v| v as i32)
+    // SATURATE, never truncate. `v as i32` wrapped: 2^32+1 became 1, so a
+    // future envelope was misclassified as v1 — that is "corrupt", which the
+    // sync pass is allowed to overwrite, destroying the newer client's data.
+    value
+        .get("v")?
+        .as_i64()
+        .map(|v| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
 }
 
 /// True when `bytes` is a readable envelope declaring a version newer than
@@ -46,6 +53,62 @@ pub const CLOCK_SKEW_TOLERANCE_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn default_kind() -> String {
     "correction".to_string()
+}
+
+// ── Shared envelope decoding (audit #7) ─────────────────────────────────────
+//
+// The envelope SHAPE is decoded whole; each RECORD is decoded independently.
+// Envelope-level problems (byte cap, malformed JSON, a wrong `v`, too many
+// entries) reject the whole file, as the frozen contract requires. A record
+// that fails to deserialize is skipped on its own — exactly what Android's
+// twin does — so one structurally-malformed record can never cost the file
+// its remaining records.
+//
+// This matters destructively: `sync_domain` sees an undecodable remote file
+// as CORRUPT and, when local state is non-empty, PUTs a replacement over it.
+// With whole-envelope decoding, a single missing `isEnabled` (or an
+// `updatedAt` sent as a string instead of a number) was enough to wipe every
+// record on Drive.
+//
+// `#[serde(default)]` on the item fields is deliberately NOT the fix: serde
+// applies `default` only to a MISSING key, never to a wrong-typed one, and
+// once defaulted it is impossible to tell an absent `isEnabled` from an
+// explicit `false` — so the malformed record would be *admitted* rather than
+// skipped. Decoding per record skips it outright and needs no field changes.
+
+/// Envelope shell only: `{"v":<int>,"entries":[<raw record>, ...]}`.
+#[derive(Deserialize)]
+struct RawEnvelope {
+    v: i64,
+    #[serde(default)]
+    entries: Vec<serde_json::Value>,
+}
+
+/// Decode one domain envelope with per-record isolation.
+///
+/// Returns `None` only for envelope-level problems. Individual records that
+/// fail to deserialize, or that fail `is_valid`, are dropped individually.
+fn decode_entries<T: DeserializeOwned>(
+    bytes: &[u8],
+    max_items: usize,
+    is_valid: fn(&T) -> bool,
+) -> Option<Vec<T>> {
+    if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
+        return None;
+    }
+    let raw: RawEnvelope = serde_json::from_slice(bytes).ok()?;
+    // `i64` not `i32`: an absurdly large `v` must not fail the parse here, so
+    // that `is_future_envelope` still sees it and protects the file.
+    if raw.v != i64::from(ENVELOPE_V1) || raw.entries.len() > max_items {
+        return None;
+    }
+    Some(
+        raw.entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value::<T>(entry).ok())
+            .filter(|item| is_valid(item))
+            .collect(),
+    )
 }
 
 // ── Dictionary ──────────────────────────────────────────────────────────────
@@ -154,17 +217,11 @@ impl DictionaryEnvelope {
 
     /// Lenient ingest: unknown fields ignored, invalid ITEMS skipped, only a
     /// wrong version or oversized item count poisons the whole envelope.
+    /// A structurally-malformed record is skipped ON ITS OWN (audit #7).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > MAX_ENVELOPE_ITEMS {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(bytes, MAX_ENVELOPE_ITEMS, DictionaryItem::validate)?,
         })
     }
 }
@@ -255,16 +312,9 @@ impl SnippetEnvelope {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > MAX_ENVELOPE_ITEMS {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(bytes, MAX_ENVELOPE_ITEMS, SnippetItem::validate)?,
         })
     }
 }
@@ -294,6 +344,24 @@ pub struct SettingsItem {
     pub updated_at: i64,
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// Optional tombstone (audit #13). The frozen settings contract allows
+    /// "+ optional deletedAt" so Android can retract a key it adopted
+    /// (e.g. reset `ai_polish_style` to a default) without the other platform
+    /// resurrecting its own value forever.
+    ///
+    /// It is OMITTED from the wire when `None`. That is load-bearing: the four
+    /// canonical fixtures predate the field, and `skip_serializing_if` is what
+    /// keeps them byte-identical on re-serialization (the byte-gate).
+    ///
+    /// Like every other domain, a tombstone is an ordinary LWW state: it wins
+    /// on `updatedAt` and loses to any newer write. It is never compared as a
+    /// tiebreak — see `merge::merge_settings`.
+    #[serde(
+        rename = "deletedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deleted_at: Option<i64>,
 }
 
 impl SettingsItem {
@@ -309,7 +377,22 @@ impl SettingsItem {
         if self.updated_at > now + CLOCK_SKEW_TOLERANCE_MS {
             return false;
         }
-        self.value.len() <= 1024
+        // Same tombstone sanity check every other domain applies, so a hostile
+        // `deletedAt: 0` cannot masquerade as a retraction. Per-record skip.
+        if let Some(d) = self.deleted_at {
+            if d <= 0 {
+                return false;
+            }
+        }
+        // Char (code-point) cap, matching every other string cap here and the
+        // contract's "settings value <=1024 chars". Bytes would reject any
+        // value over ~342 CJK characters (audit #12).
+        self.value.chars().count() <= 1024
+    }
+
+    /// True when this record is a retraction rather than a value write.
+    pub fn is_tombstone(&self) -> bool {
+        self.deleted_at.is_some()
     }
 }
 
@@ -328,16 +411,13 @@ impl SettingsEnvelope {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > SETTINGS_KEYS.len() * 4 {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(
+                bytes,
+                SETTINGS_KEYS.len() * 4,
+                SettingsItem::validate,
+            )?,
         })
     }
 }
@@ -346,7 +426,15 @@ impl SettingsEnvelope {
 // Event-sourced union dedup by eventId. One event per completed dictation;
 // totals are summed at display time so no event can ever be counted twice.
 // Backfill of pre-sync history uses deterministic UUIDv5 ids derived from the
-// history row id, making re-runs idempotent under union dedup.
+// history row id, making re-runs idempotent under union ded.
+//
+// Cross-platform note: Android's backfill uses a DIFFERENT derivation over a
+// different source (the `stats_daily` aggregate, keyed by day+account+index),
+// and that difference is deliberate and safe — see `synthetic_backfill_id`.
+// Transcription history is device-local and never syncs, so one dictation is
+// never backfilled on two devices and the union dedup is never asked to
+// collapse a cross-platform pair. Changing either derivation would re-id every
+// already-backfilled event and double the affected user's stats.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StatsItem {
@@ -433,8 +521,23 @@ pub fn synthetic_event_id(history_id: &str) -> String {
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, history_id.as_bytes()).to_string()
 }
 
-/// Deterministic UUIDv5 backfill id for legacy imports (kept for parity with
-/// Android's backfill naming).
+/// Deterministic UUIDv5 backfill id for legacy imports.
+///
+/// DEAD CODE — Windows backfills per history row via [`synthetic_event_id`], not
+/// this. Kept only so the derivation stays documented next to the live one.
+///
+/// DO NOT "align" this with Android's backfill derivation, and do not read this
+/// function as describing what Windows does. Android's backfill is over a
+/// different source entirely (the `stats_daily` aggregate, keyed by
+/// day+account+index), and the derivations differ deliberately: making them
+/// match would be destructive, not a parity fix.
+///
+/// `Backfill.kt` carries the full reasoning, including the UNMITIGATED residual
+/// that survives there — Android keys on a POSITIONAL index over the sorted day
+/// list, so a day added or removed between runs re-ids later days. Changing
+/// either derivation would re-id every already-backfilled event and double every
+/// existing user's stats; see that file for why that trade is not worth making.
+#[allow(dead_code)]
 pub fn synthetic_backfill_id(history_id: &str, account_hash: &str) -> String {
     let name = format!("{history_id}:{account_hash}");
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
@@ -468,16 +571,9 @@ impl StatsEnvelope {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > MAX_ENVELOPE_ITEMS {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(bytes, MAX_ENVELOPE_ITEMS, StatsItem::validate)?,
         })
     }
 }
@@ -687,17 +783,11 @@ impl AgentEnvelope {
 
     /// Lenient ingest: unknown fields ignored, invalid ITEMS skipped, only a
     /// wrong version or oversized item count poisons the whole envelope.
+    /// A structurally-malformed record is skipped ON ITS OWN (audit #7).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > MAX_ENVELOPE_ITEMS {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(bytes, MAX_ENVELOPE_ITEMS, AgentItem::validate)?,
         })
     }
 }
@@ -713,16 +803,9 @@ impl StyleEnvelope {
 
     /// Lenient ingest (see [`AgentEnvelope::from_bytes`]).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
-            return None;
-        }
-        let env: Self = serde_json::from_slice(bytes).ok()?;
-        if env.v != ENVELOPE_V1 || env.entries.len() > MAX_ENVELOPE_ITEMS {
-            return None;
-        }
         Some(Self {
-            v: env.v,
-            entries: env.entries.into_iter().filter(|i| i.validate()).collect(),
+            v: ENVELOPE_V1,
+            entries: decode_entries(bytes, MAX_ENVELOPE_ITEMS, StyleItem::validate)?,
         })
     }
 }
@@ -833,12 +916,14 @@ mod tests {
                     value: "dark".into(),
                     updated_at: 1,
                     device_id: "d".into(),
+                    deleted_at: None,
                 },
                 SettingsItem {
                     key: "language".into(),
                     value: "en".into(),
                     updated_at: 1,
                     device_id: "d".into(),
+                    deleted_at: None,
                 },
             ],
         };
@@ -1003,6 +1088,167 @@ mod tests {
         assert_eq!(ms.merged.len(), 1);
     }
 
+    /// #12 regression: the settings `value` cap is 1024 CHARACTERS (code
+    /// points), exactly like every other string cap in this file. It was
+    /// measured in UTF-8 BYTES, which rejected any value of ~342 CJK
+    /// characters even though it is well inside the contract's 1024-char cap.
+    #[test]
+    fn settings_value_cap_counts_codepoints_not_utf8_bytes() {
+        const CJK: char = '\u{65e5}'; // 日 - 3 UTF-8 bytes
+        const EMOJI: char = '\u{1f600}'; // 😀 - 4 UTF-8 bytes (supplementary plane)
+        let mut item = SettingsItem {
+            key: "ai_polish_style".to_string(),
+            value: CJK.to_string().repeat(1024),
+            updated_at: 1,
+            device_id: "d".to_string(),
+            deleted_at: None,
+        };
+        assert_eq!(item.value.chars().count(), 1024);
+        assert!(
+            item.value.len() > 1024,
+            "1024 CJK chars occupy {} UTF-8 bytes, well over the byte cap",
+            item.value.len()
+        );
+        assert!(
+            item.validate(),
+            "1024 CJK code points is exactly at the cap and must be valid"
+        );
+
+        item.value = CJK.to_string().repeat(1025);
+        assert!(!item.validate(), "1025 CJK code points exceeds the cap");
+
+        item.value = EMOJI.to_string().repeat(1024);
+        assert_eq!(item.value.chars().count(), 1024);
+        assert_eq!(item.value.len(), 4096);
+        assert!(
+            item.validate(),
+            "1024 astral-plane code points is exactly at the cap and must be valid"
+        );
+
+        item.value = "a".repeat(1024);
+        assert!(
+            item.validate(),
+            "1024 ASCII characters stays valid (one byte per char)"
+        );
+
+        item.value = "a".repeat(1025);
+        assert!(!item.validate(), "1025 ASCII characters exceeds the cap");
+    }
+
+    /// #7 regression: ONE structurally-malformed record must not cost the file.
+    ///
+    /// Before per-record decoding, `serde_json::from_slice` deserialized the
+    /// WHOLE envelope at once, so a single record missing `isEnabled` (or one
+    /// sending `updatedAt` as a string) made `from_bytes` return `None`. The
+    /// sync pass reads `None` as CORRUPT and, with non-empty local state,
+    /// PUTs a replacement over the file — destroying every other record on
+    /// Drive. Android's twin skips only the bad record; this pins that parity.
+    #[test]
+    fn a_structurally_malformed_record_is_skipped_and_the_file_survives() {
+        let bytes = br#"{"v":1,"entries":[
+            {"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"keeper","spoken":"keeper","corrected":"keep me","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-a"},
+            {"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"noenabled","spoken":"noenabled","corrected":"missing isEnabled","updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"},
+            {"syncId":"33333333-3333-4333-8333-333333333333","businessKey":"wrongtype","spoken":"wrongtype","corrected":"updatedAt is a string","isEnabled":true,"updatedAt":"1713471000123","deletedAt":null,"deviceId":"device-b"},
+            {"businessKey":"nosyncid","spoken":"nosyncid","corrected":"no syncId","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"},
+            "not even an object"
+        ]}"#;
+        let env = DictionaryEnvelope::from_bytes(bytes).expect("the file must still be readable");
+        assert_eq!(
+            env.entries
+                .iter()
+                .map(|e| e.spoken.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keeper"],
+            "only the four malformed records are dropped"
+        );
+        assert_eq!(
+            env.entries[0].spoken, "keeper",
+            "the one well-formed record must survive"
+        );
+    }
+
+    /// Same parity for every other envelope type — the policy lives in
+    /// `decode_entries`, and each domain must actually route through it.
+    #[test]
+    fn a_structurally_malformed_record_is_skipped_in_every_domain() {
+        let snip = br#"{"v":1,"entries":[
+            {"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"ok","trigger":"ok","expansion":"kept","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-a"},
+            {"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"bad","trigger":"bad","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"}
+        ]}"#;
+        let parsed = SnippetEnvelope::from_bytes(snip).expect("snippet envelope survives");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].trigger, "ok");
+
+        let set = br#"{"v":1,"entries":[
+            {"key":"language","value":"en","updatedAt":1713471000123,"deviceId":"device-a"},
+            {"key":"language","value":"fr","updatedAt":1713471000123}
+        ]}"#;
+        let parsed = SettingsEnvelope::from_bytes(set).expect("settings envelope survives");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].value, "en");
+
+        let stats = br#"{"v":1,"entries":[
+            {"eventId":"11111111-1111-4111-8111-111111111111","day":"2026-08-20","timestampMs":1787184000123,"words":120,"chars":640,"durationMs":84000},
+            {"eventId":"22222222-2222-4222-8222-222222222222","day":"2026-08-21","timestampMs":"nope"}
+        ]}"#;
+        let parsed = StatsEnvelope::from_bytes(stats).expect("stats envelope survives");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].day, "2026-08-20");
+
+        let agent = br#"{"v":1,"entries":[
+            {"syncId":"123e4567-e89b-12d3-a456-426614174000","businessKey":"agent:123e4567-e89b-12d3-a456-426614174001","name":"Translator","hint":"Be concise","updatedAt":1700000000000,"deletedAt":null,"deviceId":"dev-a"},
+            {"syncId":"223e4567-e89b-12d3-a456-426614174000","name":"No businessKey","hint":"x","updatedAt":1700000000000,"deletedAt":null,"deviceId":"dev-a"}
+        ]}"#;
+        let parsed = AgentEnvelope::from_bytes(agent).expect("agent envelope survives");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].name, "Translator");
+
+        let style = br#"{"v":1,"entries":[
+            {"syncId":"123e4567-e89b-12d3-a456-426614174000","businessKey":"custom:123e4567-e89b-12d3-a456-426614174001","name":"Formal","hint":"Be formal","updatedAt":1700000000000,"deletedAt":null,"deviceId":"dev-a"},
+            {"syncId":"223e4567-e89b-12d3-a456-426614174000","businessKey":"custom:123e4567-e89b-12d3-a456-426614174002","updatedAt":1700000000000,"deletedAt":null,"deviceId":"dev-a"}
+        ]}"#;
+        let parsed = StyleEnvelope::from_bytes(style).expect("style envelope survives");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].name, "Formal");
+    }
+
+    /// Envelope-LEVEL problems still reject the whole file — the per-record
+    /// skip must not leak outward and start silently truncating a file whose
+    /// shell itself is wrong.
+    #[test]
+    fn envelope_level_problems_still_reject_the_whole_file() {
+        assert!(DictionaryEnvelope::from_bytes(b"{ not json").is_none());
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":2,"entries":[]}"#).is_none());
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":1}"#).is_some(), "absent entries default empty");
+        // `entries` must be an array; anything else is an envelope problem.
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":1,"entries":{}}"#).is_none());
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":1,"entries":null}"#).is_none());
+        // Wrong type for `v` is an envelope problem too.
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":"1","entries":[]}"#).is_none());
+    }
+
+    /// #7 regression: `v as i32` truncated, so 2^32+1 became exactly 1 and a
+    /// future envelope was misread as v1 — i.e. "corrupt", which the sync pass
+    /// is allowed to overwrite. A far-future envelope must read as future.
+    #[test]
+    fn declared_envelope_version_never_truncates_a_future_version_into_v1() {
+        assert_eq!(
+            declared_envelope_version(br#"{"v":4294967297}"#),
+            Some(i32::MAX),
+            "2^32+1 must saturate, not wrap back to 1"
+        );
+        assert!(
+            is_future_envelope(br#"{"v":4294967297,"entries":[]}"#),
+            "2^32+1 truncates to 1 under `as i32` and must still read as future"
+        );
+        assert!(is_future_envelope(br#"{"v":2,"entries":[]}"#));
+        assert!(!is_future_envelope(br#"{"v":1,"entries":[]}"#));
+        assert!(!is_future_envelope(br#"{"v":-1,"entries":[]}"#));
+        // The far-future file is still unreadable to this client, and is
+        // therefore fenced exactly like any other unsupported envelope.
+        assert!(DictionaryEnvelope::from_bytes(br#"{"v":4294967297,"entries":[]}"#).is_none());
+    }
+
     #[test]
     fn future_stamped_record_skipped_per_record() {
         // F3 - far-future cap: updatedAt > now+24h is invalid per-record, never whole-file
@@ -1044,6 +1290,7 @@ mod tests {
             value: "en".to_string(),
             updated_at: future,
             device_id: "d".to_string(),
+            deleted_at: None,
         };
         assert!(!set_bad.validate());
         // Stats future also skipped, None stays valid

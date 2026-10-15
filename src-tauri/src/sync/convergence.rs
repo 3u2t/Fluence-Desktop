@@ -165,6 +165,7 @@ pub(crate) fn build_per_device(
                         value: op.value.clone().unwrap(),
                         updated_at: op.updatedAt.unwrap(),
                         device_id: op.deviceId.clone().unwrap(),
+                        deleted_at: op.deletedAt,
                     };
                     per_set.entry(dev.clone()).or_default().push(item);
                 }
@@ -222,8 +223,21 @@ mod tests {
         DictionaryEnvelope, SettingsEnvelope, SnippetEnvelope, StatsEnvelope,
     };
 
-    // 30 scenarios - explicit include_bytes! per harness spec
+    // 30 generated scenarios + scenario-31 (sync audit #5, full tie) - explicit
+    // include_bytes! per harness spec.
+    //
+    // scenario-31 is the FULL-TIE case: three devices hold one business key with
+    // IDENTICAL updatedAt, deviceId and syncId and differing only in payload. It
+    // pins RULE A level 4 (canonical wire form), the level that makes the winner
+    // independent of merge side. Its Android twin at
+    // app/src/test/resources/convergence/scenario-31.json MUST stay byte-identical
+    // to this file — if the two diverge, the corpus stops proving that both
+    // platforms resolve the tie the same way.
     const SCENARIOS: &[&[u8]] = &[
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/sync/convergence/scenario-31.json"
+        )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../examples/sync/convergence/scenario-01.json"

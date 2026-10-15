@@ -50,8 +50,15 @@ export const expireStaleSuggestions = () =>
 export const exportDictionaryJson = () =>
   invokeCmd<string>('export_dictionary');
 
+/** Outcome of a dictionary import. `coercedKind` counts entries whose `kind`
+ *  was unsupported and was coerced to `correction` (they cannot sync). */
+export interface DictionaryImportResult {
+  added: number;
+  coerced_kind: number;
+}
+
 async function importDictionaryJson(jsonData: string) {
-  return invokeCmd<number>('import_dictionary', { jsonData });
+  return invokeCmd<DictionaryImportResult>('import_dictionary_report', { jsonData });
 }
 
 interface DialogPlugin {
@@ -65,8 +72,8 @@ function dialogPlugin(): DialogPlugin {
   return dialog;
 }
 
-/** Vanilla import flow: JSON file picker → backend import → count. */
-export async function importDictionaryFile(): Promise<number | null> {
+/** Vanilla import flow: JSON file picker → backend import → result. */
+export async function importDictionaryFile(): Promise<DictionaryImportResult | null> {
   const dialog = dialogPlugin();
   const path = await dialog.open({
     filters: [{ name: 'JSON', extensions: ['json'] }],

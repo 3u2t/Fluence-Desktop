@@ -49,8 +49,30 @@ pub struct ResolvedAgent {
 }
 
 pub fn agents_path() -> PathBuf {
-    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("Fluence");
+    // Honour `FLUENCE_DATA_DIR` exactly like `sync::stores::base_data_dir()`.
+    //
+    // Without this the legacy store resolved to the REAL
+    // `%LOCALAPPDATA%\agents.json` — note NO `Fluence` leaf: this production
+    // branch starts from `dirs::data_local_dir()` and pushes only
+    // `agents.json`. Only callers of `sync::stores::base_data_dir()` append the
+    // `Fluence` component, which is what the test branch below does. That store
+    // is shared by every agent test and survives between runs, so the harness
+    // runs in parallel had tests writing over each other and each run reading
+    // the previous one's state — which made any durability test over this store
+    // flaky for reasons unrelated to the code under test.
+    //
+    // Read ONLY outside tests, matching `base_data_dir()`. Under `cfg(test)` an
+    // exported variable would collapse every `cargo test` run on the machine
+    // into one fixed directory across processes and time — the recycled-pid /
+    // shared-root hazard the per-process temp key exists to prevent. No test
+    // sets it.
+    #[cfg(not(test))]
+    let mut path = std::env::var("FLUENCE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")));
+    #[cfg(test)]
+    let mut path = crate::sync::stores::base_data_dir().join("Fluence");
+
     path.push("agents.json");
     path
 }
@@ -100,13 +122,34 @@ pub fn save_store(store: &AgentsStore) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let data = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data).map_err(|e| e.to_string())?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // Unique tmp + real flush + rename, matching `settings::save_settings` and
+    // `sync::stores::atomic_write`. Two defects lived here:
+    //  - a FIXED `json.tmp` name, so two writers both wrote the same tmp and
+    //    both renamed it — the loser renamed a tmp the winner had consumed, or
+    //    renamed a PARTIALLY written tmp onto the destination, truncating a
+    //    USER-DATA store;
+    //  - `fs::File::open` is O_RDONLY, and on Windows `sync_all` maps to
+    //    `FlushFileBuffers`, which needs `GENERIC_WRITE` — so the flush silently
+    //    did nothing despite the durability intent.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let result = (|| -> Result<(), String> {
+        fs::write(&tmp_path, &data).map_err(|e| e.to_string())?;
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        // Its name is unpredictable, so nothing else can clean it up.
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
-    Ok(())
+    result
 }
 
 pub fn sanitize_hint(hint: &str) -> String {
@@ -304,6 +347,19 @@ pub fn resolve_active_agent_routed(id: Option<&str>) -> ResolvedAgent {
 
 /// Create or update an agent: account store when signed in (so it is Owned,
 /// runnable and syncable immediately), legacy store when signed out.
+///
+/// `None` means the agent was NOT created or updated. Two ways to get there:
+/// the inputs failed validation (empty after sanitize, duplicate name), or the
+/// write to the account store failed. They are deliberately NOT split: the
+/// signed-out branch below has always collapsed a failed `save_store` into
+/// `None` the same way, and the command layer turns `None` into one error the
+/// user sees instead of a phantom row.
+///
+/// The account branch MUST report an undurable write as `None`. It used to
+/// return the new agent unconditionally, so an unwritable store (full volume,
+/// `%LOCALAPPDATA%` ACL, an indexer holding the file — routine on Windows)
+/// produced an agent the UI rendered and the user saw, which was then gone on
+/// the next launch: silent data loss with nothing on disk and nothing logged.
 pub fn save_custom_agent_routed(name: &str, hint: &str, id: Option<&str>) -> Option<CustomAgent> {
     let clean_name = sanitize_name(name);
     let clean_hint = sanitize_hint(hint);
@@ -319,7 +375,15 @@ pub fn save_custom_agent_routed(name: &str, hint: &str, id: Option<&str>) -> Opt
     };
     match local_account_hash() {
         Some(hash) => {
-            crate::account_scope::upsert_account_agent(&hash, &agent_id, &clean_name, &clean_hint);
+            // Durability gate: no `Some(agent)` unless the row reached the disk.
+            if !crate::account_scope::upsert_account_agent(
+                &hash,
+                &agent_id,
+                &clean_name,
+                &clean_hint,
+            ) {
+                return None;
+            }
             Some(CustomAgent {
                 id: agent_id,
                 name: clean_name,
@@ -422,10 +486,22 @@ pub fn delete_custom_agent_routed(id: &str) -> bool {
             let before = store.custom_agents.len();
             store.custom_agents.retain(|a| a.id != id);
             let removed = store.custom_agents.len() != before;
+            let mut persisted = false;
             if removed {
-                let _ = save_store(&store);
+                // Durability, not just intent: dropping the row from memory is not
+                // a delete. Returning `removed` unconditionally made a signed-out
+                // delete report success while the row silently resurrected on the
+                // next launch whenever the write failed (full volume, %LOCALAPPDATA%
+                // ACL, an indexer holding the file). Mirrors the signed-in branch
+                // above: `existed && persisted`.
+                match save_store(&store) {
+                    Ok(()) => persisted = true,
+                    Err(e) => log::error!("Failed to persist agent deletion for {id}: {e}"),
+                }
             }
-            removed
+            // `removed && persisted`, matching the account branch: a delete aimed
+            // at an id that was not there is not a durable delete either.
+            removed && persisted
         }
     };
     if durable {
@@ -577,11 +653,15 @@ pub fn claim_legacy_agent(
     // already keeps its legacy row. Accepted cost, stated plainly: signing out
     // re-exposes the row as device-local and runnable, which is the user's own
     // pre-existing data and is already true today for skipped and refused rows.
-    Ok(crate::account_scope::claim_legacy_account_agents(
+    //
+    // S6: the claim returns `Err` when the durable save fails, so a failed
+    // claim surfaces as an error toast. It never returns an empty Ok that the
+    // UI would render as "Nothing to add".
+    crate::account_scope::claim_legacy_account_agents(
         Some(&hash),
         &legacy,
         Some(&only),
-    ))
+    )
 }
 
 #[tauri::command]
@@ -605,6 +685,7 @@ mod tests {
 
     #[test]
     fn default_is_builtin() {
+        let _guard = crate::sync::stores::store_test_guard();
         let store = AgentsStore::default();
         assert_eq!(store.default_id, ID_BUILT_IN);
         let resolved = resolve_active_agent(&store, None);
@@ -614,6 +695,7 @@ mod tests {
 
     #[test]
     fn save_and_resolve_custom() {
+        let _guard = crate::sync::stores::store_test_guard();
         let mut store = AgentsStore::default();
         let agent =
             save_custom_agent(&mut store, "Translator", "always reply in Hindi", None).unwrap();
@@ -625,6 +707,7 @@ mod tests {
 
     #[test]
     fn unknown_id_falls_back_to_builtin() {
+        let _guard = crate::sync::stores::store_test_guard();
         let store = AgentsStore::default();
         let resolved = resolve_active_agent(&store, Some("agent:missing"));
         assert!(resolved.is_builtin);
@@ -633,6 +716,7 @@ mod tests {
 
     #[test]
     fn delete_resets_default_to_builtin() {
+        let _guard = crate::sync::stores::store_test_guard();
         let mut store = AgentsStore::default();
         let agent = save_custom_agent(&mut store, "T", "hint text", None).unwrap();
         assert!(set_default_agent_id(&mut store, &agent.id));
@@ -642,6 +726,7 @@ mod tests {
 
     #[test]
     fn builtin_cannot_be_deleted() {
+        let _guard = crate::sync::stores::store_test_guard();
         let mut store = AgentsStore::default();
         assert!(!delete_custom_agent(&mut store, ID_BUILT_IN));
     }
@@ -665,4 +750,243 @@ mod tests {
     }
 
     // ---- one-tap legacy claim: legacy-store cleanup ----
+
+    // ---- create durability: the routed path must not report a lost save ----
+    //
+    // `save_custom_agent_routed` is what `save_agent` hands to the frontend.
+    // Its signed-in branch used to ignore the account-store result and return
+    // the new agent unconditionally, so a failed disk write produced an agent
+    // the UI rendered and the user saw — gone on the next launch, with nothing
+    // on disk and nothing logged. `save_agent` already turns `None` into an
+    // error for the frontend, so returning `None` here is what surfaces it.
+
+    /// Sign in as `email` by writing the durable session key, and hand back a
+    /// restore closure. The guard is held by the CALLER for the whole test:
+    /// `sync_account_key` lives in the shared per-process settings file, so a
+    /// parallel `save_settings` between the sign-in and the routed call would
+    /// flip the branch back to legacy and the test would pass for the wrong
+    /// reason.
+    fn signed_in_as(email: &str) -> (String, Box<dyn FnOnce()>) {
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        let previous = settings.sync_account_key.clone();
+        settings.sync_account_key = Some(email.to_string());
+        crate::settings::save_settings(&settings).unwrap();
+        assert_eq!(
+            local_account_hash().as_deref(),
+            Some(crate::sync::metadata::account_hash_from_email(email).as_str()),
+            "precondition: the routed path must take the ACCOUNT branch"
+        );
+        let restore: Box<dyn FnOnce()> = Box::new(move || {
+            let mut s = crate::settings::load_settings().unwrap_or_default();
+            s.sync_account_key = previous;
+            let _ = crate::settings::save_settings(&s);
+        });
+        let hash = crate::sync::metadata::account_hash_from_email(email);
+        (hash, restore)
+    }
+
+    /// Move `hash`'s account store aside and put a DIRECTORY in its place, so the
+    /// atomic rename cannot land. The bytes are preserved, never deleted.
+    fn block_store_aside(hash: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let target = crate::account_scope::account_path_for_test(
+            &crate::account_scope::agents_base_dir_for_test(),
+            "agents",
+            hash,
+        );
+        let saved = target.with_extension("json.set-aside-by-test");
+        let _ = std::fs::remove_file(&saved);
+        std::fs::rename(&target, &saved).expect("must be able to set the store aside");
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+        (target, saved)
+    }
+
+    fn unblock_store(target: &std::path::Path, saved: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(target);
+        std::fs::rename(saved, target).expect("must be able to restore the store");
+    }
+
+    #[test]
+    fn a_routed_create_whose_account_write_fails_returns_none() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let (hash, restore) = signed_in_as("agents-create-gate@example.com");
+
+        // Healthy first, so the assertion below cannot pass vacuously.
+        assert!(
+            save_custom_agent_routed("Durable", "hint text", None).is_some(),
+            "precondition: a writable store returns the created agent"
+        );
+
+        // Block exactly this account's file with a directory, so the atomic
+        // rename cannot land. Every other account's store stays writable.
+        // The store is set ASIDE, never deleted: it is this test's own
+        // precondition and deleting it would hide a regression in it.
+        let (target, saved) = block_store_aside(&hash);
+        let result = save_custom_agent_routed("Lost", "hint text", None);
+        unblock_store(&target, &saved);
+        restore();
+
+        assert!(
+            result.is_none(),
+            "a create that never reached the disk must not be reported as saved: {:?}",
+            result.map(|a| a.name)
+        );
+    }
+
+    /// A RENAME is the same code path as a create and must fail the same way:
+    /// the user editing an existing agent's hint and being shown "saved" is the
+    /// exact silent-loss scenario.
+    #[test]
+    fn a_routed_rename_whose_account_write_fails_returns_none() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let (hash, restore) = signed_in_as("agents-rename-gate@example.com");
+
+        let created =
+            save_custom_agent_routed("Editable", "first hint", None).expect("must create");
+        let (target, saved) = block_store_aside(&hash);
+
+        let result = save_custom_agent_routed("Editable", "second hint", Some(&created.id));
+        unblock_store(&target, &saved);
+        restore();
+
+        assert!(
+            result.is_none(),
+            "a rename that never reached the disk must not be reported as saved"
+        );
+    }
+
+    /// The signed-OUT branch already gated on `save_store(&store).ok()?`; that
+    /// behaviour is unchanged and must stay that way. Pinned so the signed-in
+    /// gate is not later "simplified" by removing both.
+    #[test]
+    fn the_signed_out_create_still_reports_its_validation_failures() {
+        let _guard = crate::sync::stores::store_test_guard();
+        assert!(
+            save_custom_agent_routed("", "hint", None).is_none(),
+            "an empty name is a refusal"
+        );
+        assert!(
+            save_custom_agent_routed("Valid Name", "", None).is_none(),
+            "an empty hint is a refusal"
+        );
+        assert!(
+            save_custom_agent_routed(ID_BUILT_IN, "hint", None).is_none(),
+            "the builtin name is reserved"
+        );
+    }
+
+    /// Sign OUT (clear the durable session key) and hand back a restore closure.
+    /// Paired with [`signed_in_as`]: the routed delete/create branches on
+    /// `local_account_hash()`, so exercising the signed-out path needs this.
+    fn signed_out() -> Box<dyn FnOnce()> {
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        let previous = settings.sync_account_key.clone();
+        settings.sync_account_key = None;
+        crate::settings::save_settings(&settings).unwrap();
+        assert!(
+            local_account_hash().is_none(),
+            "precondition: the routed path must take the LEGACY branch"
+        );
+        Box::new(move || {
+            let mut s = crate::settings::load_settings().unwrap_or_default();
+            s.sync_account_key = previous;
+            let _ = crate::settings::save_settings(&s);
+        })
+    }
+
+    /// Make the legacy `save_store` FAIL while leaving the store READABLE.
+    ///
+    /// Block the write by making the DESTINATION read-only, NOT by occupying a
+    /// tmp name. `save_store` now names its tmp per writer
+    /// (`agents.json.tmp.<pid>.<seq>`), so occupying the old fixed
+    /// `agents.json.tmp` blocks nothing at all — the helper silently becomes a
+    /// no-op, the delete reports success, and this test passes for the wrong
+    /// reason, which is exactly the failure mode its own doc warns about. (It
+    /// really did: the test passed in the full suite only because a concurrent
+    /// test happened to block the same shared store, and failed in isolation.)
+    ///
+    /// A read-only destination makes `fs::rename(tmp, path)` fail on Windows
+    /// while leaving the file fully readable, so `load_store` still sees the row
+    /// — the property the assertions below depend on.
+    ///
+    /// Moving `agents.json` aside instead would NOT work: `load_store` would
+    /// then return an EMPTY store, `retain` would remove nothing, and `removed`
+    /// would be false for the wrong reason.
+    ///
+    /// Returns the store path; the caller MUST restore write permission.
+    fn block_legacy_store_aside() -> std::path::PathBuf {
+        let path = agents_path();
+        let mut perms = std::fs::metadata(&path)
+            .expect("precondition: the legacy store must exist")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("must be able to set read-only");
+        assert!(
+            path.exists(),
+            "the store must still be READABLE, or the delete has nothing to remove"
+        );
+        path
+    }
+
+    /// A name unique per run.
+    ///
+    /// These tests deliberately leave state behind: the blocked-delete test
+    /// creates a row and then cannot persist its deletion, and the legacy store
+    /// lives in the shared test data directory and SURVIVES between runs. A
+    /// fixed name would therefore collide with the previous run's orphan on the
+    /// next run and be refused by `validate_agent_name_routed` as a duplicate.
+    fn unique_name(prefix: &str) -> String {
+        format!("{prefix}{}", uuid::Uuid::new_v4().simple())
+    }
+
+    /// A signed-out DELETE must report failure when the write fails.
+    ///
+    /// The signed-out branch dropped the row from memory and returned `removed`
+    /// without checking the write, so the UI showed a successful delete while
+    /// the row silently resurrected on the next launch. Mirrors the signed-in
+    /// branch's `existed && persisted` gate.
+    #[test]
+    fn a_signed_out_delete_whose_legacy_write_fails_is_not_reported_as_deleted() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let restore = signed_out();
+
+        let victim = save_custom_agent_routed(&unique_name("SignedOutVictim"), "hint text", None)
+            .expect("precondition: a signed-out create must succeed");
+        // The row really is on disk and readable, so `removed` below is true and
+        // the ONLY thing that can falsify the delete is the failed write.
+        assert!(
+            agents_path().exists(),
+            "precondition: the legacy store must exist and be readable"
+        );
+
+        let blocked = block_legacy_store_aside();
+        let durable = delete_custom_agent_routed(&victim.id);
+        // Restore write permission FIRST, so no read-only state leaks even if an
+        // assert below fails.
+        if let Ok(meta) = std::fs::metadata(&blocked) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&blocked, perms);
+        }
+        restore();
+
+        assert!(
+            !durable,
+            "a delete that never reached the disk must not be reported as done"
+        );
+    }
+
+    /// The same delete against a HEALTHY store must still report success, so
+    /// the guard above cannot be satisfied by simply refusing every delete.
+    #[test]
+    fn a_signed_out_delete_against_a_writable_store_still_reports_success() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let restore = signed_out();
+
+        let victim = save_custom_agent_routed(&unique_name("SignedOutHealthy"), "hint text", None)
+            .expect("precondition: a signed-out create must succeed");
+        let durable = delete_custom_agent_routed(&victim.id);
+        restore();
+
+        assert!(durable, "a writable signed-out delete must report success");
+    }
 }

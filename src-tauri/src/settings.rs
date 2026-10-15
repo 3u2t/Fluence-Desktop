@@ -368,20 +368,60 @@ pub fn save_settings(settings: &AppSettings) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(settings)?;
-    // Atomic write: tmp + sync_all + rename (matches suggestion.rs + ducking.rs)
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data)?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // Atomic write: tmp + sync_all + rename (matches suggestion.rs + ducking.rs).
+    //
+    // The tmp name MUST be unique per caller. A shared name meant two concurrent
+    // writers both wrote the same tmp, then both renamed it: the loser renamed a
+    // tmp the winner had already consumed and failed with os error 2, or renamed a
+    // partially-written tmp onto the destination. Production reaches this too —
+    // the scheduler thread and the settings UI can both persist — and it was the
+    // root cause of the intermittent audio perf-test flake (load_settings writes
+    // settings.json while sync tests write the same shared test data dir).
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Same directory as the destination so the rename stays same-volume atomic.
+        let mut name = path.clone().into_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let write_result = (|| -> Result<()> {
+        fs::write(&tmp_path, &data)?;
+        // Flush via a WRITE handle. `fs::File::open` is O_RDONLY and on Windows
+        // `sync_all` -> `FlushFileBuffers` needs `GENERIC_WRITE`, so the old
+        // `File::open(..) { let _ = f.sync_all(); }` performed no flush while
+        // claiming to. Best effort, non-fatal: this can only add durability.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Best effort: never leave a stray tmp behind on the failure path.
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path)?;
-    Ok(())
+    write_result
 }
 
 // Tauri commands
 #[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
-    load_settings().map_err(|e| e.to_string())
+    let mut settings = load_settings().map_err(|e| e.to_string())?;
+    // `get_settings` is deliberately UNGATED — the wizard and overlay need it —
+    // so it must not be a wider path to the signed-in Google email than the
+    // `main`-only `sync-status` emit it was supposed to be narrower than. The
+    // S2 remediation scoped `account_key` to the main window precisely because
+    // the raw email is PII; returning it here re-opened exactly that exposure to
+    // any script that reached the overlay or wizard webview.
+    //
+    // Nothing in the frontend reads `sync_account_key` from this command — the
+    // Sync page gets it from `sync_get_status`, which is main-only. `sync_enabled`
+    // IS read (`settings.js` binds it to a checkbox) and is only a boolean, so
+    // it stays. Internal callers use `load_settings()` directly and are
+    // unaffected by this redaction.
+    settings.sync_account_key = None;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -394,7 +434,29 @@ pub fn update_settings(
         &window,
         &[crate::acl::MAIN_WINDOW, crate::acl::WIZARD_WINDOW],
     )?;
-    let old_account = load_settings().ok().and_then(|s| s.sync_account_key);
+    let current = load_settings().ok();
+    let old_account = current.as_ref().and_then(|s| s.sync_account_key.clone());
+    // This command receives the frontend's FULL `AppSettings`, which is
+    // routinely a STALE copy — the UI does not refresh after `sync_toggle` or a
+    // sign-in. Persisting `sync_enabled` / `sync_account_key` straight from it
+    // therefore REVERTS them: toggle sync off, then change any unrelated
+    // setting, and the debounced flush writes `sync_enabled: true` back a few
+    // hundred ms later. The running scheduler is never told, so nothing looks
+    // wrong until a RESTART, at which point automatic sync resumes against an
+    // explicit user opt-out. The same path re-adopts a stale account key after
+    // sign-out, so the Sync page offers to "reconnect" as an account the user
+    // already left.
+    //
+    // Both fields are owned by dedicated commands (`sync_toggle`,
+    // `sync_sign_in`, `sync_sign_out`, and the scheduler's own reconcile), which
+    // write settings directly and are unaffected. A general settings flush must
+    // not touch them. If the current file cannot be read we fall through to the
+    // incoming object rather than blocking the user's write entirely.
+    let mut settings = settings;
+    if let Some(ref c) = current {
+        settings.sync_enabled = c.sync_enabled;
+        settings.sync_account_key = c.sync_account_key.clone();
+    }
     save_settings(&settings).map_err(|e| e.to_string())?;
     // Account switch via any path (frontend, file, scheduler) must drop
     // compiled caches that were keyed to the previous account - otherwise
@@ -517,5 +579,63 @@ mod tests {
             assert!(!migrate_retired_offline_engine(&mut settings));
             assert_eq!(settings.offline_engine, current);
         }
+    }
+
+    /// Regression test for the shared-tmp-path race in `save_settings`.
+    ///
+    /// `save_settings` writes via tmp-then-rename. While the tmp name was fixed,
+    /// two concurrent writers both wrote the same tmp and then both renamed it:
+    /// the loser renamed a tmp the winner had already consumed (os error 2), or
+    /// renamed a half-written tmp onto the destination. This reproduced 10/10
+    /// before the fix and is what made the audio perf tests flake — they call
+    /// `load_settings`, which writes settings.json, while sync tests write the
+    /// same shared per-process test data dir.
+    ///
+    /// Production is exposed the same way: the scheduler thread and the settings
+    /// UI can both persist settings.
+    #[test]
+    fn concurrent_saves_of_the_same_settings_file_all_succeed() {
+        // Serialize against the other tests that mutate the shared on-disk
+        // settings file under the cfg(test) data root.
+        let _guard = crate::sync::stores::store_test_guard();
+
+        let threads = 8;
+        let writes_each = 25;
+        let mut handles = Vec::new();
+        for i in 0..threads {
+            handles.push(std::thread::spawn(move || {
+                let mut settings = AppSettings::default();
+                settings.language = format!("lang-{i}");
+                for _ in 0..writes_each {
+                    // The real code path, not a reimplementation.
+                    save_settings(&settings)
+                        .unwrap_or_else(|e| panic!("save {i} must not fail: {e}"));
+                }
+                settings
+            }));
+        }
+
+        // Every writer must complete without error: this is the assertion that
+        // failed 10/10 before the fix.
+        let settled: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("no writer thread may panic"))
+            .collect();
+        assert_eq!(settled.len(), threads);
+
+        // Destination must survive the race: present, valid JSON, and holding one
+        // of the written values — never a truncated, empty, or torn file.
+        let path = settings_path();
+        let raw = fs::read_to_string(&path)
+            .expect("settings.json must exist after racing saves");
+        let parsed: AppSettings =
+            serde_json::from_str(&raw).expect("settings.json must parse after racing saves");
+        let valid: Vec<String> = (0..threads).map(|i| format!("lang-{i}")).collect();
+        assert!(
+            valid.contains(&parsed.language),
+            "settled language {:?} must be one of the complete writes {:?}, not a torn write",
+            parsed.language,
+            valid
+        );
     }
 }

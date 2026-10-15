@@ -12,9 +12,18 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_TRIGGER_LENGTH: usize = 100;
 pub const MAX_EXPANSION_LENGTH: usize = 500;
+
+/// Sync business key of a trigger — the exact identity
+/// [`crate::sync::domain::SnippetItem::business_key`] derives (NFC +
+/// lowercase + trim), so store-level key matching agrees with what the merge
+/// treats as one record (H4 rescue).
+pub(crate) fn snippet_sync_business_key(trigger: &str) -> String {
+    trigger.trim().nfc().collect::<String>().to_lowercase()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snippet {
@@ -99,12 +108,23 @@ fn snippets_path() -> PathBuf {
 }
 
 pub(crate) fn load_store_internal() -> Result<SnippetStore> {
-    let path = snippets_path();
-    if !path.exists() {
-        return Ok(SnippetStore::default());
+    load_store_file(&snippets_path())
+}
+
+/// Path-parameterized core of [`load_store_internal`]. Tests drive this with
+/// unique temp paths so corrupt-file recovery is verified hermetically,
+/// never against the shared test data root.
+pub(crate) fn load_store_file(path: &std::path::Path) -> Result<SnippetStore> {
+    match crate::sync::recover::read_json_file(path) {
+        // Missing file is a fresh store, not corruption: no backup, writes
+        // proceed normally.
+        Ok(None) => Ok(SnippetStore::default()),
+        Ok(Some(store)) => Ok(store),
+        // Corrupt bytes are preserved aside inside `read_json_file`; surface
+        // the error so write paths fail closed instead of persisting an
+        // empty store over unreadable state (Phase E).
+        Err(e) => Err(anyhow::anyhow!("unreadable snippets store: {e:?}")),
     }
-    let data = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&data).unwrap_or_default())
 }
 
 pub(crate) fn save_store_internal(store: &SnippetStore) -> Result<()> {
@@ -113,15 +133,42 @@ pub(crate) fn save_store_internal(store: &SnippetStore) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(store)?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data)?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // The tmp name MUST be unique per caller. This used to be the fixed
+    // `path.with_extension("json.tmp")`, the exact bug `settings.rs:371-379`
+    // documents and `sync/stores.rs` + `account_scope.rs` already fixed: two
+    // concurrent writers both wrote the SAME tmp, then both renamed it, so the
+    // loser either renamed a tmp the winner had already consumed (os error 2) or
+    // renamed a partially-written tmp onto the destination — truncating a live
+    // store. Audit #22 fixed the two files it happened to touch and left these
+    // two. pid + monotonic sequence, in the destination's own directory so the
+    // rename stays same-volume atomic.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let write_result = (|| -> Result<()> {
+        fs::write(&tmp_path, &data)?;
+        // WRITE handle required: on Windows `sync_all` -> `FlushFileBuffers` needs
+        // `GENERIC_WRITE`, so the previous `File::open` (O_RDONLY) made this a no-op
+        // despite the durability intent. Best effort, non-fatal.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path)?;
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = f.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Never leave a stray tmp behind on the failure path. Its name is
+        // unpredictable, so nothing else can clean it up.
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path)?;
-    if let Ok(f) = fs::File::open(&path) {
-        let _ = f.sync_all();
-    }
+    write_result?;
     // Sync imports write through this function too. Drop the runtime cache so
     // the next transcription sees newly merged expansions immediately.
     invalidate_cache();
@@ -134,6 +181,22 @@ fn cached_store() -> SnippetStore {
         return store.clone();
     }
     drop(cache);
+    // Deliberate, bounded degradation - NOT a Phase E oversight.
+    //
+    // `load_store_internal` fails only on unreadable bytes. On this path that
+    // result is intentionally discarded and treated as "no expansions",
+    // because this is the read-only expansion path reached from
+    // `process_transcript`: the transcript has already been produced, there is
+    // no caller left to report an error to, and failing would throw away a
+    // successful dictation for something cosmetic. An empty store is the
+    // correct outcome of a store that cannot be read as expansions.
+    //
+    // It is safe precisely because nothing here writes. The corruption is
+    // preserved aside by `read_json_file`, and every *mutating* caller
+    // (add/update/remove/import, the ones further down this file) still
+    // resolves the store with `load_store_internal().map_err(..)?` and fails
+    // closed, so a corrupt store can never be silently persisted over empty.
+    // The two rules have to hold together: read degrades, write refuses.
     let store = load_store_internal().unwrap_or_default();
     let mut cache2 = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache2 = Some(store.clone());
@@ -300,7 +363,9 @@ fn trigger_collides(snippets: &[Snippet], id: &str, trigger: &str) -> bool {
 // Tauri Commands
 
 #[tauri::command]
-pub fn get_snippets() -> Result<SnippetStore, String> {
+pub fn get_snippets(window: tauri::Window) -> Result<SnippetStore, String> {
+    // Snippet content is user-authored text expansion data: main-only.
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let mut store = load_store_internal().map_err(|e| e.to_string())?;
     let active = crate::sync::metadata::current_account_hash();
     store.snippets.retain(|s| {
@@ -315,9 +380,11 @@ pub fn get_snippets() -> Result<SnippetStore, String> {
 
 #[tauri::command]
 pub fn set_snippets_enabled(
+    window: tauri::Window,
     enabled: bool,
     scheduler: tauri::State<'_, crate::sync::scheduler::Scheduler>,
 ) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_store_internal().map_err(|e| e.to_string())?;
     store.enabled = enabled;
@@ -329,10 +396,12 @@ pub fn set_snippets_enabled(
 
 #[tauri::command]
 pub fn add_snippet(
+    window: tauri::Window,
     trigger: String,
     expansion: String,
     scheduler: tauri::State<'_, crate::sync::scheduler::Scheduler>,
 ) -> Result<Snippet, String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let _io = crate::sync::io_lock::io_lock_guard();
     let (trigger, expansion) = validate_snippet(&trigger, &expansion)?;
     let mut store = load_store_internal().map_err(|e| e.to_string())?;
@@ -391,11 +460,13 @@ pub fn add_snippet(
 
 #[tauri::command]
 pub fn update_snippet(
+    window: tauri::Window,
     id: String,
     trigger: String,
     expansion: String,
     scheduler: tauri::State<'_, crate::sync::scheduler::Scheduler>,
 ) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let _io = crate::sync::io_lock::io_lock_guard();
     let (trigger, expansion) = validate_snippet(&trigger, &expansion)?;
     let mut store = load_store_internal().map_err(|e| e.to_string())?;
@@ -462,9 +533,11 @@ pub fn update_snippet(
 
 #[tauri::command]
 pub fn delete_snippet(
+    window: tauri::Window,
     id: String,
     scheduler: tauri::State<'_, crate::sync::scheduler::Scheduler>,
 ) -> Result<(), String> {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let _io = crate::sync::io_lock::io_lock_guard();
     let mut store = load_store_internal().map_err(|e| e.to_string())?;
     let mut meta = crate::sync::metadata::SyncMetadata::load();
@@ -648,5 +721,113 @@ mod tests {
         assert!(trigger_collides(&snippets, "2", "MY LINKEDIN"));
         assert!(!trigger_collides(&snippets, "1", "my linkedin"));
         assert!(!trigger_collides(&snippets, "", "other"));
+    }
+
+    // --- corrupt-file recovery (Phase E) ----------------------------------
+    //
+    // A malformed snippets.json must surface an error with the original bytes
+    // preserved aside — never silently become an empty store that a later
+    // write persists over the evidence.
+
+    fn corrupt_cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("json.corrupt.json"));
+        for n in 1..100u32 {
+            let p = path.with_extension(format!("json.corrupt.{n}.json"));
+            if !p.exists() {
+                break;
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn corrupt_snippets_file_errors_and_preserves_bytes() {
+        // Hermetic: unique temp path, no shared test data root involved.
+        let path = std::env::temp_dir().join(format!(
+            "fluence-snip-test-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let garbage = b"[{\"trigger\": broken";
+        std::fs::write(&path, garbage).unwrap();
+
+        let loaded = load_store_file(&path);
+        assert!(
+            loaded.is_err(),
+            "corrupt bytes must surface an error, never an empty store: {loaded:?}"
+        );
+        let backup = path.with_extension("json.corrupt.json");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            garbage,
+            "original bytes must be preserved byte-identical"
+        );
+        assert!(!path.exists(), "corrupt original must be rotated aside");
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn snippet_save_merged_refuses_corrupt_file_then_recovers_fresh() {
+        use crate::sync::domain::SnippetItem;
+        use crate::sync::error::SyncError;
+        use crate::sync::frozen::DirtyStore;
+        use crate::sync::stores::SnippetDirtyStore;
+        let _guard = crate::sync::stores::store_test_guard();
+        let path = snippets_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        corrupt_cleanup(&path);
+        // Seed a valid store first so the corruption replaces real state.
+        save_store_internal(&SnippetStore::default()).unwrap();
+        let garbage = b"{{{{not json";
+        std::fs::write(&path, garbage).unwrap();
+
+        let mut store = SnippetDirtyStore;
+        let winner = SnippetItem {
+            sync_id: uuid::Uuid::new_v4().to_string(),
+            trigger: "addr".to_string(),
+            expansion: "address".to_string(),
+            is_enabled: true,
+            deleted_at: None,
+            updated_at: 100,
+            device_id: "device-a".to_string(),
+        };
+        let account_hash = format!("{:064x}", 9u128);
+        let err = store
+            .save_merged(&account_hash, vec![winner.clone()])
+            .expect_err("save over a corrupt store must fail closed");
+        assert!(
+            matches!(err, SyncError::Fatal(_)),
+            "corrupt local store is unrecoverable-automatically: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("json.corrupt.json")).unwrap(),
+            garbage,
+            "the failed pass must preserve the evidence, not overwrite it"
+        );
+        assert!(
+            !path.exists(),
+            "no fresh store may be written while the corruption is unprocessed"
+        );
+
+        let mut store = SnippetDirtyStore;
+        store
+            .save_merged(&account_hash, vec![winner])
+            .expect("fresh store after quarantine must accept writes");
+        let after = load_store_internal().expect("fresh store must load");
+        assert_eq!(after.snippets.len(), 1);
+        assert_eq!(after.snippets[0].trigger, "addr");
+        corrupt_cleanup(&path);
+        if path.exists() {
+            if let Ok(mut store) = load_store_internal() {
+                store
+                    .snippets
+                    .retain(|s| s.sync_account.as_deref() != Some(account_hash.as_str()));
+                let _ = save_store_internal(&store);
+            }
+        }
+        corrupt_cleanup(&path);
     }
 }

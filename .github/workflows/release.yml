@@ -79,12 +79,14 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
-      - name: run frontend + security test suite
-        shell: pwsh
-        run: |
-          node --test "tests/*.test.mjs"
-          pwsh -File tests/verify-security.ps1
-
+      # Ordering: the node frontend suite must run AFTER the dependency installs
+      # below, not before. tests/credential-target-parity.test.mjs does
+      # `require('../web/node_modules/typescript')`, which only resolves once
+      # `npm ci --prefix web` has populated web/node_modules. Run the tests
+      # first and a fresh checkout fails with "Cannot find module
+      # '../web/node_modules/typescript'" — green on a developer machine that
+      # already has web/node_modules, red in CI. `cargo test --lib` stays above
+      # because it has no web dependency.
       - name: install frontend dependencies
         run: npm ci
 
@@ -93,8 +95,30 @@ jobs:
       # (tsc, vite). Root `npm ci` does not install them (no workspaces),
       # and a fresh checkout has no node_modules — without this step the
       # build fails instantly with `'tsc' is not recognized` (v1.20.0 run 54).
+      # It must also land before the node test suite below, which compiles
+      # web/src/ipc/providers.ts through web/node_modules/typescript.
       - name: install web frontend dependencies
         run: npm ci --prefix web
+
+      # Fresh-checkout guard: the node suite silently depends on the web
+      # frontend's typescript. If that install ever regresses again, fail
+      # loudly here instead of reporting a confusing module-not-found.
+      - name: verify web typescript is installed
+        shell: pwsh
+        run: |
+          $ts = "web/node_modules/typescript"
+          if (-not (Test-Path -LiteralPath $ts)) {
+            throw "Missing web/node_modules/typescript: the node test suite requires it. Run `npm ci --prefix web` before `node --test tests/*.test.mjs`."
+          }
+          $pkg = Get-Content -LiteralPath "$ts/package.json" -Raw | ConvertFrom-Json
+          Write-Host "typescript $($pkg.version) present at web/node_modules/typescript"
+
+      - name: run frontend + security test suite
+        shell: pwsh
+        run: |
+          node --test "tests/*.test.mjs"
+          npm test --prefix web
+          pwsh -File tests/verify-security.ps1
 
       - name: build and release
         uses: tauri-apps/tauri-action@v0.6.2
@@ -107,48 +131,56 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Fluence v__VERSION__'
           releaseBody: |
-            ## Take your Agents and Styles with you
+            ## Sync reliability release
 
-            If you created custom Agents or AI cleanup Styles **before** you had a Fluence account, they were locked away: greyed out, unusable, and unable to sync. They were never lost - they just couldn't be attached to an account.
+            A deep audit of the cloud sync engine turned up several bugs that
+            could quietly lose your data or leave sync silently broken. All of
+            them are fixed here.
 
-            Now you can add them yourself, one tap at a time.
+            > **Why this is v1.27.1:** the `v1.27.0` tag was cut from the same
+            > code but never produced a download. Its release pipeline stopped
+            > at its own test gate before anything was built or published, and a
+            > regression test for these very fixes was the step that failed.
+            > Nothing was ever released under `v1.27.0`, so this is the first
+            > public build of the sync reliability work.
 
-            ### What's new
+            ### Data safety
 
-            **"Add to my account" on your old Agents and Styles**
+            - **A corrupt snippet file can no longer delete your other snippets.**
+              If one cloud file failed to parse, it could be treated as valid and
+              the readable copy beside it removed. That is fixed.
+            - **Turning a setting off now sticks.** Changing any other setting
+              could silently switch sync back on, and it only revealed itself
+              after a restart. Fixed.
+            - **Your custom Agents and Styles are protected.** A damaged store
+              used to read as "you have none", and your next edit overwrote the
+              real file. Writes now refuse to touch an account store they could
+              not read.
+            - **Edits made while sync was running are no longer discarded.** A
+              setting you changed mid-sync could be overwritten with no trace.
+              It is now deferred and carried to the next sync instead.
+            - **Saving is genuinely durable now.** Every store flush was writing
+              through a read-only handle, so the flush silently did nothing. Ten
+              call sites fixed, and eight files that could be corrupted by two
+              concurrent writers now write through uniquely named temporary files.
 
-            Any pre-account Agent or Style you see now has an **Add to my account** button. Tap it and it becomes a normal part of your account:
+            ### Cloud sync correctness
 
-            - you can edit it like any other
-            - you can delete it
-            - it becomes available to Agent Mode and AI cleanup
-            - it syncs to your other devices
-
-            Nothing is moved or deleted behind your back. Until you tap, your old records stay exactly where they are, and if anything goes wrong they're still there to try again.
-
-            ### Fixes
-
-            - **Deleting an Agent or Style now really deletes it.** Previously a deleted item could reappear as a device-only entry after you signed out. This now works for Styles the same way it already did for Agents.
-            - **Honest delete confirmations.** If a delete can't be saved to your account, we now tell you instead of reporting success - and your data is left untouched.
-            - **Your choices are protected.** If a delete doesn't go through, your default Agent and any app-specific Style assignments stay exactly as they were.
+            - **Sync stops immediately if the signed-in account does not match
+              the account on file**, instead of quietly switching you to a
+              different account in the background.
+            - **Duplicate cloud files are now merged instead of ignored.**
+            - **Rate limits are respected.** If Google asks us to wait, we wait,
+              instead of retrying every minute against an exhausted quota.
+            - **Sync no longer gets stuck** on a slow or unresponsive connection.
 
             ### For the technical minded
 
-            Nothing about how your data syncs has changed - same format, same folders, same conflict rules. A claimed item is stored exactly like an item you created inside the app, so it uploads and merges through the normal path. The app can only ever add to the account you are signed in to at the moment you tap; there is no way for any part of the app to aim a claim at a different account.
-
-            Both sign-in states remain supported: signed out, your old items still work as before; signed in, you choose what to add.
-
-            ### Verification
-
-            - Full Rust suite green (`cargo test --lib`, 614 tests).
-            - Web claim suite green (17 tests), including a boundary test asserting the claim command carries only a record id.
-            - Web typecheck and production build clean; no new dependencies, no sync/schema changes.
-
-            ---
-
-            ### Download & Install
-
-            Download the installer (`.exe`) below to install or update Fluence on Windows.
+            The sync wire format is unchanged and still compatible with previous
+            releases - same envelope version, same folders, same conflict
+            resolution rules. All fixes are in how this client reads, merges and
+            writes those files, so you can upgrade and downgrade freely and your
+            data stays readable either way.
           releaseDraft: false
           prerelease: false
 

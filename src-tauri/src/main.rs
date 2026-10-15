@@ -184,6 +184,7 @@ pub fn run() {
             dictionary::update_dictionary_entry,
             dictionary::delete_dictionary_entry,
             dictionary::import_dictionary,
+            dictionary::import_dictionary_report,
             dictionary::read_import_file,
             dictionary::export_dictionary,
             // Text expansion (snippets)
@@ -282,6 +283,7 @@ pub fn run() {
             // Sync
             sync::scheduler::sync_get_status,
             sync::scheduler::sync_toggle,
+            sync::scheduler::sync_run_now,
             sync::scheduler::sync_sign_in,
             sync::scheduler::sync_sign_out,
             // Account-level combined statistics
