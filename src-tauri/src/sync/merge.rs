@@ -14,7 +14,10 @@
 // Stats: union dedup by eventId - summation happens at display time, so the
 // same event can never be counted twice.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+use serde::Serialize;
 
 use crate::sync::clock::cmp_keyed_winner;
 use crate::sync::domain::*;
@@ -25,24 +28,104 @@ pub struct MergeOutcome<T> {
     pub changed: bool,
 }
 
+// ── Total winner order for keyed domains (audit #5) ──────────────────────────
+//
+// `clock::cmp_keyed_winner` orders records by (updatedAt, deviceId, syncId).
+// That is still a PARTIAL order: a cross-key rename keeps the record's
+// syncId, so two records can tie on all three keys while carrying different
+// payloads. `Iterator::max_by` returns the LAST of the equal candidates, and
+// candidates are folded local-then-remote, so the per-key winner depended on
+// whether a record arrived as the local or the remote copy — two devices
+// holding different payloads for one business key would each keep their own,
+// re-push it forever, and never converge.
+//
+// RULE A — PER-BUSINESS-KEY WINNER (mirror this verbatim in Kotlin `Merge.kt`):
+//
+//   1. `updatedAt`  — larger wins.
+//   2. `deviceId`   — larger wins, compared as UTF-8 bytes.
+//   3. `syncId`     — larger wins, compared as UTF-8 bytes.
+//   4. CANONICAL WIRE FORM of the record — larger wins. The canonical wire
+//      form is the record's own serialization in frozen key order, i.e. the
+//      exact bytes the frozen contract writes and Android's
+//      `DomainSerializer` emits:
+//        dict     {"syncId","businessKey","spoken","corrected","isEnabled",
+//                  "updatedAt","deletedAt","deviceId"}
+//        snippet  {"syncId","businessKey","trigger","expansion","isEnabled",
+//                  "updatedAt","deletedAt","deviceId"}
+//        agent    {"syncId","businessKey","name","hint","updatedAt",
+//                  "deletedAt","deviceId"}
+//        style    {"syncId","businessKey","name","hint","updatedAt",
+//                  "deletedAt","deviceId"}
+//      Kotlin MUST compare the canonical form by UNICODE CODE POINT (equivalently
+//      by its UTF-8 bytes). Kotlin's `String.compareTo` is UTF-16 code-unit
+//      order and DISAGREES with code-point order for supplementary-plane
+//      characters, so `String.compareTo` must NOT be used here. Build the
+//      canonical string with the SAME JSON writer settings as the serializer
+//      (compact separators, frozen field order, `null` for an absent
+//      `deletedAt`); no spaces, no reordered keys.
+//   5. Records equal on all four keys are the SAME record on the wire, so they
+//      compare `Equal` and fold order keeps deciding true duplicates.
+//
+// Levels 1–4 make Rule A TOTAL: it depends only on record CONTENT, never on
+// local/remote side or iteration order. Level 4 is reached only on a genuine
+// three-way tie, so the serialization cost is paid per tie, not per comparison.
+// `deleted_at` is never compared — a tombstone is an ordinary state that wins
+// on recency and loses to any newer edit, exactly as in every other domain.
+//
+// RULE B — CROSS-KEY `syncId` COLLAPSE (UNCHANGED from before audit #5, and
+// already implemented in Android): after the per-key pick, records sharing a
+// `syncId` under different business keys are folded by levels 1–3 of Rule A
+// only; a residual full tie keeps the record that came FIRST in ascending
+// business-key order, i.e. the SMALLEST business key wins. This is
+// deterministic — `merged` is emitted in `BTreeMap` key order — and it is
+// deliberately NOT Rule A level 4, because Android's existing pre-collapse
+// sort already resolves it this way and diverging would desynchronise the two
+// platforms for no correctness gain. Pinned by
+// `rename_full_tie_keeps_smallest_business_key`.
+
+/// Canonical wire form of a record, used only as Rule A's last-resort
+/// tiebreak.
+///
+/// `to_string` cannot fail for these types (no map keys, no floats), and
+/// degrades to `""` rather than panicking if a future item type ever makes it
+/// failable — which would only restore the old order-dependent behaviour, not
+/// lose data.
+fn canonical_content<T: Serialize>(item: &T) -> String {
+    serde_json::to_string(item).unwrap_or_default()
+}
+
 /// Merge dictionary items: one winner per businessKey using pure LWW.
 ///
-/// The comparison is a *total* order (`cmp_keyed_winner` falls back to
-/// `sync_id`), so the winner never depends on whether a record arrived as the
-/// local or the remote copy. Android's `Merge` applies the identical rule.
+/// The per-key comparison is the *total* Rule A documented above, so the
+/// winner never depends on whether a record arrived as the local or the remote
+/// copy, nor on iteration order. Android's `Merge` applies the identical rule.
 fn merge_keyed<T, K>(
     local: &[T],
     remote: &[T],
     business_key: impl Fn(&T) -> K,
-    mut updated_at: impl FnMut(&T) -> i64,
-    mut device_id: impl FnMut(&T) -> &str,
-    mut sync_id: impl FnMut(&T) -> &str,
+    updated_at: impl Fn(&T) -> i64,
+    device_id: impl Fn(&T) -> &str,
+    sync_id: impl Fn(&T) -> &str,
     mut sort_by: impl FnMut(&mut [T]),
 ) -> MergeOutcome<T>
 where
-    T: Clone + PartialEq,
+    T: Clone + PartialEq + Serialize,
     K: Ord + Clone + Eq + std::hash::Hash,
 {
+    // Rule A. Folded over `local.iter().chain(remote.iter())`, so the fold
+    // order is fixed but `max_by` returns the LAST of equals — without the
+    // content level that would be a remote-side bias, i.e. split-brain.
+    let keyed_cmp = |a: &T, b: &T| {
+        cmp_keyed_winner(
+            updated_at(a),
+            device_id(a),
+            sync_id(a),
+            updated_at(b),
+            device_id(b),
+            sync_id(b),
+        )
+        .then_with(|| canonical_content(a).cmp(&canonical_content(b)))
+    };
     let mut grouped: BTreeMap<K, Vec<T>> = BTreeMap::new();
     for item in local.iter().chain(remote.iter()) {
         grouped
@@ -57,16 +140,7 @@ where
     for (bk, candidates) in grouped {
         let winner = candidates
             .into_iter()
-            .max_by(|a, b| {
-                cmp_keyed_winner(
-                    updated_at(a),
-                    device_id(a),
-                    sync_id(a),
-                    updated_at(b),
-                    device_id(b),
-                    sync_id(b),
-                )
-            })
+            .max_by(|a, b| keyed_cmp(a, b))
             .unwrap();
         match local_map.get(&bk) {
             Some(local_item) if local_item == &winner => {}
@@ -78,17 +152,15 @@ where
     // a record's business key while keeping its sync_id, so the pre-rename key
     // (usually remote) and the post-rename key (local) each contribute a winner
     // for the SAME logical record. Without this step both survive every future
-    // merge as a permanent duplicate. Collapse to the `cmp_keyed_winner` max —
-    // the same total order as the per-key pick — so the outcome is independent
-    // of merge side/order. Tombstones ride the same comparator (`deleted_at`
-    // is never compared), preserving delete-vs-edit semantics across keys:
-    // the newest record wins regardless of which key it sits under.
+    // merge as a permanent duplicate. Collapse by levels 1–3 of Rule A only
+    // (see RULE B above); the outcome is independent of merge side/order.
+    // Tombstones ride the same comparator (`deleted_at` is never compared),
+    // preserving delete-vs-edit semantics across keys: the newest record wins
+    // regardless of which key it sits under.
     //
-    // Residual-tie determinism: inside one sync_id group the sync_id tiebreak
-    // is inert, reducing the order to (updated_at, device_id). Winners arrive
-    // here in ascending business-key order (`grouped` is a BTreeMap), and only
-    // `Greater` replaces, so a genuine full tie keeps the smallest business
-    // key — the same record Android keeps via its pre-collapse sort.
+    // Residual ties keep the FIRST record in ascending business-key order, so
+    // the smallest business key wins — the rule Android's pre-collapse sort
+    // already implements.
     let mut by_sync_id: HashMap<String, T> = HashMap::new();
     for item in merged {
         let sid = sync_id(&item).to_string();
@@ -104,7 +176,7 @@ where
                     updated_at(incumbent),
                     device_id(incumbent),
                     sync_id(incumbent),
-                ) == std::cmp::Ordering::Greater
+                ) == Ordering::Greater
                 {
                     by_sync_id.insert(sid, item);
                 }
@@ -225,6 +297,15 @@ fn effective_settings_time(updated_at: i64) -> i64 {
 /// `Merge.mergeSettings`, so both platforms pick the same winner when
 /// updatedAt and deviceId tie); output is canonically sorted by key,
 /// matching Android exactly.
+///
+/// Tombstones (audit #13) are ordinary LWW states, exactly like dictionary /
+/// snippet / agent / style tombstones: `deleted_at` takes part in RECENCY
+/// only and is NEVER itself a tiebreak. The comparison below therefore still
+/// reads `(effective updatedAt, deviceId, value)` — `value` remains the final
+/// discriminator, so a full tie between a tombstone and a live record resolves
+/// by value identically on both platforms and a tombstone can never win a tie
+/// it did not win on recency. The newest record for a key wins outright, and
+/// the merged result carries that record's `deleted_at` verbatim.
 pub fn merge_settings(
     local: &[SettingsItem],
     remote: &[SettingsItem],
@@ -250,7 +331,7 @@ pub fn merge_settings(
                         existing_at,
                         &existing.device_id,
                         &existing.value,
-                    ) == std::cmp::Ordering::Greater
+                    ) == Ordering::Greater
                 } else if existing_at == 0 {
                     true
                 } else if item_at == 0 {
@@ -263,7 +344,7 @@ pub fn merge_settings(
                         existing_at,
                         &existing.device_id,
                         &existing.value,
-                    ) == std::cmp::Ordering::Greater
+                    ) == Ordering::Greater
                 };
                 if winner_is_item {
                     e.insert(item.clone());
@@ -278,16 +359,33 @@ pub fn merge_settings(
     }
     let mut merged: Vec<SettingsItem> = map.into_values().collect();
     merged.sort_by(|a, b| a.key.cmp(&b.key));
+    // A settings record's identity is its full content. `deleted_at` is part of
+    // that: a retraction changes nothing else about the record, so a set that
+    // omitted it could not see one.
+    //
+    // DEFENSIVE, NOT CURRENTLY REACHABLE. With `value` as the comparator's last
+    // level, a merged record can never differ from the local one in
+    // `deleted_at` alone: if the remote wins it must have out-ranked the local
+    // on `(updatedAt, deviceId, value)`, and if it only tied, local-first keeps
+    // the local record verbatim. So no input today flips `changed` purely on
+    // this field. It is kept so that `changed` stays a true content comparison
+    // if the comparator ever gains a level that does not separate the two.
     let changed = {
+        let identity = |i: &SettingsItem| {
+            format!(
+                "{}|{}|{}|{}",
+                i.key,
+                i.value,
+                i.updated_at,
+                i.deleted_at.map(|d| d.to_string()).unwrap_or_default()
+            )
+        };
         let local_set: HashSet<String> = local
             .iter()
             .filter(|i| is_allowed_settings_key(&i.key))
-            .map(|i| format!("{}|{}|{}", i.key, i.value, i.updated_at))
+            .map(identity)
             .collect();
-        let merged_set: HashSet<String> = merged
-            .iter()
-            .map(|i| format!("{}|{}|{}", i.key, i.value, i.updated_at))
-            .collect();
+        let merged_set: HashSet<String> = merged.iter().map(identity).collect();
         local_set != merged_set
     };
     MergeOutcome { merged, changed }
@@ -634,9 +732,12 @@ mod tests {
     fn rename_full_tie_keeps_smallest_business_key() {
         // Same sync_id, same updated_at, same device_id under two keys: the
         // sync_id tiebreak is inert inside the group, so determinism comes
-        // from key order — smallest business key wins, matching Android's
-        // pre-collapse sort. Practically unreachable (a rename restamps
-        // updated_at), pinned so the order is total by construction.
+        // from key order — smallest business key wins. That is RULE B (the
+        // cross-key collapse deliberately does NOT use Rule A's content
+        // level, because Android's existing pre-collapse sort already resolves
+        // it this way and diverging would desynchronise the platforms).
+        // Practically unreachable (a rename restamps updated_at), pinned so
+        // the order is total by construction.
         let old = dict("oldword", "Old", "correction", false, 100, "a");
         let mut new = dict("newword", "Old", "correction", false, 100, "a");
         new.sync_id = old.sync_id.clone();
@@ -754,6 +855,22 @@ mod tests {
             value: value.to_string(),
             updated_at,
             device_id: device_id.to_string(),
+            deleted_at: None,
+        }
+    }
+
+    fn setting_tomb(
+        key: &str,
+        value: &str,
+        updated_at: i64,
+        device_id: &str,
+    ) -> SettingsItem {
+        SettingsItem {
+            key: key.to_string(),
+            value: value.to_string(),
+            updated_at,
+            device_id: device_id.to_string(),
+            deleted_at: Some(updated_at),
         }
     }
 
@@ -1022,5 +1139,307 @@ mod tests {
         assert_eq!(out.merged[0].timestamp_ms, 200);
         let flipped = merge_stats(&[later_ts], &[base]);
         assert_eq!(flipped.merged[0].timestamp_ms, 200);
+    }
+
+    // ── #5 full tie on (updatedAt, deviceId, syncId) ───────────────────────
+
+    /// A record pinned to a fixed identity so every field of Rule A levels 1–3
+    /// ties and only the CONTENT level can decide.
+    fn full_tie_dict(sync_id: &str, spoken: &str, corrected: &str) -> DictionaryItem {
+        let mut item = dict(spoken, corrected, "correction", false, 1_713_471_000_123, "dev");
+        item.sync_id = sync_id.to_string();
+        item
+    }
+
+    fn full_tie_snippet(sync_id: &str, trigger: &str, expansion: &str) -> SnippetItem {
+        let mut item = snippet(trigger, expansion, false, 1_713_471_000_123, "dev");
+        item.sync_id = sync_id.to_string();
+        item
+    }
+
+    /// #5 headline regression. Three copies of ONE record (identical
+    /// `updatedAt`, `deviceId` and `syncId`) with different payloads, held by
+    /// three devices. `max_by` returns the LAST of the equal candidates and
+    /// candidates are folded local-then-remote, so before the content level the
+    /// winner was simply "whichever side the caller's own copy sat on" —
+    /// permanent split-brain, each device re-pushing its own payload forever.
+    /// Every merge order must now pick the content-maximal record.
+    #[test]
+    fn full_tie_on_all_three_keys_resolves_by_canonical_content_not_by_side() {
+        let sid = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f01";
+        let a = full_tie_dict(sid, "tie", "AAA");
+        let b = full_tie_dict(sid, "tie", "BBB");
+        let c = full_tie_dict(sid, "tie", "CCC");
+
+        let ab = merge_dictionary(&[a.clone(), b.clone()], &[c.clone()]);
+        let ba = merge_dictionary(&[b.clone(), c.clone()], &[a.clone()]);
+        let ca = merge_dictionary(&[c.clone(), a.clone()], &[b.clone()]);
+        for out in [&ab, &ba, &ca] {
+            assert_eq!(out.merged.len(), 1);
+            assert_eq!(
+                out.merged[0].corrected, "CCC",
+                "levels 1-3 tie, so the canonical wire form decides: the \
+                 record whose corrected field is \"CCC\" is the largest"
+            );
+        }
+        assert_eq!(ab.merged, ba.merged, "order independence");
+        assert_eq!(ab.merged, ca.merged, "order independence");
+    }
+
+    /// Same defect, same fix, for every domain routed through `merge_keyed` —
+    /// including the agent/style keyspaces whose business key is a stable id
+    /// rather than derived from content.
+    #[test]
+    fn full_tie_resolves_by_content_in_every_keyed_domain() {
+        let sid = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f11";
+        let s_a = full_tie_snippet(sid, "tie-snip", "AAA");
+        let s_b = full_tie_snippet(sid, "tie-snip", "BBB");
+        let s_c = full_tie_snippet(sid, "tie-snip", "CCC");
+        for out in [
+            merge_snippets(&[s_a.clone(), s_b.clone()], &[s_c.clone()]),
+            merge_snippets(&[s_c.clone()], &[s_b.clone(), s_a.clone()]),
+        ] {
+            assert_eq!(out.merged.len(), 1);
+            assert_eq!(out.merged[0].expansion, "CCC");
+        }
+
+        let key = "agent:123e4567-e89b-12d3-a456-426614174000".to_string();
+        let mk = |hint: &str| AgentItem {
+            sync_id: sid.to_string(),
+            business_key: key.clone(),
+            name: "Agent".to_string(),
+            hint: hint.to_string(),
+            updated_at: 1_713_471_000_123,
+            deleted_at: None,
+            device_id: "dev".to_string(),
+        };
+        for out in [
+            merge_agents(&[mk("AAA"), mk("BBB")], &[mk("CCC")]),
+            merge_agents(&[mk("CCC")], &[mk("BBB"), mk("AAA")]),
+        ] {
+            assert_eq!(out.merged.len(), 1);
+            assert_eq!(out.merged[0].hint, "CCC");
+        }
+
+        let key = "custom:123e4567-e89b-12d3-a456-426614174000".to_string();
+        let mk = |hint: &str| StyleItem {
+            sync_id: sid.to_string(),
+            business_key: key.clone(),
+            name: "Style".to_string(),
+            hint: hint.to_string(),
+            updated_at: 1_713_471_000_123,
+            deleted_at: None,
+            device_id: "dev".to_string(),
+        };
+        for out in [
+            merge_styles(&[mk("AAA"), mk("BBB")], &[mk("CCC")]),
+            merge_styles(&[mk("CCC")], &[mk("BBB"), mk("AAA")]),
+        ] {
+            assert_eq!(out.merged.len(), 1);
+            assert_eq!(out.merged[0].hint, "CCC");
+        }
+    }
+
+    /// The content level must not disturb records that already differ on
+    /// `updatedAt` / `deviceId` / `syncId`: levels 1–3 are reached first, so
+    /// recency and the Android-coordinated tiebreaks keep winning exactly as
+    /// before. This is the anti-regression for the frozen LWW law.
+    #[test]
+    fn content_level_never_overrides_recency_device_or_sync_id() {
+        let mut older_but_bigger_content = full_tie_dict(
+            "99999999-9999-4999-8999-999999999999",
+            "tie",
+            "ZZZZZZZZ",
+        );
+        older_but_bigger_content.updated_at = 100;
+        let newer = full_tie_dict("00000000-0000-4000-8000-000000000001", "tie", "AAA");
+        let out = merge_dictionary(&[newer], &[older_but_bigger_content]);
+        assert_eq!(
+            out.merged[0].corrected, "AAA",
+            "updatedAt outranks canonical content"
+        );
+    }
+
+    /// #5 corpus replay. `scenario-31` is the full-tie shape described above,
+    /// in the cross-platform convergence-corpus format, so the same file can be
+    /// wired into `sync::convergence::SCENARIOS` with one `include_bytes!` line.
+    ///
+    /// Replay is deliberately stronger than that harness: it folds EVERY
+    /// permutation of the three devices (6 folds, not 3 rotations) and requires
+    /// all six to agree with the corpus `expected` block.
+    #[test]
+    fn convergence_scenario_31_full_tie_agrees_in_every_merge_permutation() {
+        const SCENARIO_31: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/sync/convergence/scenario-31.json"
+        ));
+        let raw: serde_json::Value = serde_json::from_slice(SCENARIO_31).expect("scenario parses");
+        let devices = raw["devices"].as_object().expect("devices map");
+        let mut ids: Vec<&String> = devices.keys().collect();
+        ids.sort();
+
+        let ops = |dev: &str, kind: &str| -> Vec<serde_json::Value> {
+            devices[dev]
+                .as_array()
+                .expect("ops")
+                .iter()
+                .filter(|op| op["kind"] == kind)
+                .cloned()
+                .collect()
+        };
+        let to_dict = |op: &serde_json::Value| DictionaryItem {
+            sync_id: op["syncId"].as_str().unwrap().to_string(),
+            spoken: op["spoken"].as_str().unwrap().to_string(),
+            corrected: op["corrected"].as_str().unwrap().to_string(),
+            kind: "correction".to_string(),
+            is_enabled: op["isEnabled"].as_bool().unwrap_or(true),
+            deleted_at: op["deletedAt"].as_i64(),
+            updated_at: op["updatedAt"].as_i64().unwrap(),
+            device_id: op["deviceId"].as_str().unwrap().to_string(),
+        };
+        let to_snip = |op: &serde_json::Value| SnippetItem {
+            sync_id: op["syncId"].as_str().unwrap().to_string(),
+            trigger: op["trigger"].as_str().unwrap().to_string(),
+            expansion: op["expansion"].as_str().unwrap().to_string(),
+            is_enabled: op["isEnabled"].as_bool().unwrap_or(true),
+            deleted_at: op["deletedAt"].as_i64(),
+            updated_at: op["updatedAt"].as_i64().unwrap(),
+            device_id: op["deviceId"].as_str().unwrap().to_string(),
+        };
+
+        let mut folds = 0usize;
+        for perm in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut dict_acc: Vec<DictionaryItem> = Vec::new();
+            let mut snip_acc: Vec<SnippetItem> = Vec::new();
+            for step in perm {
+                let dev = ids[step];
+                for op in ops(dev, "dict") {
+                    dict_acc = merge_dictionary(&dict_acc, &[to_dict(&op)]).merged;
+                }
+                for op in ops(dev, "snip") {
+                    snip_acc = merge_snippets(&snip_acc, &[to_snip(&op)]).merged;
+                }
+            }
+            folds += 1;
+
+            let want = &raw["expected"]["dictionary"][0];
+            assert_eq!(dict_acc.len(), 1, "fold {folds}: one winner per business key");
+            assert_eq!(dict_acc[0].sync_id, want["syncId"].as_str().unwrap());
+            assert_eq!(dict_acc[0].business_key(), want["businessKey"].as_str().unwrap());
+            assert_eq!(dict_acc[0].corrected, want["corrected"].as_str().unwrap());
+            assert_eq!(dict_acc[0].updated_at, want["updatedAt"].as_i64().unwrap());
+            assert_eq!(dict_acc[0].device_id, want["deviceId"].as_str().unwrap());
+
+            let want = &raw["expected"]["snippets"][0];
+            assert_eq!(snip_acc.len(), 1, "fold {folds}: one winner per business key");
+            assert_eq!(snip_acc[0].sync_id, want["syncId"].as_str().unwrap());
+            assert_eq!(snip_acc[0].business_key(), want["businessKey"].as_str().unwrap());
+            assert_eq!(snip_acc[0].expansion, want["expansion"].as_str().unwrap());
+            assert_eq!(snip_acc[0].updated_at, want["updatedAt"].as_i64().unwrap());
+            assert_eq!(snip_acc[0].device_id, want["deviceId"].as_str().unwrap());
+        }
+        assert_eq!(folds, 6, "every device permutation must be exercised");
+    }
+
+    // ── #13 settings tombstones ────────────────────────────────────────────
+
+    /// #13 headline: Android retracts a key (reset `ai_polish_style`), Windows
+    /// holds the old live value. The newest record wins, so the tombstone
+    /// applies on Windows and the merged result CARRIES it — which is what
+    /// makes the retraction propagate back instead of being resurrected.
+    #[test]
+    fn android_settings_tombstone_applies_on_windows() {
+        let local = vec![setting("ai_polish_style", "formal", 1_713_471_000_123, "windows")];
+        let remote = vec![setting_tomb(
+            "ai_polish_style",
+            "default",
+            1_713_471_000_999,
+            "android",
+        )];
+        for out in [
+            merge_settings(&local, &remote),
+            merge_settings(&remote, &local),
+        ] {
+            assert_eq!(out.merged.len(), 1);
+            assert!(
+                out.merged[0].is_tombstone(),
+                "the newer retraction must win on recency alone"
+            );
+            assert_eq!(out.merged[0].deleted_at, Some(1_713_471_000_999));
+            assert_eq!(out.merged[0].value, "default");
+        }
+    }
+
+    /// A tombstone is an ordinary LWW state, so a newer write resurrects the
+    /// key exactly as it does for dictionary/snippet tombstones.
+    #[test]
+    fn newer_settings_write_beats_an_older_tombstone() {
+        let tomb = vec![setting_tomb("language", "en", 100, "android")];
+        let live = vec![setting("language", "fr", 200, "windows")];
+        for out in [merge_settings(&live, &tomb), merge_settings(&tomb, &live)] {
+            assert_eq!(out.merged.len(), 1);
+            assert_eq!(out.merged[0].value, "fr");
+            assert!(
+                !out.merged[0].is_tombstone(),
+                "the newer live write must resurrect the key"
+            );
+            assert_eq!(out.merged[0].deleted_at, None);
+        }
+    }
+
+    /// #13's second requirement: a tombstone is NEVER itself a tiebreak. With
+    /// `updatedAt` and `deviceId` tied, the winner is still decided by `value`
+    /// — the H2 rule Android already implements — so tombstone-ness cannot
+    /// change the outcome and the two platforms cannot disagree about it.
+    #[test]
+    fn settings_tombstone_is_never_a_tiebreak_on_a_full_tie() {
+        let live_low = setting("language", "en", 100, "d");
+        let live_high = setting("language", "zz", 100, "d");
+        let tomb_low = setting_tomb("language", "aa", 100, "d");
+        let tomb_high = setting_tomb("language", "yy", 100, "d");
+
+        // Tombstone with the SMALLER value loses to a live record with the
+        // larger one, even though the live record is not a retraction.
+        for out in [
+            merge_settings(&[live_high.clone()], &[tomb_low.clone()]),
+            merge_settings(&[tomb_low], &[live_high]),
+        ] {
+            assert_eq!(out.merged[0].value, "zz");
+            assert!(!out.merged[0].is_tombstone());
+        }
+        // Symmetrically: a tombstone with the LARGER value wins.
+        for out in [
+            merge_settings(&[tomb_high.clone()], &[live_low.clone()]),
+            merge_settings(&[live_low], &[tomb_high]),
+        ] {
+            assert_eq!(out.merged[0].value, "yy");
+            assert!(out.merged[0].is_tombstone());
+        }
+    }
+
+    /// A remote retraction must reach local state AND be reported as a state
+/// change, or the device keeps the retracted key forever and re-adopts it on
+/// the next pass. (The `changed` flip here is carried by `updatedAt`, not by
+/// `deleted_at` — see the note on `merge_settings`'s dirty check.)
+    #[test]
+    fn a_tombstone_only_change_is_reported_as_changed() {
+        let live = vec![setting("language", "en", 100, "d")];
+        let tomb = vec![setting_tomb("language", "en", 200, "d")];
+        let out = merge_settings(&live, &tomb);
+        assert!(out.changed, "a pure retraction is a state change");
+        // ... and it settles: re-merging the merged set reports no change.
+        let settled = merge_settings(&out.merged, &[]);
+        assert!(
+            !settled.changed,
+            "a converged settings set must re-merge clean"
+        );
+        assert!(settled.merged[0].is_tombstone());
     }
 }

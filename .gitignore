@@ -66,6 +66,18 @@ vs_buildtools.exe
 # Local agent/design tooling
 .claude/
 .impeccable/
+# Vendored agent skills (git-cloned shadcn/ui skills + their lockfile).
+# Same class as .claude/ and .impeccable/ above: local tooling, not product
+# code. skills-lock.json is only meaningful alongside the vendored tree.
+.agents/
+skills-lock.json
 
 # Local scratch/test logs (never committed)
 scratch/
+
+# OAuth client-secret file. The app reads it from %LOCALAPPDATA%\Fluence\, but
+# the setup guidance tells developers to create `Fluence/sync-oauth.json`, so a
+# repo-local copy is a realistic accident. It must never be committable.
+sync-oauth.json
+**/sync-oauth.json
+*.oauth.json

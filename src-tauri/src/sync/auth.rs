@@ -199,7 +199,9 @@ pub fn parse_token_response(json: &str) -> Result<TokenResponse, AuthError> {
 /// `listen_for_redirect`, which ran after the browser was already spawned: a
 /// fast redirect could arrive at an unbound port and be refused by the OS,
 /// failing an otherwise-successful sign-in (audit finding S4).
-pub async fn bind_redirect_listener(redirect_uri: &str) -> Result<tokio::net::TcpListener, AuthError> {
+pub async fn bind_redirect_listener(
+    redirect_uri: &str,
+) -> Result<tokio::net::TcpListener, AuthError> {
     let url = Url::parse(redirect_uri).map_err(|_| AuthError::BadRedirect)?;
     let port = url.port().ok_or(AuthError::BadRedirect)?;
     tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -349,7 +351,52 @@ pub async fn accept_redirect(
     .map_err(|_| AuthError::Timeout)?
 }
 
+/// Longest provider-supplied `error=` value kept in an [`AuthError::AccessDenied`].
+///
+/// RFC 6749 §4.1.2.1 fixes the set to `invalid_request`, `unauthorized_client`,
+/// `access_denied`, `unsupported_response_type`, `invalid_scope`,
+/// `server_error`, `temporarily_unavailable` - the longest is 24 characters.
+/// Anything materially longer is not a provider string, so anything longer is
+/// clamped rather than rendered into the sync toast verbatim.
+pub const OAUTH_ERROR_MAX_CHARS: usize = 32;
+
+/// Normalize an attacker- or provider-supplied `error=` value.
+///
+/// The redirect arrives on a loopback listener bound to a FIXED port
+/// ([`crate::sync::scheduler::SYNC_REDIRECT_PORT`]) that accepts exactly one
+/// connection, so any local process can win that accept and put any bytes it
+/// likes on this path. The value therefore gets an ALLOWLIST rather than a
+/// denylist: RFC 6749 §4.1.2.1 defines `error` as
+/// `1*VSCHAR`-derived but the real values are a fixed set of
+/// `[A-Za-z0-9_-]` tokens, and anything else can only be there to spoof the
+/// one-line sync toast (newline, bidi override, zero-width joiner, an
+/// embedded URL, a megabyte of padding). A value that normalizes to nothing
+/// becomes the one error Google actually sends, `access_denied`. This is
+/// defense in depth - it matters far less once the state is validated first,
+/// but the string still reaches a user-visible error path.
+fn bounded_oauth_error(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(OAUTH_ERROR_MAX_CHARS)
+        .collect();
+    if cleaned.is_empty() {
+        return "access_denied".to_string();
+    }
+    cleaned
+}
+
 /// Parse `GET /?code=..&state=.. HTTP/1.1` and validate the state.
+///
+/// **State is validated FIRST, before anything else in the query is looked
+/// at** (audit finding C9). The loopback listener is single-accept on a fixed
+/// port, so a local process can win the accept and inject a request of its own
+/// choosing. The old order returned on `error=` before the state check, which
+/// did two things an attacker controls: it surfaced an arbitrary
+/// attacker-chosen string as the app's sign-in error, and because `accept`
+/// is single-shot it consumed the connection and killed the real sign-in
+/// (the user's browser then had nowhere to land). Validating state first makes
+/// an injected request indistinguishable from any other rejected redirect.
 pub fn parse_redirect_request(
     request_line: &str,
     expected_state: &str,
@@ -367,12 +414,14 @@ pub fn parse_redirect_request(
         url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
-    if let Some(error) = params.get("error") {
-        return Err(AuthError::AccessDenied(error.clone()));
+    match params.get("state") {
+        Some(state) if state == expected_state => {}
+        // Missing OR mismatched: never distinguishable from each other to an
+        // attacker, and both mean "not the request we started".
+        _ => return Err(AuthError::InvalidState),
     }
-    let state = params.get("state").ok_or(AuthError::BadRedirect)?;
-    if state != expected_state {
-        return Err(AuthError::InvalidState);
+    if let Some(error) = params.get("error") {
+        return Err(AuthError::AccessDenied(bounded_oauth_error(error)));
     }
     params.get("code").cloned().ok_or(AuthError::BadRedirect)
 }
@@ -693,7 +742,128 @@ mod tests {
         )); // code missing
     }
 
-    // --- Loopback request head accumulation (audit finding S4) ------------
+    // --- Audit finding C9: state before error ----------------------------
+
+    #[test]
+    fn parse_redirect_request_error_with_valid_state_is_access_denied() {
+        // Ordering (a): the provider's own denial, on a request that really is
+        // ours, must still be reported as a denial.
+        let line = "GET /?error=access_denied&state=state-1 HTTP/1.1";
+        match parse_redirect_request(line, "state-1") {
+            Err(AuthError::AccessDenied(m)) => assert_eq!(m, "access_denied"),
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_redirect_request_error_with_wrong_state_is_invalid_state() {
+        // Ordering (b): the attack shape. A local process that won the
+        // single-accept on the fixed loopback port sends this; it must NOT get
+        // its own text back, and it must NOT consume the real sign-in as a
+        // "denial" - an injected request is just another rejected redirect.
+        for line in [
+            "GET /?error=access_denied&state=attacker-state HTTP/1.1",
+            "GET /?state=attacker-state&error=access_denied HTTP/1.1",
+        ] {
+            assert!(
+                matches!(
+                    parse_redirect_request(line, "state-1"),
+                    Err(AuthError::InvalidState)
+                ),
+                "{line} must be rejected on state, not surfaced"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_redirect_request_error_with_missing_state_is_invalid_state() {
+        // Same attack with the state parameter omitted entirely. Note the
+        // error query string is fully attacker-controlled here, so this is
+        // the exact injection the old `error`-first ordering handed to the UI.
+        assert!(matches!(
+            parse_redirect_request("GET /?error=access_denied HTTP/1.1", "state-1"),
+            Err(AuthError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn attacker_controlled_error_text_never_reaches_the_error() {
+        // Belt and braces: even with a VALID state (the provider's real
+        // denial), the value is bounded - control characters stripped, length
+        // clamped, empty replaced. It reaches a user-visible sync toast.
+        let hostile =
+            "denied\u{202E}\n\u{0}Click here to re-authorise your account at https://evil.example";
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("error", hostile)
+            .append_pair("state", "s")
+            .finish();
+        match parse_redirect_request(&format!("GET /?{query} HTTP/1.1"), "s") {
+            Err(AuthError::AccessDenied(m)) => {
+                assert!(!m.contains('\n'), "no newline in a one-line toast");
+                assert!(!m.contains('\u{0}'), "no NUL");
+                assert!(!m.contains('\u{202E}'), "no bidi override");
+                assert!(!m.contains("evil.example"), "the URL must not survive");
+                assert!(
+                    m.chars().count() <= OAUTH_ERROR_MAX_CHARS,
+                    "clamped to {OAUTH_ERROR_MAX_CHARS} chars, got {}",
+                    m.chars().count()
+                );
+            }
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_error_bounding_leaves_real_provider_values_untouched() {
+        // RFC 6749 4.1.2.1 values must pass through verbatim - the bound only
+        // bites on something no provider would send.
+        for real in [
+            "invalid_request",
+            "unauthorized_client",
+            "access_denied",
+            "unsupported_response_type",
+            "invalid_scope",
+            "server_error",
+            "temporarily_unavailable",
+        ] {
+            assert_eq!(bounded_oauth_error(real), real, "{real} must survive");
+        }
+        assert_eq!(bounded_oauth_error(""), "access_denied");
+        assert_eq!(bounded_oauth_error("   "), "access_denied");
+        assert_eq!(bounded_oauth_error("\n\t"), "access_denied");
+        assert_eq!(bounded_oauth_error("\u{202E}\u{200B}"), "access_denied");
+        assert_eq!(
+            bounded_oauth_error("  access_denied  "),
+            "access_denied",
+            "surrounding whitespace stripped"
+        );
+        // The allowlist is positional, not just a prefix cut: a spoof that
+        // looks legitimate at the front still loses its payload.
+        assert_eq!(
+            bounded_oauth_error("access_denied reauthorise at evil.example"),
+            "access_deniedreauthoriseatevilexample"
+                .chars()
+                .take(OAUTH_ERROR_MAX_CHARS)
+                .collect::<String>()
+        );
+        let clamped = bounded_oauth_error(&"x".repeat(10_000));
+        assert_eq!(clamped.chars().count(), OAUTH_ERROR_MAX_CHARS);
+    }
+
+    #[test]
+    fn success_path_still_works_and_state_is_still_required() {
+        // The success path is untouched...
+        assert_eq!(
+            parse_redirect_request("GET /?code=auth-code-1&state=state-1 HTTP/1.1", "state-1")
+                .unwrap(),
+            "auth-code-1"
+        );
+        // ...and a code with no state at all can never be accepted.
+        assert!(matches!(
+            parse_redirect_request("GET /?code=auth-code-1 HTTP/1.1", "state-1"),
+            Err(AuthError::InvalidState)
+        ));
+    }
 
     #[test]
     fn redirect_head_accumulates_until_the_terminator() {
@@ -718,15 +888,24 @@ mod tests {
             parse_redirect_request(head.lines().next().unwrap(), "state-1").unwrap(),
             "auth-code-1"
         );
+        // CHANGED EXPECTATION (audit finding C9). This asserted `BadRedirect`,
+        // which was the pre-fix result of the state lookup being the LAST thing
+        // tried. It is now `InvalidState`, because a request whose `state`
+        // parameter is absent (here, truncated mid-token) is exactly the shape
+        // an injected single-accept connection produces, and it must be
+        // rejected as a state mismatch - before any other query parameter is
+        // read - rather than as a generic malformed redirect.
         assert!(matches!(
             parse_redirect_request("GET /?code=auth-code-1&sta", "state-1"),
-            Err(AuthError::BadRedirect)
+            Err(AuthError::InvalidState)
         ));
     }
 
     #[test]
     fn redirect_head_accepts_an_lf_only_terminator() {
-        assert!(!redirect_head_is_complete(b"GET /?code=1&state=s HTTP/1.1\n"));
+        assert!(!redirect_head_is_complete(
+            b"GET /?code=1&state=s HTTP/1.1\n"
+        ));
         assert!(
             redirect_head_is_complete(b"GET /?code=1&state=s HTTP/1.1\nHost: localhost\n\n"),
             "bare LF line endings are tolerated as a fallback"
@@ -846,8 +1025,9 @@ mod tests {
     /// query string until it is at least `pad_to` bytes. Never truncated: the
     /// natural length is the floor, so a caller can pass 0 for "just the line".
     fn request_line(code: &str, pad_to: usize) -> Vec<u8> {
-        let mut line = format!("GET /?code={code}&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .into_bytes();
+        let mut line =
+            format!("GET /?code={code}&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .into_bytes();
         if line.len() < pad_to {
             let need = pad_to - line.len();
             let at = line
@@ -860,7 +1040,10 @@ mod tests {
             padded.extend_from_slice(&line[at..]);
             line = padded;
         }
-        assert!(line.len() >= pad_to, "request line must reach the requested size");
+        assert!(
+            line.len() >= pad_to,
+            "request line must reach the requested size"
+        );
         line
     }
 
@@ -868,8 +1051,13 @@ mod tests {
     #[tokio::test]
     async fn accept_loop_below_cap_reads_a_normal_request() {
         let line = request_line("small-code-1", 0);
-        assert!(line.len() < REDIRECT_HEAD_MAX_BYTES, "this case must be below cap");
-        let code = drive_accept(vec![line]).await.expect("a small request must succeed");
+        assert!(
+            line.len() < REDIRECT_HEAD_MAX_BYTES,
+            "this case must be below cap"
+        );
+        let code = drive_accept(vec![line])
+            .await
+            .expect("a small request must succeed");
         assert_eq!(code, "small-code-1");
     }
 
@@ -977,10 +1165,7 @@ mod tests {
         // `room` is 96, which is below the chunk size and therefore the case
         // `room.min(..)` exists for. The pause keeps the tail out of the read
         // that would otherwise be filled to a chunk boundary by coalescing.
-        client
-            .write_all(&[b'a'; 4000])
-            .await
-            .expect("write head");
+        client.write_all(&[b'a'; 4000]).await.expect("write head");
         client.flush().await.expect("flush head");
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         // The server may legitimately have finished and closed once the cap was

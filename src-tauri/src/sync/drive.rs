@@ -472,7 +472,7 @@ pub fn classify_status_with_body(status: u16, body: &str) -> Result<(), SyncErro
 /// scheduler falls back to its exponential backoff in that case.
 ///
 /// `None` when the header is absent, unparseable, or non-positive. Pure and
-/// offline-testable; feeds [`classify_status_with_response`].
+/// offline-testable; feeds [`classify_status_with_retry_after`].
 pub fn read_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let value = headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -487,20 +487,10 @@ pub fn read_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> 
     Some(secs.saturating_mul(1000))
 }
 
-/// Classify a Drive response, honoring a `Retry-After` header on 429 as
-/// [`SyncError::Throttled`]. Every other status matches
-/// [`classify_status_with_body`] exactly.
-pub fn classify_status_with_response(
-    resp: &reqwest::blocking::Response,
-    status: u16,
-    body: &str,
-) -> Result<(), SyncError> {
-    classify_status_with_retry_after(status, read_retry_after_ms(resp.headers()), body)
-}
-
-/// Pure core of [`classify_status_with_response`]: a 429 with (or without) a
-/// `Retry-After` delay becomes [`SyncError::Throttled`]; every other status
-/// matches [`classify_status_with_body`] exactly. Offline-testable.
+/// Classify a Drive response from its status, `Retry-After` header and body: a
+/// 429 - and a quota-shaped 403 - with (or without) a `Retry-After` delay
+/// becomes [`SyncError::Throttled`]; every other status matches
+/// [`classify_status_with_body`] exactly. Pure and offline-testable.
 fn classify_status_with_retry_after(
     status: u16,
     retry_after_ms: Option<u64>,
@@ -508,6 +498,12 @@ fn classify_status_with_retry_after(
 ) -> Result<(), SyncError> {
     if status == 429 {
         return Err(SyncError::Throttled { retry_after_ms });
+    }
+    // A quota-shaped 403 carries the SAME Retry-After semantics as a 429 -
+    // `dailyLimitExceeded` asks the client to come back tomorrow - so it must
+    // not fall through to `classify_status_with_body`, which drops the header.
+    if status == 403 {
+        return Err(classify_forbidden_with_retry_after(body, retry_after_ms));
     }
     classify_status_with_body(status, body)
 }
@@ -540,14 +536,180 @@ fn forbidden_reason(value: &serde_json::Value) -> Option<&str> {
 /// wrongly-retried 403 merely costs one backoff attempt. On unknown bodies we
 /// prefer availability over strictness.
 pub fn classify_forbidden(body: &str) -> SyncError {
+    classify_forbidden_with_retry_after(body, None)
+}
+
+/// [`classify_forbidden`], but carrying the response's `Retry-After`.
+///
+/// A quota-shaped 403 that arrived with an explicit delay becomes
+/// [`SyncError::Throttled`] so the scheduler honors it. Without this the
+/// `dailyLimitExceeded` header is dropped on the floor and the scheduler
+/// re-polls on its 60 s exponential cap forever against a server that asked
+/// for a day. With `retry_after_ms: None` the classification is byte-for-byte
+/// identical to [`classify_forbidden`] - the only behavior change is that a
+/// present header now survives.
+pub fn classify_forbidden_with_retry_after(body: &str, retry_after_ms: Option<u64>) -> SyncError {
     let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
     match parsed.as_ref().and_then(forbidden_reason) {
-        Some(reason) if is_transient_403_reason(reason) => {
-            SyncError::Retryable(format!("Drive rate limited ({reason})"))
-        }
+        Some(reason) if is_transient_403_reason(reason) => match retry_after_ms {
+            // `Throttled` routes to exactly the same retryable scheduling
+            // path as `Retryable` (see `frozen.rs`'s failure tally); it only
+            // carries the header so the delay is honored.
+            Some(_) => SyncError::Throttled { retry_after_ms },
+            None => SyncError::Retryable(format!("Drive rate limited ({reason})")),
+        },
         Some(_) => SyncError::NotOurs,
         None => SyncError::Retryable("Drive HTTP 403".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded response bodies (audit finding F14).
+//
+// `MAX_DOMAIN_BYTES` used to be enforced on UPLOAD only, and on download only
+// AFTER the whole body had already been buffered - so one oversized (or
+// simply lying) remote still cost us a full unbounded allocation, and the
+// `resp.text()` calls on listing/metadata/error responses had no ceiling at
+// all. Two guards close that:
+//   1. the declared `Content-Length` is checked BEFORE a byte is read;
+//   2. the body is streamed under a hard ceiling, so an absent, chunked or
+//      simply wrong `Content-Length` still costs a bounded allocation.
+// Both are needed: the header is only a claim, the ceiling is the guarantee.
+// ---------------------------------------------------------------------------
+
+/// Bytes of a FAILURE body we will keep. Drive's error JSON is a few hundred
+/// bytes; past this it is abuse or a proxy error page and carries no
+/// classification signal worth buffering. Success bodies use the far larger
+/// domain cap instead (see [`read_bounded_body`]).
+pub const MAX_DIAGNOSTIC_BODY_BYTES: usize = 64 * 1024;
+
+/// A response body read under a hard byte ceiling.
+#[derive(Debug)]
+pub enum BoundedBody {
+    /// The whole body arrived and is <= the cap.
+    Complete(Vec<u8>),
+    /// The body exceeded the cap and was abandoned mid-stream. At most
+    /// `cap + 1` bytes were ever held.
+    Truncated,
+}
+
+/// Whether a declared `Content-Length` already exceeds `cap`.
+///
+/// Pre-read half of the guard: when the length is declared we refuse before a
+/// single body byte is buffered. `None` - absent, chunked, or simply a lie -
+/// falls through to the streaming ceiling, which is what actually holds.
+pub fn content_length_over_cap(content_length: Option<u64>, cap: usize) -> Option<u64> {
+    content_length.filter(|&len| len > cap as u64)
+}
+
+/// Stream `reader` into a `Vec`, abandoning it the moment the body passes
+/// `cap`.
+///
+/// Streaming half of the guard. `Ok(None)` = exceeded `cap`; `Ok(Some(_))` =
+/// the complete body, guaranteed <= `cap`. At most `cap + 1` bytes are ever
+/// held, so an unbounded or hostile body costs a bounded allocation. Reads
+/// through any `Read`, so it is exercisable offline with a cursor.
+pub fn read_capped<R: std::io::Read>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        // `buf.len() <= cap` holds here (we return as soon as it exceeds), so
+        // `room >= 1` and the read never asks for a zero-length buffer.
+        let room = cap + 1 - buf.len();
+        let want = room.min(chunk.len());
+        let n = reader.read(&mut chunk[..want])?;
+        if n == 0 {
+            return Ok(Some(buf));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > cap {
+            return Ok(None);
+        }
+    }
+}
+
+/// [`read_bounded_body_capped`] with the cap chosen from the response status.
+///
+/// A success body is domain state (listing, media, about) and gets the full
+/// domain cap - `list_v1_files` legitimately returns ~1000 rows of
+/// `id,name,version,size`, well past a diagnostic-sized cap. A failure body is
+/// only read to CLASSIFY the failure, so it gets the small diagnostic cap and a
+/// hostile error page can never make us buffer megabytes.
+pub fn read_bounded_body(resp: &mut reqwest::blocking::Response) -> Result<BoundedBody, SyncError> {
+    let cap = if resp.status().is_success() {
+        MAX_DOMAIN_BYTES
+    } else {
+        MAX_DIAGNOSTIC_BODY_BYTES
+    };
+    read_bounded_body_capped(resp, cap)
+}
+
+/// The whole two-guard read as a pure function of (declared length, stream).
+///
+/// Guard 1 checks the declared `Content-Length` before a byte is read; guard 2
+/// streams under the ceiling for the case where that header is absent, chunked
+/// or simply wrong. `Ok(None)` means "do not use this body" for either reason.
+/// Split out of [`read_bounded_body_capped`] so both guards are exercisable
+/// offline over a plain stream, with the byte counter proving guard 1 read
+/// nothing at all.
+pub fn read_body_capped<R: std::io::Read>(
+    content_length: Option<u64>,
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    if content_length_over_cap(content_length, cap).is_some() {
+        return Ok(None);
+    }
+    read_capped(reader, cap)
+}
+
+/// [`read_bounded_body`] with an explicit cap: the `Content-Length` pre-check,
+/// then the streaming ceiling.
+pub fn read_bounded_body_capped(
+    resp: &mut reqwest::blocking::Response,
+    cap: usize,
+) -> Result<BoundedBody, SyncError> {
+    match read_body_capped(resp.content_length(), resp, cap) {
+        Ok(Some(bytes)) => Ok(BoundedBody::Complete(bytes)),
+        Ok(None) => {
+            log::warn!("sync: response body passed the {cap} byte cap, abandoned unread");
+            Ok(BoundedBody::Truncated)
+        }
+        Err(e) => Err(SyncError::Retryable(e.to_string())),
+    }
+}
+
+/// Decode a body read by [`read_bounded_body`] for parsing or classification.
+///
+/// A truncated SUCCESS body cannot yield valid state, so it is `Rejected` -
+/// never decoded, never handed to the engine. A truncated FAILURE body
+/// decodes to an empty string so the status and headers alone still classify
+/// the failure, which keeps the documented fail-safe (an unparseable 403 is
+/// `Retryable`, never the `NotOurs` fatal latch).
+pub fn decoded_bounded_body(status: u16, body: &BoundedBody) -> Result<String, SyncError> {
+    match body {
+        BoundedBody::Complete(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        BoundedBody::Truncated if (200..=299).contains(&status) => Err(SyncError::Rejected(
+            format!("response body exceeds {MAX_DOMAIN_BYTES} byte cap"),
+        )),
+        BoundedBody::Truncated => Ok(String::new()),
+    }
+}
+
+/// Read + classify one response: status and `Retry-After` are read off the
+/// headers FIRST (so a throttled answer is honored even when the body is
+/// never looked at), the body is bounded by [`read_bounded_body`], and the
+/// decoded text is handed to the classifier. Returns the decoded body so the
+/// caller can parse it on the success path.
+fn read_and_classify(resp: &mut reqwest::blocking::Response) -> Result<String, SyncError> {
+    let status = resp.status().as_u16();
+    let retry_after_ms = read_retry_after_ms(resp.headers());
+    let body = decoded_bounded_body(status, &read_bounded_body(resp)?)?;
+    classify_status_with_retry_after(status, retry_after_ms, &body)?;
+    Ok(body)
 }
 
 /// The files query for a folder listing, `trashed=false`, with optional
@@ -760,17 +922,12 @@ impl GoogleDriveStore {
             [("q", q.as_str()), ("spaces", APPDATA_FOLDER_ALIAS)],
         )
         .expect("valid url");
-        let resp = self.send(|client, token| {
+        let mut resp = self.send(|client, token| {
             client
                 .request(reqwest::Method::GET, list_url.as_str())
                 .bearer_auth(token)
         })?;
-        let status = resp.status().as_u16();
-        let retry_after_ms = read_retry_after_ms(resp.headers());
-        let body = resp
-            .text()
-            .map_err(|e| SyncError::Retryable(e.to_string()))?;
-        classify_status_with_retry_after(status, retry_after_ms, &body)?;
+        let body = read_and_classify(&mut resp)?;
         // Folder listings reuse the same parser shape (id/name); versions are
         // simply absent for folders.
         let (folders, _) = Self::parse_file_listing_lenient(&body)?;
@@ -781,18 +938,13 @@ impl GoogleDriveStore {
         {
             return Ok(first.file_id);
         }
-        let create = self.send(|client, token| {
+        let mut create = self.send(|client, token| {
             client
                 .request(reqwest::Method::POST, API_BASE.to_string() + "/files?fields=id")
                 .bearer_auth(token)
                 .json(&serde_json::json!({"name": name, "mimeType": FOLDER_MIME, "parents": [parent]}))
         })?;
-        let status = create.status().as_u16();
-        let retry_after_ms = read_retry_after_ms(create.headers());
-        let body = create
-            .text()
-            .map_err(|e| SyncError::Retryable(e.to_string()))?;
-        classify_status_with_retry_after(status, retry_after_ms, &body)?;
+        let body = read_and_classify(&mut create)?;
         parse_id_from_response(&body)
             .ok_or_else(|| SyncError::Retryable("folder create missing id".to_string()))
     }
@@ -860,7 +1012,7 @@ impl GoogleDriveStore {
         body.extend_from_slice(content);
         body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
         let body_for_send = body.clone();
-        let resp = self.send(|client, token| {
+        let mut resp = self.send(|client, token| {
             client
                 .request(method.clone(), &url)
                 .bearer_auth(token)
@@ -870,12 +1022,7 @@ impl GoogleDriveStore {
                 )
                 .body(body_for_send.clone())
         })?;
-        let status = resp.status().as_u16();
-        let retry_after_ms = read_retry_after_ms(resp.headers());
-        let body = resp
-            .text()
-            .map_err(|e| SyncError::Retryable(e.to_string()))?;
-        classify_status_with_retry_after(status, retry_after_ms, &body)?;
+        let body = read_and_classify(&mut resp)?;
         if let Some(v) = parse_version_from_response(&body) {
             return Ok(v);
         }
@@ -884,17 +1031,12 @@ impl GoogleDriveStore {
         let id = parse_id_from_response(&body);
         if let Some(id) = id {
             let meta_url = format!("{API_BASE}/files/{id}?fields=version");
-            let resp = self.send(|client, token| {
+            let mut resp = self.send(|client, token| {
                 client
                     .request(reqwest::Method::GET, &meta_url)
                     .bearer_auth(token)
             })?;
-            let status = resp.status().as_u16();
-            let retry_after_ms = read_retry_after_ms(resp.headers());
-            let body = resp
-                .text()
-                .map_err(|e| SyncError::Retryable(e.to_string()))?;
-            classify_status_with_retry_after(status, retry_after_ms, &body)?;
+            let body = read_and_classify(&mut resp)?;
             if let Some(v) = parse_version_from_response(&body) {
                 return Ok(v);
             }
@@ -926,7 +1068,7 @@ impl DomainDriveStore for GoogleDriveStore {
         let mut page_token: Option<String> = None;
         loop {
             let url = list_v1_files_query(&v1_id, page_token.as_deref());
-            let resp = self.send(|client, token| {
+            let mut resp = self.send(|client, token| {
                 client
                     .request(reqwest::Method::GET, &url)
                     .bearer_auth(token)
@@ -934,12 +1076,7 @@ impl DomainDriveStore for GoogleDriveStore {
             if resp.status().as_u16() == 404 {
                 return Ok(Vec::new());
             }
-            let status = resp.status().as_u16();
-            let retry_after_ms = read_retry_after_ms(resp.headers());
-            let body = resp
-                .text()
-                .map_err(|e| SyncError::Retryable(e.to_string()))?;
-            classify_status_with_retry_after(status, retry_after_ms, &body)?;
+            let body = read_and_classify(&mut resp)?;
             let (files, next) = parse_domain_listing(&body)?;
             all.extend(files);
             match next {
@@ -1032,7 +1169,7 @@ impl DomainDriveStore for GoogleDriveStore {
             return Ok(Some(bytes));
         }
         let url = format!("{API_BASE}/files/{file_id}?alt=media");
-        let resp = self.send(|client, token| {
+        let mut resp = self.send(|client, token| {
             client
                 .request(reqwest::Method::GET, &url)
                 .bearer_auth(token)
@@ -1042,12 +1179,31 @@ impl DomainDriveStore for GoogleDriveStore {
         }
         let status = resp.status().as_u16();
         let retry_after_ms = read_retry_after_ms(resp.headers());
-        let bytes = resp
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| SyncError::Retryable(e.to_string()))?;
-        classify_status_with_retry_after(status, retry_after_ms, &String::from_utf8_lossy(&bytes))?;
-        Ok(Some(bytes))
+        match read_bounded_body(&mut resp)? {
+            BoundedBody::Complete(bytes) => {
+                classify_status_with_retry_after(
+                    status,
+                    retry_after_ms,
+                    &String::from_utf8_lossy(&bytes),
+                )?;
+                Ok(Some(bytes))
+            }
+            // Over-cap on the success path (audit finding F14): `Rejected`,
+            // which is exactly what the engine raises for an oversized remote,
+            // so the pass aborts BEFORE any mutation and the remote is left
+            // untouched. `Ok(None)` is deliberately NOT used here - the engine
+            // reads "absent" as "safe to (re)create", which would overwrite the
+            // very file we just refused to read.
+            BoundedBody::Truncated if (200..=299).contains(&status) => Err(SyncError::Rejected(
+                format!("remote domain body exceeds {MAX_DOMAIN_BYTES} byte cap"),
+            )),
+            // Over-cap on the failure path: the body is only diagnostic, so
+            // discard it and classify from the status + headers alone.
+            BoundedBody::Truncated => {
+                classify_status_with_retry_after(status, retry_after_ms, "")?;
+                Ok(None)
+            }
+        }
     }
 
     fn put_domain(
@@ -1114,7 +1270,7 @@ impl DomainDriveStore for GoogleDriveStore {
 
     fn delete_domain_file(&mut self, file_id: &str) -> Result<(), SyncError> {
         let url = format!("{API_BASE}/files/{file_id}");
-        let resp = self.send(|client, token| {
+        let mut resp = self.send(|client, token| {
             client
                 .request(reqwest::Method::DELETE, &url)
                 .bearer_auth(token)
@@ -1122,16 +1278,12 @@ impl DomainDriveStore for GoogleDriveStore {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
         }
-        let status = resp.status().as_u16();
-        if status == 403 {
-            let body = resp
-                .text()
-                .map_err(|e| SyncError::Retryable(e.to_string()))?;
-            return Err(classify_forbidden(&body));
-        }
-        // The body is only consumed for 403 above; the 429 branch of
-        // classify_status_with_response reads the Retry-After header only.
-        classify_status_with_response(&resp, status, "")
+        // `read_and_classify` inspects the body for EVERY status, not just
+        // 403: only 403 changes classification based on it
+        // (`classify_forbidden`), and the bounded read costs a body we were
+        // already reading anyway.
+        read_and_classify(&mut resp)?;
+        Ok(())
     }
 
     fn ensure_partition_folder(&mut self, folder_name: &str) -> Result<String, SyncError> {
@@ -1164,7 +1316,7 @@ impl DomainDriveStore for GoogleDriveStore {
         let mut page_token: Option<String> = None;
         loop {
             let url = list_files_query(folder_id, page_token.as_deref(), APPDATA_FOLDER_ALIAS);
-            let resp = self.send(|client, token| {
+            let mut resp = self.send(|client, token| {
                 client
                     .request(reqwest::Method::GET, &url)
                     .bearer_auth(token)
@@ -1172,12 +1324,7 @@ impl DomainDriveStore for GoogleDriveStore {
             if resp.status().as_u16() == 404 {
                 return Ok(Vec::new());
             }
-            let status = resp.status().as_u16();
-            let retry_after_ms = read_retry_after_ms(resp.headers());
-            let body = resp
-                .text()
-                .map_err(|e| SyncError::Retryable(e.to_string()))?;
-            classify_status_with_retry_after(status, retry_after_ms, &body)?;
+            let body = read_and_classify(&mut resp)?;
             let (files, next) = parse_domain_listing(&body)?;
             all.extend(files);
             match next {
@@ -1250,24 +1397,26 @@ impl DomainDriveStore for GoogleDriveStore {
             return Err(e);
         }
         let url = format!("{API_BASE}/about?fields=user");
-        let resp = self.send(|client, token| {
+        let mut resp = self.send(|client, token| {
             client
                 .request(reqwest::Method::GET, &url)
                 .bearer_auth(token)
         })?;
-        let status = resp.status().as_u16();
-        let retry_after_ms = read_retry_after_ms(resp.headers());
-        let body = resp
-            .text()
-            .map_err(|e| SyncError::Retryable(e.to_string()))?;
-        classify_status_with_retry_after(status, retry_after_ms, &body)?;
+        let body = read_and_classify(&mut resp)?;
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|_| SyncError::Rejected("corrupt about response".to_string()))?;
         Ok(value
             .get("user")
             .and_then(|u| u.get("emailAddress"))
             .and_then(|e| e.as_str())
-            .filter(|s| !s.is_empty())
+            // Same blank predicate as `scheduler::parse_account_email`, which
+            // the sign-in path uses. These two parsers disagreed: sign-in
+            // rejected a whitespace-only address (`trim().is_empty()`) while
+            // every PASS accepted it, and an all-whitespace address normalises
+            // to the empty string — so the pass went on to hash `""` and address
+            // the partition for it, deriving an identity Drive never returned.
+            // One predicate, so both paths fail closed together.
+            .filter(|s| !s.trim().is_empty())
             .map(str::to_string))
     }
 }
@@ -1460,7 +1609,10 @@ mod tests {
         let resp = store
             .send(|client, token| {
                 client
-                    .request(reqwest::Method::GET, format!("http://{origin}/file?alt=media"))
+                    .request(
+                        reqwest::Method::GET,
+                        format!("http://{origin}/file?alt=media"),
+                    )
                     .bearer_auth(token)
             })
             .expect("a refused redirect is a response, not a transport error");
@@ -1629,6 +1781,303 @@ mod tests {
                 "unparseable 403 body {body:?} must not latch NotOurs"
             );
         }
+    }
+
+    // --- Audit finding F14: bounded response bodies -----------------------
+    //
+    // Every case below is constructed from plain values - a declared length, a
+    // cursor over a body - so none of it touches a socket.
+
+    /// A reader that yields exactly `len` bytes of `b'x'` one byte at a time,
+    /// while counting what was actually pulled. Lets a test prove the read was
+    /// ABANDONED at the ceiling instead of draining the whole body.
+    struct CountingBody {
+        remaining: usize,
+        read_so_far: usize,
+    }
+
+    impl CountingBody {
+        fn new(len: usize) -> Self {
+            Self {
+                remaining: len,
+                read_so_far: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for CountingBody {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            for slot in buf.iter_mut().take(n) {
+                *slot = b'x';
+            }
+            self.remaining -= n;
+            self.read_so_far += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn content_length_over_cap_refuses_a_declared_oversize_before_reading() {
+        // Declared larger than the cap -> refused, and the value is reported
+        // so the log/diagnostic can name the size.
+        assert_eq!(
+            content_length_over_cap(Some(MAX_DOMAIN_BYTES as u64 + 1), MAX_DOMAIN_BYTES),
+            Some(MAX_DOMAIN_BYTES as u64 + 1)
+        );
+        // Exactly at the cap is allowed (the cap is inclusive).
+        assert_eq!(
+            content_length_over_cap(Some(MAX_DOMAIN_BYTES as u64), MAX_DOMAIN_BYTES),
+            None
+        );
+        assert_eq!(content_length_over_cap(Some(0), MAX_DOMAIN_BYTES), None);
+        // Absent / chunked / lying: the header cannot help, the streaming
+        // ceiling is what holds. This is the TOCTOU the listing `size` guard
+        // cannot cover.
+        assert_eq!(content_length_over_cap(None, MAX_DOMAIN_BYTES), None);
+    }
+
+    #[test]
+    fn read_capped_returns_the_whole_body_when_it_fits() {
+        let body = b"{\"v\":1,\"entries\":[]}".to_vec();
+        let mut reader = std::io::Cursor::new(body.clone());
+        let got = read_capped(&mut reader, MAX_DOMAIN_BYTES)
+            .expect("read cannot fail")
+            .expect("body is under the cap");
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn a_declared_oversize_is_refused_without_reading_a_single_byte() {
+        // Guard 1, end to end: Drive says how big it is, so nothing is read.
+        // `CountingBody` counts the pulls, which is the whole point - an
+        // over-cap remote must not cost an allocation at all.
+        let cap = 128 * 1024usize;
+        let mut reader = CountingBody::new(cap * 4);
+        let got =
+            read_body_capped(Some(cap as u64 * 4 + 1), &mut reader, cap).expect("read cannot fail");
+        assert!(got.is_none(), "a declared oversize must be refused");
+        assert_eq!(
+            reader.read_so_far, 0,
+            "the pre-read guard must fire before the stream is touched"
+        );
+
+        // A declared length UNDER the cap is not a reason to stop early.
+        let body = b"small".to_vec();
+        let mut reader = std::io::Cursor::new(body.clone());
+        assert_eq!(
+            read_body_capped(Some(body.len() as u64), &mut reader, cap).expect("read cannot fail"),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn read_capped_stops_a_lying_content_length_body_at_the_ceiling() {
+        // A body that is 3 MiB over the cap, with NO declared length to catch
+        // it first: the reader must stop at the ceiling, not buffer 11 MiB.
+        let cap = 256 * 1024usize;
+        let mut reader = CountingBody::new(cap * 2 + 3);
+        let got = read_capped(&mut reader, cap).expect("read cannot fail");
+        assert!(got.is_none(), "an over-cap body must report truncation");
+        assert!(
+            reader.read_so_far <= cap + 1,
+            "buffered {} bytes for a {cap} cap: the ceiling did not hold",
+            reader.read_so_far
+        );
+    }
+
+    #[test]
+    fn read_capped_holds_the_ceiling_on_a_bounded_reader_too() {
+        // Same guarantee on a reader that hands back big chunks: the loop has
+        // to size each read by the room left under the cap, not by its own
+        // buffer size.
+        let cap = 100_000usize;
+        let mut reader = std::io::Cursor::new(vec![b'y'; cap * 3]);
+        assert!(read_capped(&mut reader, cap)
+            .expect("read cannot fail")
+            .is_none());
+    }
+
+    #[test]
+    fn read_capped_accepts_a_body_of_exactly_the_cap() {
+        let cap = 4096usize;
+        let mut reader = std::io::Cursor::new(vec![b'z'; cap]);
+        let got = read_capped(&mut reader, cap)
+            .expect("read cannot fail")
+            .expect("cap is inclusive");
+        assert_eq!(got.len(), cap);
+    }
+
+    #[test]
+    fn decoded_bounded_body_rejects_a_truncated_success_body() {
+        // An over-cap SUCCESS body cannot yield valid state, and must never be
+        // handed to the engine as if it had been read.
+        assert!(matches!(
+            decoded_bounded_body(200, &BoundedBody::Truncated),
+            Err(SyncError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_bounded_body_still_classifies_a_truncated_failure_body() {
+        // Fail-safe preserved: with no body to inspect the 403 is unparseable,
+        // which the documented policy classifies `Retryable` - never the
+        // `NotOurs` fatal latch that would need a manual sign-out.
+        let text =
+            decoded_bounded_body(403, &BoundedBody::Truncated).expect("classify from status");
+        assert_eq!(text, "");
+        assert!(matches!(
+            classify_status_with_retry_after(403, None, &text),
+            Err(SyncError::Retryable(_))
+        ));
+        // The header alone must NOT promote it to `Throttled`: without a body
+        // we cannot tell a quota 403 from a permission 403, and guessing
+        // `Throttled` on a permission failure would re-introduce the retry
+        // loop that `NotOurs` exists to prevent. Exponential backoff is the
+        // right answer for an unreadable error.
+        assert!(
+            matches!(
+                classify_status_with_retry_after(403, Some(86_400_000), &text),
+                Err(SyncError::Retryable(_))
+            ),
+            "an unreadable 403 body falls back to plain retryable backoff"
+        );
+        // ...but a 429 needs no body at all, so its header still survives.
+        assert!(matches!(
+            classify_status_with_retry_after(429, Some(86_400_000), &text),
+            Err(SyncError::Throttled {
+                retry_after_ms: Some(86_400_000)
+            })
+        ));
+    }
+
+    #[test]
+    fn oversized_remote_domain_body_is_rejected_and_never_returned() {
+        // Mirrors the `get_domain_content` success-path decision, end to end
+        // over a constructed body: an over-cap remote yields `Rejected` (the
+        // engine's own oversized outcome, which aborts the pass BEFORE any
+        // mutation and leaves the remote intact) - and specifically NOT
+        // `Ok(None)`, which the engine reads as "absent" and would then
+        // overwrite.
+        let status = 200u16;
+        let read = read_capped(
+            &mut CountingBody::new(MAX_DOMAIN_BYTES + 1),
+            MAX_DOMAIN_BYTES,
+        )
+        .expect("read cannot fail");
+        assert!(read.is_none(), "{MAX_DOMAIN_BYTES}+1 bytes cannot complete");
+        assert!(matches!(
+            decoded_bounded_body(status, &BoundedBody::Truncated),
+            Err(SyncError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn diagnostic_body_cap_is_small_but_listing_bodies_keep_the_domain_cap() {
+        // A 403's error JSON is a few hundred bytes; a proxy error page is
+        // not, and must not be buffered as if it were domain state.
+        assert_eq!(MAX_DIAGNOSTIC_BODY_BYTES, 64 * 1024);
+        assert!(
+            MAX_DIAGNOSTIC_BODY_BYTES < MAX_DOMAIN_BYTES,
+            "failure bodies must be capped tighter than domain bodies"
+        );
+        // A page of 1000 listing rows fits the success-path cap comfortably,
+        // which is why the cap is chosen from the status, not fixed.
+        let listing = vec![b'0'; 200 * 1024];
+        assert!(listing.len() < MAX_DOMAIN_BYTES);
+    }
+
+    // --- Audit finding F16: Retry-After on a quota-shaped 403 --------------
+
+    #[test]
+    fn quota_403_with_retry_after_keeps_the_header_instead_of_a_plain_retryable() {
+        // The bug: `classify_forbidden` returned a bare `Retryable`, so the
+        // `Retry-After` was dropped and the scheduler re-polled on its 60 s cap
+        // against a server that had asked for a day.
+        let body = r#"{"error":{"code":403,"reason":"dailyLimitExceeded"}}"#;
+        assert_eq!(
+            classify_forbidden_with_retry_after(body, Some(86_400_000)),
+            SyncError::Throttled {
+                retry_after_ms: Some(86_400_000)
+            }
+        );
+        // The nested `errors[].reason` shape carries it too.
+        let nested =
+            r#"{"error":{"errors":[{"domain":"usageLimits","reason":"dailyLimitExceeded"}]}}"#;
+        assert!(matches!(
+            classify_forbidden_with_retry_after(nested, Some(3_600_000)),
+            SyncError::Throttled {
+                retry_after_ms: Some(3_600_000)
+            }
+        ));
+    }
+
+    #[test]
+    fn quota_403_without_retry_after_is_byte_identical_to_the_old_classification() {
+        // No header -> unchanged. Nothing about the pre-existing contract moves.
+        for body in [
+            r#"{"error":{"code":403,"reason":"dailyLimitExceeded"}}"#,
+            r#"{"error":{"code":403,"reason":"userRateLimitExceeded"}}"#,
+            "<html>Bad Gateway</html>",
+        ] {
+            assert_eq!(
+                classify_forbidden_with_retry_after(body, None),
+                classify_forbidden(body)
+            );
+            assert!(matches!(
+                classify_forbidden_with_retry_after(body, None),
+                SyncError::Retryable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn non_quota_403_ignores_retry_after_and_stays_not_ours() {
+        // A `Retry-After` on a permission failure must not turn the fatal
+        // ownership latch into a retry loop.
+        let body = r#"{"error":{"code":403,"reason":"insufficientPermissions"}}"#;
+        assert_eq!(
+            classify_forbidden_with_retry_after(body, Some(3_600_000)),
+            SyncError::NotOurs
+        );
+        assert_eq!(
+            classify_status_with_retry_after(403, Some(3_600_000), body),
+            Err(SyncError::NotOurs)
+        );
+    }
+
+    #[test]
+    fn retry_after_survives_the_full_status_path_for_429_and_quota_403() {
+        assert_eq!(
+            classify_status_with_retry_after(429, Some(2_000), ""),
+            Err(SyncError::Throttled {
+                retry_after_ms: Some(2_000)
+            })
+        );
+        assert_eq!(
+            classify_status_with_retry_after(
+                429,
+                None,
+                r#"{"error":{"code":429,"reason":"rateLimitExceeded"}}"#
+            ),
+            Err(SyncError::Throttled {
+                retry_after_ms: None
+            })
+        );
+        // 5xx / 401 / 400 are untouched by the header.
+        assert!(matches!(
+            classify_status_with_retry_after(500, Some(2_000), ""),
+            Err(SyncError::Retryable(_))
+        ));
+        assert_eq!(
+            classify_status_with_retry_after(401, Some(2_000), ""),
+            Err(SyncError::AuthRequired)
+        );
+        assert!(matches!(
+            classify_status_with_retry_after(400, Some(2_000), ""),
+            Err(SyncError::Rejected(_))
+        ));
+        assert!(classify_status_with_retry_after(200, Some(2_000), "").is_ok());
     }
 
     #[test]

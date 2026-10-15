@@ -49,6 +49,20 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// Size ceiling for a LOCAL store file.
+///
+/// Audit #6a: this used to be 8 MB - the size of `drive::MAX_DOMAIN_BYTES`,
+/// which is a WIRE cap on one remote sync envelope, not a property of local
+/// state. Reusing it here declared a legitimate, perfectly valid local store
+/// "corrupt" and rotated the user's real ledger aside as `*.corrupt.json`
+/// (dictionary.json / snippets.json / stats_events.json all grow without bound
+/// over a multi-year install - stats is deliberately sharded on the wire
+/// precisely because one envelope cannot hold it, while the local ledger keeps
+/// every event). Local stores therefore get their own, much larger ceiling.
+/// The wire cap is unchanged and still enforced where it belongs: on remote
+/// payloads, in `drive::MAX_DOMAIN_BYTES` and the envelope decoder.
+pub(crate) const MAX_LOCAL_STORE_JSON_LEN: u64 = 64 * 1024 * 1024;
+
 /// Read a JSON store file, distinguishing missing / parseable / corrupt /
 /// unreadable. Size is bounded before reading so a pathological file cannot
 /// OOM the process; oversized files are treated as corrupt (bytes preserved).
@@ -59,15 +73,14 @@ where
     if !path.exists() {
         return Ok(None);
     }
-    const MAX_STORE_JSON_LEN: u64 = 8_000_000;
     let meta = std::fs::metadata(path).map_err(ReadError::Io)?;
-    if meta.len() > MAX_STORE_JSON_LEN {
+    if meta.len() > MAX_LOCAL_STORE_JSON_LEN {
         let backup = backup_corrupt_file(path).ok();
         return Err(ReadError::Parse {
             detail: format!(
                 "store file too large ({} bytes, cap {}); treated as corrupt",
                 meta.len(),
-                MAX_STORE_JSON_LEN
+                MAX_LOCAL_STORE_JSON_LEN
             ),
             backup,
         });
@@ -283,5 +296,42 @@ mod tests {
             !path.with_extension("json.corrupt.json").exists(),
             "failed backup must not create phantom files"
         );
+    }
+
+    /// Audit #6a: the 8 MiB WIRE cap must never be applied to a local store.
+    /// A valid store larger than one remote envelope (a long-lived stats
+    /// ledger, a large dictionary) used to be declared corrupt, and its bytes
+    /// were rotated aside - real user data, quarantined for no reason.
+    #[test]
+    fn a_valid_local_store_larger_than_the_wire_cap_is_not_corrupt() {
+        let wire_cap = crate::sync::drive::MAX_DOMAIN_BYTES as u64;
+        assert!(
+            MAX_LOCAL_STORE_JSON_LEN > wire_cap,
+            "the local cap must be its own, larger bound than the wire cap"
+        );
+        let path = scratch_path("large.json");
+        // Comfortably over the wire cap, far under the local cap.
+        let filler = "x".repeat((wire_cap as usize) + 1_048_576);
+        let bytes = format!(r#"{{"name":"{filler}","count":7}}"#);
+        assert!(
+            bytes.len() as u64 > wire_cap,
+            "precondition: the fixture is over the wire cap"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let out: Result<Option<Probe>, ReadError> = read_json_file(&path);
+        match out {
+            Ok(Some(probe)) => {
+                assert_eq!(probe.count, 7);
+                assert_eq!(probe.name.len(), filler.len());
+            }
+            other => panic!("a valid oversized local store must parse, got: {other:?}"),
+        }
+        assert!(
+            !path.with_extension("json.corrupt.json").exists(),
+            "an oversized-but-valid store must never be quarantined as corrupt"
+        );
+        assert!(path.exists(), "the original file must be left in place");
+        let _ = std::fs::remove_file(&path);
     }
 }

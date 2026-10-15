@@ -387,7 +387,11 @@ pub fn save_settings(settings: &AppSettings) -> Result<()> {
     };
     let write_result = (|| -> Result<()> {
         fs::write(&tmp_path, &data)?;
-        if let Ok(f) = fs::File::open(&tmp_path) {
+        // Flush via a WRITE handle. `fs::File::open` is O_RDONLY and on Windows
+        // `sync_all` -> `FlushFileBuffers` needs `GENERIC_WRITE`, so the old
+        // `File::open(..) { let _ = f.sync_all(); }` performed no flush while
+        // claiming to. Best effort, non-fatal: this can only add durability.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
             let _ = f.sync_all();
         }
         fs::rename(&tmp_path, &path)?;
@@ -403,7 +407,21 @@ pub fn save_settings(settings: &AppSettings) -> Result<()> {
 // Tauri commands
 #[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
-    load_settings().map_err(|e| e.to_string())
+    let mut settings = load_settings().map_err(|e| e.to_string())?;
+    // `get_settings` is deliberately UNGATED — the wizard and overlay need it —
+    // so it must not be a wider path to the signed-in Google email than the
+    // `main`-only `sync-status` emit it was supposed to be narrower than. The
+    // S2 remediation scoped `account_key` to the main window precisely because
+    // the raw email is PII; returning it here re-opened exactly that exposure to
+    // any script that reached the overlay or wizard webview.
+    //
+    // Nothing in the frontend reads `sync_account_key` from this command — the
+    // Sync page gets it from `sync_get_status`, which is main-only. `sync_enabled`
+    // IS read (`settings.js` binds it to a checkbox) and is only a boolean, so
+    // it stays. Internal callers use `load_settings()` directly and are
+    // unaffected by this redaction.
+    settings.sync_account_key = None;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -416,7 +434,29 @@ pub fn update_settings(
         &window,
         &[crate::acl::MAIN_WINDOW, crate::acl::WIZARD_WINDOW],
     )?;
-    let old_account = load_settings().ok().and_then(|s| s.sync_account_key);
+    let current = load_settings().ok();
+    let old_account = current.as_ref().and_then(|s| s.sync_account_key.clone());
+    // This command receives the frontend's FULL `AppSettings`, which is
+    // routinely a STALE copy — the UI does not refresh after `sync_toggle` or a
+    // sign-in. Persisting `sync_enabled` / `sync_account_key` straight from it
+    // therefore REVERTS them: toggle sync off, then change any unrelated
+    // setting, and the debounced flush writes `sync_enabled: true` back a few
+    // hundred ms later. The running scheduler is never told, so nothing looks
+    // wrong until a RESTART, at which point automatic sync resumes against an
+    // explicit user opt-out. The same path re-adopts a stale account key after
+    // sign-out, so the Sync page offers to "reconnect" as an account the user
+    // already left.
+    //
+    // Both fields are owned by dedicated commands (`sync_toggle`,
+    // `sync_sign_in`, `sync_sign_out`, and the scheduler's own reconcile), which
+    // write settings directly and are unaffected. A general settings flush must
+    // not touch them. If the current file cannot be read we fall through to the
+    // incoming object rather than blocking the user's write entirely.
+    let mut settings = settings;
+    if let Some(ref c) = current {
+        settings.sync_enabled = c.sync_enabled;
+        settings.sync_account_key = c.sync_account_key.clone();
+    }
     save_settings(&settings).map_err(|e| e.to_string())?;
     // Account switch via any path (frontend, file, scheduler) must drop
     // compiled caches that were keyed to the previous account - otherwise

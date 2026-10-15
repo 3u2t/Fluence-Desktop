@@ -257,12 +257,26 @@ where
                 continue;
             }
             if let Some(items) = decode(&bytes) {
+                let usable = !items.is_empty();
                 remote_items.extend(items);
-                valid_file_ids.push(meta.file_id.clone());
-                if remote_version.is_none() {
-                    remote_version = meta.version.clone();
+                // FENCE (#7): per-record isolation means an envelope whose
+                // every record is structurally malformed now decodes to an
+                // EMPTY list instead of `None`. That is still a readable file,
+                // so it is never repaired over — but it must NOT be recorded
+                // as a VALID duplicate. We cannot tell "the user emptied this
+                // file" apart from "every record in it was garbage this client
+                // could not parse", and consolidation deletes valid duplicates.
+                // Registering it would let a pass DELETE a file whose real
+                // contents we simply failed to read. Readable-but-empty files
+                // therefore contribute records, but are never a write target
+                // and never shed.
+                if usable {
+                    valid_file_ids.push(meta.file_id.clone());
+                    if remote_version.is_none() {
+                        remote_version = meta.version.clone();
+                    }
+                    valid_found = true;
                 }
-                valid_found = true;
             } else if crate::sync::domain::is_future_envelope(&bytes) {
                 // A newer client owns this file. It is NOT corrupt and must
                 // never be repaired over; leave it completely untouched.
@@ -325,8 +339,25 @@ where
                 degraded: false,
             });
         }
-        let needs_push =
-            state_differs || store.has_dirty(account_hash) || (!valid_found && !merged.is_empty());
+        let needs_push = state_differs
+            || store.has_dirty(account_hash)
+            || (!valid_found && !merged.is_empty())
+            // Duplicate valid files must force the PUT, not merely skip the pass.
+            // The consolidation that actually deletes them lives INSIDE the
+            // `Ok(..)` arm of the write below, so a pass that short-circuits at
+            // `!needs_push` never reaches it. With two readable same-name files
+            // holding disjoint records, `remote_items` is their union, so
+            // `state_differs` is false and neither other term fires — the
+            // duplicates were re-listed and re-downloaded every cadence, forever,
+            // never merged onto one file. Android forces the same write through
+            // `|| fetch.hasDuplicateValidFiles`; this is its missing twin.
+            //
+            // Known cost: if `delete_domain_file` keeps failing (permissions, a
+            // transient Drive error), every later pass now performs a full PUT
+            // plus a doomed delete where it previously did two idle reads. It is
+            // bounded per pass by `MAX_ATTEMPTS` and still strictly better than
+            // never consolidating at all.
+            || valid_file_ids.len() > 1;
 
         if !needs_push {
             if outcome.changed {
@@ -354,13 +385,29 @@ where
 
         // 5. Never upload state we cannot re-parse (roundtrip validation).
         let bytes = encode(&merged);
+        // SIZE check first, and separately. `decode` rejects anything over
+        // MAX_DOMAIN_BYTES by returning `None`, so an oversized-but-otherwise-
+        // valid merged set failed this gate and reported a factually wrong
+        // message ("failed roundtrip validation") — and, worse, as `Fatal`,
+        // which LATCHES scheduling until the user manually re-arms sync. A
+        // dictionary that simply grew past 8 MiB is a size condition, not a
+        // code bug, and it should degrade rather than stop sync dead. Android's
+        // twin already reports this accurately as `Rejected`.
+        if bytes.len() > crate::sync::drive::MAX_DOMAIN_BYTES {
+            return Err(SyncError::Rejected(format!(
+                "{name}: merged state serializes to {} bytes, over the {} byte cap; \
+                 upload refused and remote left intact",
+                bytes.len(),
+                crate::sync::drive::MAX_DOMAIN_BYTES
+            )));
+        }
         if decode(&bytes) != Some(merged.clone()) {
             return Err(SyncError::Fatal(format!(
                 // F5 actionability: this fires only on bytes WE encoded (remote
                 // content never reaches it — undecodable remotes are skipped,
-                // oversized ones Rejected). Local data is intact and nothing
-                // was uploaded; the remedy is a code fix (app update), not a
-                // retry — hence Fatal rather than a retry loop.
+                // oversized ones Rejected above). Local data is intact and
+                // nothing was uploaded; the remedy is a code fix (app update),
+                // not a retry — hence Fatal rather than a retry loop.
                 "{name}: serialized envelope failed roundtrip validation; upload refused, local data intact"
             )));
         }
@@ -441,6 +488,35 @@ where
     )))
 }
 
+// ── Canonical write order (frozen README) ───────────────────────────────────
+//
+// `to_bytes` does NOT sort — the deterministic sort is the caller's
+// obligation, and these are the production sorters used before every write.
+// They are named functions (not inline closures) so the write-side ordering
+// tests can exercise the real comparator instead of a copy of it (audit #21).
+
+/// dict/snippet: businessKey, then syncId.
+pub(crate) fn sort_dictionary_items(items: &mut [DictionaryItem]) {
+    items.sort_by(|a, b| {
+        a.business_key()
+            .cmp(&b.business_key())
+            .then_with(|| a.sync_id.cmp(&b.sync_id))
+    });
+}
+
+pub(crate) fn sort_snippet_items(items: &mut [SnippetItem]) {
+    items.sort_by(|a, b| {
+        a.business_key()
+            .cmp(&b.business_key())
+            .then_with(|| a.sync_id.cmp(&b.sync_id))
+    });
+}
+
+/// settings: key.
+pub(crate) fn sort_settings_items(items: &mut [SettingsItem]) {
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+}
+
 // ── Thin per-domain wrappers ────────────────────────────────────────────────
 
 pub fn sync_dictionary_domain(
@@ -465,13 +541,7 @@ pub fn sync_dictionary_domain(
             .to_bytes()
         },
         |bytes| DictionaryEnvelope::from_bytes(bytes).map(|e| e.entries),
-        |items| {
-            items.sort_by(|a, b| {
-                a.business_key()
-                    .cmp(&b.business_key())
-                    .then_with(|| a.sync_id.cmp(&b.sync_id))
-            })
-        },
+        sort_dictionary_items,
         |i| i.updated_at,
     )
 }
@@ -498,13 +568,7 @@ pub fn sync_snippet_domain(
             .to_bytes()
         },
         |bytes| SnippetEnvelope::from_bytes(bytes).map(|e| e.entries),
-        |items| {
-            items.sort_by(|a, b| {
-                a.business_key()
-                    .cmp(&b.business_key())
-                    .then_with(|| a.sync_id.cmp(&b.sync_id))
-            })
-        },
+        sort_snippet_items,
         |i| i.updated_at,
     )
 }
@@ -531,7 +595,7 @@ pub fn sync_settings_domain(
             .to_bytes()
         },
         |bytes| SettingsEnvelope::from_bytes(bytes).map(|e| e.entries),
-        |items| items.sort_by(|a, b| a.key.cmp(&b.key)),
+        sort_settings_items,
         |i| i.updated_at,
     )
 }
@@ -707,10 +771,24 @@ fn sync_stats_sharded(
                 }
                 match StatsEnvelope::from_bytes(&bytes) {
                     Some(env) => {
+                        // FENCE (#7), same rule as `sync_domain`: per-record
+                        // isolation means a shard whose every record is
+                        // malformed decodes to an EMPTY envelope rather than
+                        // `None`. It must not be registered as a valid
+                        // duplicate — consolidation deletes valid duplicates,
+                        // and we cannot tell an intentionally-empty shard from
+                        // one we simply failed to parse. It is not a write
+                        // target either, so the CAS-protected repair path below
+                        // is the only thing that may ever overwrite it.
+                        let usable = !env.entries.is_empty();
                         valid_entries.extend(env.entries);
-                        valid_ids.push(meta.file_id.clone());
-                        if preferred.is_none() {
-                            preferred = Some((*meta).clone());
+                        if usable {
+                            valid_ids.push(meta.file_id.clone());
+                            if preferred.is_none() {
+                                preferred = Some((*meta).clone());
+                            }
+                        } else if repair_target.is_none() {
+                            repair_target = Some((*meta).clone());
                         }
                     }
                     None if crate::sync::domain::is_future_envelope(&bytes) => {
@@ -1152,6 +1230,7 @@ mod tests {
     use crate::sync::drive::{DomainFileMeta, MAX_DOMAIN_BYTES};
     use crate::sync::error::SyncError;
     use crate::sync::metadata::SyncMetadata;
+    use crate::sync::stats_shards as shards;
 
     struct FakeDrive {
         files: Vec<DomainFileMeta>,
@@ -1175,6 +1254,10 @@ mod tests {
         /// Test-only: make every partitioned upload fail, to exercise the path
         /// where the pass aborts and must therefore leave local state alone.
         partition_put_error: Option<SyncError>,
+        /// Test-only: payload of the last V1 upload, so a test can assert WHAT
+        /// was written — the destructive half of audit #7 is a push whose
+        /// payload silently omits records the remote still had.
+        last_put: Option<Vec<u8>>,
     }
 
     impl FakeDrive {
@@ -1190,6 +1273,7 @@ mod tests {
                 canned_email: Some("test@example.com".to_string()),
                 on_partitioned_put: None,
                 partition_put_error: None,
+                last_put: None,
             }
         }
         fn with_file(mut self, name: &str, file_id: &str, version: &str, bytes: Vec<u8>) -> Self {
@@ -1226,6 +1310,7 @@ mod tests {
             preferred_file_id: Option<&str>,
         ) -> Result<String, SyncError> {
             self.put_count += 1;
+            self.last_put = Some(_content.to_vec());
             let new_version = format!("v{}", self.put_count + 10);
             let file_id = preferred_file_id
                 .map(|id| id.to_string())
@@ -2023,6 +2108,303 @@ mod tests {
         }
     }
 
+    // ── #21 write-side deterministic ordering ─────────────────────────────
+    //
+    // `to_bytes` deliberately does NOT sort: the deterministic order is the
+    // caller's obligation, and these tests pin the four production sorters to
+    // a byte-exact canonical encoding. A shuffled input must produce the same
+    // bytes as a canonically ordered one, otherwise two devices holding the
+    // same winner set emit different files and CAS ping-pongs forever.
+    //
+    // The expected strings below are written out by hand, not produced by the
+    // code under test — a test that rebuilt the expectation from the sorter
+    // would pass no matter what the sorter did.
+
+    fn dict_wire(sync_id: &str, spoken: &str, corrected: &str, ts: i64, device: &str) -> DictionaryItem {
+        DictionaryItem {
+            sync_id: sync_id.to_string(),
+            spoken: spoken.to_string(),
+            corrected: corrected.to_string(),
+            kind: "correction".to_string(),
+            is_enabled: true,
+            deleted_at: None,
+            updated_at: ts,
+            device_id: device.to_string(),
+        }
+    }
+
+    fn snippet_wire(
+        sync_id: &str,
+        trigger: &str,
+        expansion: &str,
+        ts: i64,
+        device: &str,
+    ) -> SnippetItem {
+        SnippetItem {
+            sync_id: sync_id.to_string(),
+            trigger: trigger.to_string(),
+            expansion: expansion.to_string(),
+            is_enabled: true,
+            deleted_at: None,
+            updated_at: ts,
+            device_id: device.to_string(),
+        }
+    }
+
+    fn setting_wire(key: &str, value: &str, ts: i64, device: &str) -> SettingsItem {
+        SettingsItem {
+            key: key.to_string(),
+            value: value.to_string(),
+            updated_at: ts,
+            device_id: device.to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// Deliberately reverse-canonical input: `beta` before both `alpha`s, and
+    /// the two `alpha`s in DESCENDING syncId order so the secondary key is
+    /// load-bearing (businessKey alone cannot order them).
+    #[test]
+    fn write_side_dictionary_sort_is_deterministic_for_shuffled_input() {
+        let shuffled = vec![
+            dict_wire("22222222-2222-4222-8222-222222222222", " Beta ", "B", 3, "dev-b"),
+            dict_wire("33333333-3333-4333-8333-333333333333", "  Alpha", "C", 2, "dev-c"),
+            dict_wire("11111111-1111-4111-8111-111111111111", "alpha", "A", 1, "dev-a"),
+        ];
+        let mut items = shuffled;
+        sort_dictionary_items(&mut items);
+        let bytes = DictionaryEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                r#"{"v":1,"entries":["#,
+                r#"{"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"alpha","spoken":"alpha","corrected":"A","isEnabled":true,"updatedAt":1,"deletedAt":null,"deviceId":"dev-a"},"#,
+                r#"{"syncId":"33333333-3333-4333-8333-333333333333","businessKey":"alpha","spoken":"  Alpha","corrected":"C","isEnabled":true,"updatedAt":2,"deletedAt":null,"deviceId":"dev-c"},"#,
+                r#"{"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"beta","spoken":" Beta ","corrected":"B","isEnabled":true,"updatedAt":3,"deletedAt":null,"deviceId":"dev-b"}"#,
+                "]}",
+                "\n",
+            ),
+            "dict writes must be ordered by (businessKey, syncId), whatever the input order"
+        );
+    }
+
+    /// Same contract for snippets; the input is shuffled AND the two records
+    /// that tie on businessKey are given descending syncIds.
+    #[test]
+    fn write_side_snippet_sort_is_deterministic_for_shuffled_input() {
+        let shuffled = vec![
+            snippet_wire("33333333-3333-4333-8333-333333333333", " Beta ", "C", 3, "dev-c"),
+            snippet_wire("11111111-1111-4111-8111-111111111111", "alpha", "A", 1, "dev-a"),
+            snippet_wire("22222222-2222-4222-8222-222222222222", "  Alpha", "B", 2, "dev-b"),
+        ];
+        let mut items = shuffled;
+        sort_snippet_items(&mut items);
+        let bytes = SnippetEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                r#"{"v":1,"entries":["#,
+                r#"{"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"alpha","trigger":"alpha","expansion":"A","isEnabled":true,"updatedAt":1,"deletedAt":null,"deviceId":"dev-a"},"#,
+                r#"{"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"alpha","trigger":"  Alpha","expansion":"B","isEnabled":true,"updatedAt":2,"deletedAt":null,"deviceId":"dev-b"},"#,
+                r#"{"syncId":"33333333-3333-4333-8333-333333333333","businessKey":"beta","trigger":" Beta ","expansion":"C","isEnabled":true,"updatedAt":3,"deletedAt":null,"deviceId":"dev-c"}"#,
+                "]}",
+                "\n",
+            ),
+            "snippet writes must be ordered by (businessKey, syncId)"
+        );
+    }
+
+    /// #13 wire half: `deletedAt` is OMITTED when absent, which is exactly what
+    /// keeps the four canonical fixtures byte-identical now that the field
+    /// exists, and only appears when a tombstone is really carried.
+    #[test]
+    fn write_side_settings_sort_is_deterministic_and_omits_absent_tombstone() {
+        let shuffled = vec![
+            setting_wire("snippets_enabled", "false", 3, "dev-c"),
+            setting_wire("ai_polish_style", "default", 2, "dev-b"),
+            setting_wire("language", "en", 1, "dev-a"),
+        ];
+        let mut items = shuffled;
+        sort_settings_items(&mut items);
+        let bytes = SettingsEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                r#"{"v":1,"entries":["#,
+                r#"{"key":"ai_polish_style","value":"default","updatedAt":2,"deviceId":"dev-b"},"#,
+                r#"{"key":"language","value":"en","updatedAt":1,"deviceId":"dev-a"},"#,
+                r#"{"key":"snippets_enabled","value":"false","updatedAt":3,"deviceId":"dev-c"}"#,
+                "]}",
+                "\n",
+            ),
+            "settings writes must be key-sorted and must NOT gain a \"deletedAt\":null"
+        );
+
+        // And a real tombstone IS emitted, so the retraction reaches Drive.
+        let mut with_tomb = vec![setting_wire("language", "en", 1, "dev-a")];
+        with_tomb[0].deleted_at = Some(9);
+        sort_settings_items(&mut with_tomb);
+        assert_eq!(
+            String::from_utf8(SettingsEnvelope { v: ENVELOPE_V1, entries: with_tomb }.to_bytes())
+                .unwrap(),
+            concat!(
+                r#"{"v":1,"entries":["#,
+                r#"{"key":"language","value":"en","updatedAt":1,"deviceId":"dev-a","deletedAt":9}"#,
+                "]}",
+                "\n",
+            ),
+            "a carried tombstone must appear on the wire, after deviceId"
+        );
+    }
+
+    /// #21 stats: the production stats writer orders by (day, eventId). The
+    /// input puts two events on the SAME day in descending eventId order, so
+    /// `day` alone is not enough and the secondary key is pinned too.
+    #[test]
+    fn write_side_stats_sort_is_deterministic_for_shuffled_input() {
+        let mk = |event_id: &str, day: &str, ts: i64| StatsItem {
+            event_id: event_id.to_string(),
+            day: day.to_string(),
+            timestamp_ms: ts,
+            words: Some(2),
+            chars: Some(4),
+            duration_ms: Some(6),
+            updated_at: None,
+            device_id: None,
+        };
+        let shuffled = vec![
+            mk("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "2026-02-01", 20),
+            mk("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "2026-01-02", 30),
+            mk("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "2026-01-02", 10),
+        ];
+        let mut items = shuffled;
+        shards::sort_stats_records(&mut items);
+        let bytes = StatsEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                r#"{"v":1,"entries":["#,
+                r#"{"eventId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","day":"2026-01-02","timestampMs":10,"words":2,"chars":4,"durationMs":6},"#,
+                r#"{"eventId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","day":"2026-01-02","timestampMs":30,"words":2,"chars":4,"durationMs":6},"#,
+                r#"{"eventId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","day":"2026-02-01","timestampMs":20,"words":2,"chars":4,"durationMs":6}"#,
+                "]}",
+                "\n",
+            ),
+            "stats writes must be ordered by (day, eventId)"
+        );
+    }
+
+    // ── #7 fencing on the consolidation path ───────────────────────────────
+    //
+    // The duplicate-consolidation loop deletes only ids that were decoded
+    // successfully. These tests drive the path where a push actually HAPPENS
+    // (so consolidation runs) alongside a sibling that must survive it —
+    // the case the existing "no put happened" tests cannot reach.
+
+    #[test]
+    fn a_push_never_deletes_a_corrupt_sibling_while_consolidating() {
+        let valid = DictionaryEnvelope {
+            v: ENVELOPE_V1,
+            entries: vec![dict_item("remoteonly", 100)],
+        }
+        .to_bytes();
+        let corrupt = b"{ not json".to_vec();
+        // id-1 sorts BEFORE id-2, so id-1 becomes the write target and
+        // consolidation walks id-2 looking for duplicates to shed.
+        let mut drive = FakeDrive::new()
+            .with_file("dictionary.json", "id-1", "1", valid.clone())
+            .with_file("dictionary.json", "id-2", "2", corrupt.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("localonly", 100)]);
+        store.has_dirty = false;
+
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(drive.put_count, 1, "the local-only row forces a push");
+        assert_eq!(
+            drive.delete_count, 0,
+            "consolidation must only ever delete VALID duplicates"
+        );
+        assert_eq!(
+            drive.contents.get("id-2"),
+            Some(&corrupt),
+            "the corrupt sibling may hold data we cannot read; it stays byte-for-byte"
+        );
+        let written = String::from_utf8(drive.last_put.clone().unwrap()).unwrap();
+        assert!(written.contains("remoteonly"), "{written}");
+        assert!(written.contains("localonly"), "{written}");
+    }
+
+    #[test]
+    fn a_push_never_deletes_a_future_sibling_while_consolidating() {
+        let valid = DictionaryEnvelope {
+            v: ENVELOPE_V1,
+            entries: vec![dict_item("remoteonly", 100)],
+        }
+        .to_bytes();
+        let future = br#"{"v":2,"entries":[{"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"newer","spoken":"newer","corrected":"newer","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"newer-device"}]}"#.to_vec();
+        let mut drive = FakeDrive::new()
+            .with_file("dictionary.json", "id-1", "1", valid.clone())
+            .with_file("dictionary.json", "id-2", "2", future.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("localonly", 100)]);
+        store.has_dirty = false;
+
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(drive.put_count, 1, "the local-only row forces a push");
+        assert_eq!(
+            drive.delete_count, 0,
+            "a future envelope is owned by a newer client, never shed as a duplicate"
+        );
+        assert_eq!(
+            drive.contents.get("id-2"),
+            Some(&future),
+            "the newer client's record must be intact"
+        );
+    }
+
+    /// A file whose records are ALL structurally malformed decodes to an empty
+    /// (but readable) envelope. It must NOT be mistaken for a valid sibling
+    /// whose contents are part of the merged payload: with non-empty local
+    /// state the pass repairs the target, and if that target happened to be
+    /// the all-malformed file the repair is a genuine overwrite. What must
+    /// never happen is that a VALID sibling is shed while the malformed one
+    /// survives as the new target — that would lose the valid file's records.
+    #[test]
+    fn an_all_malformed_sibling_is_repaired_and_the_valid_sibling_survives() {
+        let valid = DictionaryEnvelope {
+            v: ENVELOPE_V1,
+            entries: vec![dict_item("remoteonly", 100)],
+        }
+        .to_bytes();
+        let all_bad = br#"{"v":1,"entries":[{"syncId":"22222222-2222-4222-8222-222222222222","spoken":"broken","corrected":"missing isEnabled","updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"}]}"#.to_vec();
+        let mut drive = FakeDrive::new()
+            .with_file("dictionary.json", "id-1", "1", valid.clone())
+            .with_file("dictionary.json", "id-2", "2", all_bad.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("localonly", 100)]);
+        store.has_dirty = false;
+
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "{res:?}");
+        let written = String::from_utf8(drive.last_put.clone().unwrap()).unwrap();
+        assert!(written.contains("remoteonly"), "{written}");
+        assert!(written.contains("localonly"), "{written}");
+        assert_eq!(
+            drive.delete_count, 0,
+            "the valid sibling was the write target; nothing needed shedding"
+        );
+        assert_eq!(
+            store
+                .items
+                .iter()
+                .map(|i| i.spoken.as_str())
+                .collect::<Vec<_>>(),
+            vec!["localonly", "remoteonly"]
+        );
+    }
+
     #[test]
     fn oversized_remote_is_not_auto_replaced_keep_remote_intact() {
         // UNIT C - oversized (abuse) must not be auto-replaced via !valid_found fallback
@@ -2265,6 +2647,181 @@ mod tests {
         assert_eq!(
             drive.put_count, 0,
             "a populated v2 remote must never be overwritten by a v1 client"
+        );
+    }
+
+    /// #7 headline regression: a file whose ENVELOPE is fine but which contains
+    /// one structurally-malformed record must be read as "valid, minus the bad
+    /// record" — not as corrupt. Reading it as corrupt made `sync_domain` see
+    /// `!valid_found` with non-empty local state and PUT a replacement over the
+    /// Drive file, destroying every record the file actually held.
+    ///
+    /// The pushed payload is the proof: it must carry the remote's good record
+    /// AND the local-only row, and must NOT carry the malformed ones.
+    #[test]
+    fn a_malformed_record_no_longer_costs_the_whole_remote_file() {
+        let remote = br#"{"v":1,"entries":[
+            {"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"remoteonly","spoken":"remoteonly","corrected":"kept","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-a"},
+            {"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"broken","spoken":"broken","corrected":"missing isEnabled","updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"},
+            {"syncId":"33333333-3333-4333-8333-333333333333","businessKey":"wrongtype","spoken":"wrongtype","corrected":"updatedAt is a string","isEnabled":true,"updatedAt":"1713471000123","deletedAt":null,"deviceId":"device-b"}
+        ]}"#.to_vec();
+        let mut drive = FakeDrive::new().with_file("dictionary.json", "id-1", "1", remote.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("localonly", 100)]);
+        store.has_dirty = false;
+
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "a partly-bad file is not an error: {res:?}");
+        assert_eq!(drive.put_count, 1, "the local-only row still needs pushing");
+        let written = String::from_utf8(drive.last_put.clone().expect("a payload was pushed"))
+            .expect("utf8 payload");
+        assert!(
+            written.contains("remoteonly"),
+            "the remote's good record must survive the repair — payload: {written}"
+        );
+        assert!(
+            written.contains("localonly"),
+            "the local-only row must be pushed: {written}"
+        );
+        assert!(
+            !written.contains("\"broken\"") && !written.contains("wrongtype"),
+            "malformed records are dropped, never resurrected: {written}"
+        );
+        // And the record really came back into local state.
+        assert_eq!(
+            store
+                .items
+                .iter()
+                .map(|i| i.spoken.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["localonly", "remoteonly"].into_iter().collect(),
+        );
+    }
+
+    /// The boundary the audit calls out explicitly: a file that is malformed at
+    /// the ENVELOPE level (unparseable JSON) still has no recoverable content,
+    /// so the existing repair-by-push behaviour is correct and unchanged —
+    /// `corrupt_within_size_is_repaired_via_push` pins it. What must NEVER
+    /// happen is that envelope level being inferred from a record level fault.
+    #[test]
+    fn envelope_corruption_is_still_repaired_but_record_faults_are_not() {
+        let corrupt = b"{ not json".to_vec();
+        let mut drive = FakeDrive::new().with_file("dictionary.json", "id-1", "1", corrupt);
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("localonly", 100)]);
+        store.has_dirty = false;
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "unparseable JSON is repaired, not rejected");
+        assert_eq!(drive.put_count, 1);
+        let written = String::from_utf8(drive.last_put.clone().unwrap()).unwrap();
+        assert!(written.contains("localonly"));
+    }
+
+    /// Valid + corrupt SIBLING files coexisting: the valid file's records are
+    /// merged in, the corrupt sibling is neither trusted nor deleted, and no
+    /// write is issued when the merged set already equals the valid remote.
+    #[test]
+    fn a_corrupt_sibling_never_discards_the_valid_files_records() {
+        let valid = DictionaryEnvelope {
+            v: ENVELOPE_V1,
+            entries: vec![
+                DictionaryItem {
+                    sync_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                    spoken: "alpha".to_string(),
+                    corrected: "A".to_string(),
+                    kind: "correction".to_string(),
+                    is_enabled: true,
+                    deleted_at: None,
+                    updated_at: 100,
+                    device_id: "device-a".to_string(),
+                },
+                DictionaryItem {
+                    sync_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                    spoken: "beta".to_string(),
+                    corrected: "B".to_string(),
+                    kind: "correction".to_string(),
+                    is_enabled: true,
+                    deleted_at: None,
+                    updated_at: 100,
+                    device_id: "device-a".to_string(),
+                },
+            ],
+        }
+        .to_bytes();
+        let corrupt = b"{ not json".to_vec();
+        let mut drive = FakeDrive::new()
+            .with_file("dictionary.json", "id-a", "1", valid.clone())
+            .with_file("dictionary.json", "id-b", "2", corrupt.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::<DictionaryItem>::new(Vec::new());
+        store.has_dirty = false;
+
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(
+            drive.put_count, 0,
+            "merged == valid remote, so nothing is written"
+        );
+        assert_eq!(
+            drive.delete_count, 0,
+            "a corrupt sibling must never be deleted — it may hold data we cannot read"
+        );
+        assert_eq!(
+            drive.contents.get("id-b"),
+            Some(&corrupt),
+            "the corrupt sibling is left byte-for-byte intact"
+        );
+        assert_eq!(
+            store
+                .items
+                .iter()
+                .map(|i| i.spoken.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"],
+            "both valid sibling records survive"
+        );
+    }
+
+    /// A file whose every record is malformed still has a readable envelope:
+    /// with empty local state there is nothing to heal, so it must be left
+    /// exactly as-is rather than replaced with an empty envelope.
+    #[test]
+    fn an_all_malformed_file_is_left_untouched_when_local_is_empty() {
+        let all_bad = br#"{"v":1,"entries":[
+            {"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"broken","spoken":"broken","corrected":"missing isEnabled","updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"}
+        ]}"#.to_vec();
+        let mut drive =
+            FakeDrive::new().with_file("dictionary.json", "id-1", "1", all_bad.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::<DictionaryItem>::new(Vec::new());
+        store.has_dirty = false;
+        let res = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(drive.put_count, 0, "nothing to heal means no write");
+        assert_eq!(
+            drive.contents.get("id-1"),
+            Some(&all_bad),
+            "the remote must not be rewritten"
+        );
+    }
+
+    /// The saturation guard in `declared_envelope_version` is a fencing guard:
+    /// `v = 2^32+1` truncated to 1 under `as i32`, which read as "v1 corrupt" —
+    /// a state `sync_domain` is allowed to overwrite. It must be fenced like
+    /// any other future envelope.
+    #[test]
+    fn a_far_future_envelope_version_is_never_overwritten() {
+        let future = br#"{"v":4294967297,"entries":[{"syncId":"11111111-1111-4111-8111-111111111111","businessKey":"newer","spoken":"newer","corrected":"newer","isEnabled":true,"updatedAt":1713471000123,"deletedAt":null,"deviceId":"newer-device"}]}"#.to_vec();
+        let mut drive = FakeDrive::new().with_file("dictionary.json", "id-1", "1", future.clone());
+        let mut meta = SyncMetadata::default();
+        let mut store = MemStore::new(vec![dict_item("hello", 100)]);
+        store.has_dirty = true;
+        let _ = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
+        assert_eq!(drive.put_count, 0, "a 2^32+1 envelope is future, not corrupt");
+        assert_eq!(
+            drive.contents.get("id-1"),
+            Some(&future),
+            "the newer client's data must be intact"
         );
     }
 
@@ -3215,6 +3772,46 @@ mod sharded_stats_tests {
             drive.contents_of("stats-2026-08.json").unwrap(),
             b"{ corrupt".to_vec()
         );
+    }
+
+    /// #7 fence, stats side. Per-record isolation means a shard whose every
+    /// record is structurally malformed decodes to an EMPTY envelope rather
+    /// than `None`. Registering that as a valid duplicate would let the
+    /// consolidation step DELETE it — losing records this client simply could
+    /// not parse. The valid sibling must carry the data and the malformed one
+    /// must survive the push.
+    #[test]
+    fn an_all_malformed_stats_shard_sibling_is_never_shed_by_consolidation() {
+        let remote_event = stat(1, "2026-08-01", 10);
+        let valid = StatsEnvelope {
+            v: ENVELOPE_V1,
+            entries: vec![remote_event.clone()],
+        }
+        .to_bytes();
+        let all_bad = br#"{"v":1,"entries":[{"day":"2026-08-05","timestampMs":50}]}"#.to_vec();
+        let mut drive = ShardFakeDrive::new()
+            .with_shard_bytes("stats-2026-08.json", "id-a", valid.clone(), "vA")
+            .with_shard_bytes("stats-2026-08.json", "id-b", all_bad.clone(), "vB");
+        let local = stat(2, "2026-08-02", 20);
+        let mut store = TrackStore::new(vec![local], true);
+
+        let out = sync(&mut drive, &mut store).expect("sync must succeed");
+        assert!(out.pushed, "the local-only event forces an upload");
+        assert!(
+            drive.deletes.is_empty(),
+            "consolidation must never shed a readable-but-empty sibling: {:?}",
+            drive.deletes
+        );
+        assert_eq!(
+            drive.contents.get("id-b").cloned(),
+            Some(all_bad),
+            "the unreadable sibling stays byte-for-byte"
+        );
+        assert!(
+            drive.files.iter().any(|f| f.file_id == "id-b"),
+            "and is still listed, not consolidated away"
+        );
+        assert!(parsed_names(&store.items()).contains(&remote_event.event_id));
     }
 
     #[test]

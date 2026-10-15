@@ -113,13 +113,28 @@ pub fn save_store(store: &PromptsStore) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let data = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data).map_err(|e| e.to_string())?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // Unique tmp + real flush + rename — see `agents::save_store` for why the
+    // fixed `json.tmp` name and the O_RDONLY `File::open` flush were both wrong.
+    // This is a USER-DATA store (custom styles), so the rotate-aside path above
+    // exists precisely to protect it from a bad write.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let result = (|| -> Result<(), String> {
+        fs::write(&tmp_path, &data).map_err(|e| e.to_string())?;
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
-    Ok(())
+    result
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -298,6 +313,16 @@ pub fn resolve_custom_hint(style_id: &str) -> Option<String> {
 /// Create or update a style: account store when signed in, legacy when signed
 /// out. Writing legacy while signed in would create an immediately-unrunnable,
 /// never-synced record.
+///
+/// `None` means the style was NOT created or updated — either validation
+/// failed, or the account store rejected the write. The two are deliberately
+/// collapsed for the same reason as `agents::save_custom_agent_routed`: the
+/// signed-out branch below already maps a failed `save_store` to `None`, and the
+/// command layer turns `None` into one error the user sees rather than a phantom
+/// row. The account branch used to return the new style unconditionally, so an
+/// unwritable store (full volume, `%LOCALAPPDATA%` ACL, an indexer holding the
+/// file — routine on Windows) yielded a style the UI rendered and the user saw
+/// that was gone on the next launch.
 pub fn save_custom_style_routed(name: &str, hint: &str, id: Option<&str>) -> Option<CustomStyle> {
     let clean_name = sanitize_name(name);
     let clean_hint = sanitize_custom_prompt(hint);
@@ -310,7 +335,15 @@ pub fn save_custom_style_routed(name: &str, hint: &str, id: Option<&str>) -> Opt
     };
     match local_account_hash() {
         Some(hash) => {
-            crate::account_scope::upsert_account_style(&hash, &style_id, &clean_name, &clean_hint);
+            // Durability gate: no `Some(style)` unless the row reached the disk.
+            if !crate::account_scope::upsert_account_style(
+                &hash,
+                &style_id,
+                &clean_name,
+                &clean_hint,
+            ) {
+                return None;
+            }
             Some(CustomStyle {
                 id: style_id,
                 name: clean_name,
@@ -408,7 +441,20 @@ pub fn delete_custom_style_routed(id: &str) -> Result<Vec<String>, String> {
                 }
             }
             store.custom_styles.retain(|s| s.id != id);
-            let _ = save_store(&store);
+            // ...and the write is CHECKED. Reporting success here without confirming
+            // persistence made a signed-out delete claim to have worked while the
+            // row silently resurrected on the next launch (full volume,
+            // %LOCALAPPDATA% ACL, an indexer holding the file). The style is still
+            // live and still assigned on disk, so its `package_overrides` bindings
+            // remain valid: return the error rather than sending the user's apps
+            // back to Auto for a delete that did not happen. Mirrors the
+            // `existed && !persisted` arm above.
+            if let Err(e) = save_store(&store) {
+                log::error!("Failed to persist style deletion for {id}: {e}");
+                return Err(
+                    "Could not save the delete. Nothing was lost - please try again.".to_string(),
+                );
+            }
         }
     }
     Ok(affected)
@@ -1021,7 +1067,10 @@ mod admitted_projection {
     fn an_account_owned_style_is_projected_into_the_view() {
         let hash = qa_account("project");
         let id = "custom:qa-project-0001";
-        crate::account_scope::upsert_account_style(&hash, id, "Synced Style", "synced hint");
+        assert!(
+            crate::account_scope::upsert_account_style(&hash, id, "Synced Style", "synced hint"),
+            "precondition: the style must reach the account store"
+        );
         let store = PromptsStore::default();
         assert!(
             store.custom_styles.is_empty(),
@@ -1044,7 +1093,10 @@ mod admitted_projection {
     fn a_tombstoned_account_style_is_not_projected() {
         let hash = qa_account("tombstone");
         let id = "custom:qa-tombstone-0001";
-        crate::account_scope::upsert_account_style(&hash, id, "Doomed", "doomed hint");
+        assert!(
+            crate::account_scope::upsert_account_style(&hash, id, "Doomed", "doomed hint"),
+            "precondition: the style must reach the account store"
+        );
         crate::account_scope::delete_account_style(&hash, id);
 
         let view = build_prompts_view(PromptsStore::default(), Some(hash.as_str()));
@@ -1110,7 +1162,10 @@ mod admitted_projection {
         let hash = qa_account("durability-gate");
         let id = "custom:qa-durability-0001";
         let exe = "qa-durability-app.exe";
-        crate::account_scope::upsert_account_style(&hash, id, "Owned", "owned hint");
+        assert!(
+            crate::account_scope::upsert_account_style(&hash, id, "Owned", "owned hint"),
+            "precondition: the style must reach the account store"
+        );
 
         // Sign in so the routed delete takes the ACCOUNT branch.
         let mut settings = crate::settings::load_settings().unwrap_or_default();
@@ -1131,12 +1186,16 @@ mod admitted_projection {
         );
 
         // Make the account file unwritable so the tombstone cannot land.
+        //
+        // The BLOCKER is the read-only DESTINATION: `write_json` names its tmp
+        // per caller (`<store>.json.tmp.<pid>.<seq>`) and removes it itself on
+        // the failure path, so occupying a fixed tmp path would block nothing
+        // and this test would pass for the wrong reason.
         let path = crate::account_scope::account_path_for_test(
             &crate::account_scope::prompts_base_dir_for_test(),
             "styles",
             &hash,
         );
-        let tmp = path.with_extension("json.tmp");
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();
@@ -1147,7 +1206,6 @@ mod admitted_projection {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
-        let _ = std::fs::remove_file(&tmp);
 
         let overrides_after = load_store().package_overrides;
         let mut settings = crate::settings::load_settings().unwrap_or_default();
@@ -1162,6 +1220,105 @@ mod admitted_projection {
             overrides_after.get(exe).map(String::as_str),
             Some(id),
             "the style is still live, so its app bindings must survive a failed delete"
+        );
+    }
+
+    /// The style counterpart of the agent create-durability gate.
+    ///
+    /// `save_custom_style_routed` is what `save_prompt_style` hands to the
+    /// frontend. Its signed-in branch used to ignore the account-store result
+    /// and return the new style unconditionally, so a failed disk write
+    /// (unwritable `%LOCALAPPDATA%`, full volume, an indexer holding the file —
+    /// routine on Windows) produced a style the UI rendered and the user saw,
+    /// gone on the next launch with nothing logged. `save_prompt_style` already
+    /// turns `None` into an error, so `None` is what surfaces the failure.
+    ///
+    /// Guard: the whole test, because it writes `sync_account_key` and then
+    /// resolves the account branch through that same shared file.
+    #[test]
+    fn a_routed_style_create_whose_account_write_fails_returns_none() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let hash = qa_account("create-gate");
+
+        // Sign in so the routed create takes the ACCOUNT branch.
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        let previous_key = settings.sync_account_key.clone();
+        settings.sync_account_key = Some("qa-prompts-create-gate@runtime.test".to_string());
+        crate::settings::save_settings(&settings).unwrap();
+
+        // Healthy first, so the assertion below cannot pass vacuously.
+        let created = save_custom_style_routed("Durable", "hint text", None);
+        assert!(
+            created.is_some(),
+            "precondition: a writable store returns the created style"
+        );
+
+        // Block exactly this account's file with a directory, so the atomic
+        // rename cannot land. Cross-platform: a read-only *file* only blocks the
+        // rename on Windows.
+        let target = crate::account_scope::account_path_for_test(
+            &crate::account_scope::prompts_base_dir_for_test(),
+            "styles",
+            &hash,
+        );
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let result = save_custom_style_routed("Lost", "hint text", None);
+        let _ = std::fs::remove_dir_all(&target);
+
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.sync_account_key = previous_key;
+        let _ = crate::settings::save_settings(&settings);
+
+        assert!(
+            result.is_none(),
+            "a style create that never reached the disk must not be reported as saved: {:?}",
+            result.map(|s| s.name)
+        );
+        assert!(
+            !crate::account_scope::load_account_styles(&hash)
+                .custom_styles
+                .iter()
+                .any(|s| s.name == "Lost"),
+            "the blocked style must not have reached the account store"
+        );
+    }
+
+    /// A style RENAME is the same code path as a create and must fail the same
+    /// way, for the same silent-loss reason.
+    #[test]
+    fn a_routed_style_rename_whose_account_write_fails_returns_none() {
+        let _guard = crate::sync::stores::store_test_guard();
+        let hash = qa_account("rename-gate");
+
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        let previous_key = settings.sync_account_key.clone();
+        settings.sync_account_key = Some("qa-prompts-rename-gate@runtime.test".to_string());
+        crate::settings::save_settings(&settings).unwrap();
+
+        let created =
+            save_custom_style_routed("Editable", "first hint", None).expect("must create");
+        let target = crate::account_scope::account_path_for_test(
+            &crate::account_scope::prompts_base_dir_for_test(),
+            "styles",
+            &hash,
+        );
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).expect("must be able to block the target");
+
+        let result = save_custom_style_routed("Editable", "second hint", Some(&created.id));
+        let _ = std::fs::remove_dir_all(&target);
+
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.sync_account_key = previous_key;
+        let _ = crate::settings::save_settings(&settings);
+
+        assert!(
+            result.is_none(),
+            "a style rename that never reached the disk must not be reported as saved"
         );
     }
 }

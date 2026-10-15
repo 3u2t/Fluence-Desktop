@@ -133,15 +133,42 @@ pub(crate) fn save_store_internal(store: &SnippetStore) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(store)?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data)?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // The tmp name MUST be unique per caller. This used to be the fixed
+    // `path.with_extension("json.tmp")`, the exact bug `settings.rs:371-379`
+    // documents and `sync/stores.rs` + `account_scope.rs` already fixed: two
+    // concurrent writers both wrote the SAME tmp, then both renamed it, so the
+    // loser either renamed a tmp the winner had already consumed (os error 2) or
+    // renamed a partially-written tmp onto the destination — truncating a live
+    // store. Audit #22 fixed the two files it happened to touch and left these
+    // two. pid + monotonic sequence, in the destination's own directory so the
+    // rename stays same-volume atomic.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let write_result = (|| -> Result<()> {
+        fs::write(&tmp_path, &data)?;
+        // WRITE handle required: on Windows `sync_all` -> `FlushFileBuffers` needs
+        // `GENERIC_WRITE`, so the previous `File::open` (O_RDONLY) made this a no-op
+        // despite the durability intent. Best effort, non-fatal.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path)?;
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = f.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Never leave a stray tmp behind on the failure path. Its name is
+        // unpredictable, so nothing else can clean it up.
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path)?;
-    if let Ok(f) = fs::File::open(&path) {
-        let _ = f.sync_all();
-    }
+    write_result?;
     // Sync imports write through this function too. Drop the runtime cache so
     // the next transcription sees newly merged expansions immediately.
     invalidate_cache();

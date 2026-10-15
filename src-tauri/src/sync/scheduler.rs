@@ -50,6 +50,17 @@ pub const SYNC_DEBOUNCE_MS: u64 = 300;
 pub const SYNC_BACKOFF_BASE_MS: u64 = 1_000;
 pub const SYNC_BACKOFF_FACTOR: u32 = 2;
 pub const SYNC_BACKOFF_CAP_MS: u64 = 60_000;
+/// Longest automatic hold we will take from a `Retry-After` header. A quota
+/// reset is bounded by the day; anything past that is a malformed or hostile
+/// header and must not be able to park the automatic schedule indefinitely.
+/// The manual "Sync now" override is unaffected either way (see
+/// [`SchedulerCore::take_run`]).
+pub const SYNC_QUOTA_HOLD_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+/// How often the scheduler thread wakes while a quota hold is in force, so a
+/// queued command - "Sync now" above all - is drained promptly instead of
+/// after the whole hold. Each wake is a mutex lock and a clock read; the pass
+/// itself is still refused by [`SchedulerCore::take_run`].
+const SYNC_QUOTA_HOLD_POLL_MS: u64 = 60_000;
 /// Idle wake-up poll cap (disabled / signed out / fatal latch).
 const SYNC_IDLE_POLL_MS: u64 = 3_600_000;
 
@@ -154,6 +165,18 @@ pub struct SchedulerCore {
     /// response; consumed by the `Retryable` branch of [`SchedulerCore::finish`]
     /// so a rate-limited API is honored rather than retried too eagerly.
     pending_retry_after_ms: Option<u64>,
+    /// The UNCLAMPED (but bounded, see [`SYNC_QUOTA_HOLD_MAX_MS`]) part of a
+    /// `Retry-After` header that asks for longer than
+    /// [`SYNC_BACKOFF_CAP_MS`]. Consumed by the `Retryable` branch of
+    /// [`SchedulerCore::finish`], which turns it into
+    /// [`Self::quota_hold_until_ms`].
+    pending_quota_hold_ms: Option<u64>,
+    /// Absolute epoch millis until which AUTOMATIC passes are refused because
+    /// Drive asked for a longer wait than the backoff cap. Deliberately a
+    /// deadline rather than an interval: a manual "Sync now" sets
+    /// `pending_run`, which [`SchedulerCore::take_run`] honors before it ever
+    /// looks at this, so the user override survives a day-long hold.
+    pub quota_hold_until_ms: Option<i64>,
     pub debounce_until_ms: Option<i64>,
 }
 
@@ -178,6 +201,8 @@ impl SchedulerCore {
             backoff_active: false,
             retry_delay_ms: SYNC_BACKOFF_BASE_MS,
             pending_retry_after_ms: None,
+            pending_quota_hold_ms: None,
+            quota_hold_until_ms: None,
             debounce_until_ms: None,
         }
     }
@@ -192,8 +217,22 @@ impl SchedulerCore {
     /// arrives here as 3_600_000 ms) would park the whole scheduler - and
     /// therefore every command, including "Sync now" - for an hour. A capped
     /// hint is honored; an uncapped one is not.
+    ///
+    /// But `retry_delay_ms` is ALSO the automatic-run interval, and for a
+    /// `dailyLimitExceeded` the server asks for a day: honoring only the 60 s
+    /// cap meant re-polling every minute, forever, against a server that had
+    /// said "come back tomorrow". So a hint that exceeds the cap is recorded
+    /// TWICE - clamped for the interval (UI safety), and separately as a
+    /// quota hold (honoring the server). The hold gates automatic passes only:
+    /// `pending_run` is checked first in both [`SchedulerCore::wait_ms`] and
+    /// [`SchedulerCore::take_run`], so "Sync now" still starts a pass at once.
     pub fn note_retry_after(&mut self, ms: Option<u64>) {
         self.pending_retry_after_ms = ms.map(|ms| ms.min(SYNC_BACKOFF_CAP_MS));
+        self.pending_quota_hold_ms = ms.filter(|&ms| ms > SYNC_BACKOFF_CAP_MS).map(|ms| {
+            // A hint past a whole day is malformed or hostile; bound it so no
+            // single response can park the automatic schedule forever.
+            ms.min(SYNC_QUOTA_HOLD_MAX_MS)
+        });
     }
 
     pub fn apply(&mut self, cmd: &SyncCommand) {
@@ -232,6 +271,10 @@ impl SchedulerCore {
                 self.backoff_active = false;
                 self.retry_delay_ms = SYNC_BACKOFF_BASE_MS;
                 self.debounce_until_ms = None;
+                // A fresh grant is a deliberate user action; clear the quota
+                // hold with the rest of the backoff state so the pass the
+                // sign-in schedules is not refused.
+                self.quota_hold_until_ms = None;
             }
             SyncCommand::SignedOut => {
                 self.signed_in = false;
@@ -286,6 +329,16 @@ impl SchedulerCore {
         if self.pending_run {
             return Some(0);
         }
+        // Quota hold: automatic passes are refused until the deadline, but the
+        // thread must keep waking on a short slice so a command queued in the
+        // meantime ("Sync now") is drained in seconds rather than after the
+        // whole hold. Deliberately placed AFTER the `pending_run` short-circuit
+        // above - a pending request must never be delayed by a hold.
+        if let Some(hold) = self.quota_hold_until_ms {
+            if now_ms < hold {
+                return Some(((hold - now_ms) as u64).min(SYNC_QUOTA_HOLD_POLL_MS));
+            }
+        }
         let interval = if self.backoff_active {
             self.retry_delay_ms
         } else {
@@ -310,6 +363,13 @@ impl SchedulerCore {
             }
         }
         if !self.pending_run {
+            // A quota hold is a DEADLINE, not an interval: it refuses automatic
+            // passes outright for as long as Drive asked. The `pending_run`
+            // branch above is what preserves the manual override, so "Sync now"
+            // still starts a pass mid-hold.
+            if self.quota_hold_until_ms.is_some_and(|hold| now_ms < hold) {
+                return false;
+            }
             let interval = if self.backoff_active {
                 self.retry_delay_ms
             } else {
@@ -338,6 +398,7 @@ impl SchedulerCore {
         // that got past the throttle, a crash, a success) cannot leak into a
         // later pass's retry delay and park the scheduler after the fact.
         let pending_retry_after_ms = self.pending_retry_after_ms.take();
+        let pending_quota_hold_ms = self.pending_quota_hold_ms.take();
         match outcome {
             PassOutcomeKind::Success => {
                 self.backoff.reset();
@@ -345,6 +406,7 @@ impl SchedulerCore {
                 self.last_error = None;
                 self.degraded = false;
                 self.degraded_detail = None;
+                self.quota_hold_until_ms = None;
                 if error.is_none() {
                     self.last_sync_at = Some(_now_ms);
                 }
@@ -360,6 +422,15 @@ impl SchedulerCore {
                 self.retry_delay_ms = pending_retry_after_ms.map_or(next, |r| next.max(r));
                 self.backoff_active = true;
                 self.last_error = error;
+                // ...but a hint LONGER than the cap is a server asking for
+                // hours (a `dailyLimitExceeded` says a day), not a blip. Hold
+                // automatic passes for the real duration instead of re-polling
+                // every 60 s. A still-running hold is left alone so a repeat
+                // throttled pass cannot shorten it; an elapsed one is simply
+                // ignored by the `now_ms < hold` guards.
+                if let Some(hold) = pending_quota_hold_ms {
+                    self.quota_hold_until_ms = Some(_now_ms.saturating_add(hold as i64));
+                }
             }
             PassOutcomeKind::Rejected => {
                 // Permanent rejections must NOT backoff-escalate: reset the
@@ -368,6 +439,7 @@ impl SchedulerCore {
                 self.backoff.reset();
                 self.backoff_active = false;
                 self.retry_delay_ms = SYNC_BACKOFF_BASE_MS;
+                self.quota_hold_until_ms = None;
                 self.last_error = error;
             }
             PassOutcomeKind::Degraded => {
@@ -382,6 +454,7 @@ impl SchedulerCore {
                 self.backoff.reset();
                 self.backoff_active = false;
                 self.retry_delay_ms = SYNC_BACKOFF_BASE_MS;
+                self.quota_hold_until_ms = None;
                 self.last_sync_at = Some(_now_ms);
                 self.last_error = None;
                 self.degraded = true;
@@ -392,6 +465,7 @@ impl SchedulerCore {
                 self.backoff_active = false;
                 self.retry_delay_ms = SYNC_BACKOFF_BASE_MS;
                 self.wait_for_command = true;
+                self.quota_hold_until_ms = None;
                 self.last_error = error;
             }
             PassOutcomeKind::AuthRequired => {
@@ -399,6 +473,7 @@ impl SchedulerCore {
                 self.pending_run = false;
                 self.backoff_active = false;
                 self.retry_delay_ms = SYNC_BACKOFF_BASE_MS;
+                self.quota_hold_until_ms = None;
                 self.last_error = error;
             }
         }
@@ -564,7 +639,10 @@ fn truncate_after_http_status(s: &str) -> &str {
     let mut from = 0;
     while let Some(rel) = s[from..].find("HTTP ") {
         let start = from + rel + 5;
-        let digits = s[start..].chars().take_while(|c| c.is_ascii_digit()).count();
+        let digits = s[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
         if digits == 0 {
             from = start;
             continue;
@@ -592,15 +670,8 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.chars().count() <= max {
         return s;
     }
-    let hard = s
-        .char_indices()
-        .nth(max)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    let word_edge = s[..hard]
-        .rfind(char::is_whitespace)
-        .unwrap_or(hard)
-        .max(1);
+    let hard = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+    let word_edge = s[..hard].rfind(char::is_whitespace).unwrap_or(hard).max(1);
     &s[..word_edge]
 }
 
@@ -650,15 +721,12 @@ impl Scheduler {
         let settings = crate::settings::load_settings().unwrap_or_default();
         // Seed signed_in from a *usable* credential only: absence or an empty
         // blob must not report signed-in, or every pass would fail with
-        // AuthRequired from the token endpoint instead.
-        let signed_in = matches!(
-            crate::credentials::read_sync_refresh_token_checked(),
-            Ok(crate::credentials::SyncRefreshTokenRead::Present(t)) if !t.trim().is_empty()
-        );
-        let core = Arc::new(Mutex::new(SchedulerCore::new(
-            settings.sync_enabled,
-            signed_in,
-        )));
+        // AuthRequired from the token endpoint instead. A credential-store
+        // FAILURE is not absence, though - see `seed_credential_state`.
+        let seed = seed_credential_state(&crate::credentials::read_sync_refresh_token_checked());
+        let mut initial = SchedulerCore::new(settings.sync_enabled, seed.signed_in);
+        initial.last_error = seed.last_error;
+        let core = Arc::new(Mutex::new(initial));
         let (tx, rx) = channel();
         let thread_app = app.clone();
         let thread_core = core.clone();
@@ -724,6 +792,60 @@ impl Scheduler {
 fn apply_and_snapshot(core: &mut SchedulerCore, cmd: &SyncCommand, now_ms: i64) -> SyncStatus {
     core.apply_with_time(cmd, now_ms);
     build_status(core)
+}
+
+/// Initial scheduler state derived from the seed-time credential read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeedCredential {
+    /// What `SchedulerCore::signed_in` starts as.
+    pub signed_in: bool,
+    /// What `SchedulerCore::last_error` starts as, if anything.
+    pub last_error: Option<String>,
+}
+
+/// Map the seed-time credential read onto the scheduler's initial state.
+///
+/// Absence (`Missing`) and an empty blob genuinely mean signed out, so the
+/// scheduler starts disarmed with no error - that is the state the UI already
+/// renders as "signed out, reconnect".
+///
+/// A **store failure** is a different thing and must not collapse into it.
+/// `Err(..)`/`StoreFailed(..)` means the vault could not be READ (locked,
+/// service stopped, unregistered profile) - it says nothing about whether a
+/// token is stored. Mapping it to `signed_in = false` (audit finding C5) meant
+/// `wait_ms` returned `None`, the thread fell into the 1-hour idle poll with no
+/// error and no retry, and the Sync page showed "signed out" plus a reconnect
+/// prompt for an account that is actually signed in. Recovery then required a
+/// full sign-out/sign-in round trip.
+///
+/// Instead stay ARMED and carry the diagnostic, exactly as `run_pass` already
+/// classifies the same condition via `credential_store_error`: the first pass
+/// runs immediately, retries with backoff if the vault is still unreadable,
+/// and `last_error` tells the user what actually went wrong. The wording is
+/// taken from [`credential_store_diagnostic`], the same sentence `run_pass`'s
+/// branch produces, so the seeded message is byte-identical to the one a
+/// retryable pass shows - same text, same redaction path.
+pub(crate) fn seed_credential_state(
+    read: &std::result::Result<crate::credentials::SyncRefreshTokenRead, anyhow::Error>,
+) -> SeedCredential {
+    use crate::credentials::SyncRefreshTokenRead as Read;
+    let store_failure = |message: String| SeedCredential {
+        signed_in: true,
+        last_error: Some(credential_store_diagnostic(&message)),
+    };
+    match read {
+        Ok(Read::Present(token)) if !token.trim().is_empty() => SeedCredential {
+            signed_in: true,
+            last_error: None,
+        },
+        // An empty blob is present-but-unusable: still signed out.
+        Ok(Read::Present(_)) | Ok(Read::Missing) => SeedCredential {
+            signed_in: false,
+            last_error: None,
+        },
+        Ok(Read::StoreFailed(message)) => store_failure(message.clone()),
+        Err(e) => store_failure(e.to_string()),
+    }
 }
 
 fn scheduler_thread(app: AppHandle, core: Arc<Mutex<SchedulerCore>>, rx: Receiver<SyncCommand>) {
@@ -898,7 +1020,15 @@ fn sync_config() -> auth::OAuthConfig {
 /// A *missing* credential is not an error here: `load_refresh_token_checked`
 /// returns `Ok(None)` and `run_pass` maps it to `AuthRequired`.
 fn credential_store_error(message: String) -> SyncError {
-    SyncError::Retryable(format!("credential store read failed: {message}"))
+    SyncError::Retryable(credential_store_diagnostic(&message))
+}
+
+/// The one sentence both `run_pass`'s store-failure branch and the seed-time
+/// classification put in front of the user. Shared so the two can never drift:
+/// the Sync page must not show a different message for the same condition
+/// depending on whether it was caught at startup or mid-pass.
+fn credential_store_diagnostic(message: &str) -> String {
+    format!("credential store read failed: {message}")
 }
 
 /// Outcome of [`reconcile_persisted_account_key`].
@@ -951,7 +1081,7 @@ pub(crate) fn reconcile_persisted_account_key(
     if settings
         .sync_account_key
         .as_deref()
-        .is_some_and(|key| key.trim().eq_ignore_ascii_case(verified_email.trim()))
+        .is_some_and(|key| crate::sync::metadata::account_keys_match(key, verified_email))
     {
         return Ok(AccountReconcileOutcome::AlreadyBound);
     }
@@ -1025,21 +1155,37 @@ fn run_pass() -> Result<SyncOutcome, SyncError> {
     // and no cached data is dropped beyond what an ordinary account switch drops.
     // Only a mis-binding that Drive itself cannot resolve is reported, and as
     // Retryable (S5-c), never as a terminal AuthRequired.
-    match persisted_email.as_deref() {
-        Some(key) if key.trim().eq_ignore_ascii_case(verified_email.trim()) => {
+    match identity_gate(persisted_email.as_deref(), &verified_email) {
+        IdentityGate::AlreadyBound => {
             // Already bound to the credential's identity: no write, no log.
         }
-        previous => {
-            let prev_hash = previous
-                .map(|k| crate::sync::metadata::account_hash_from_email(k))
-                .unwrap_or_else(|| "<none>".to_string());
+        // A DIFFERENT account's key is persisted. This is NOT an interrupted
+        // sign-in: the credential's identity and the recorded key disagree about
+        // which account the user is. `reconcile_persisted_account_key` would
+        // adopt the credential's account, re-point the whole app's partition at
+        // it, and flip `sync_enabled = true` — all from a background repair, with
+        // no signal beyond a log line the user never sees. Fail closed instead,
+        // exactly as Android's `identityDivergenceOutcome` does. Reported
+        // Retryable (not a latch, never AuthRequired): the user is not signed
+        // out and the pass backs off rather than wedging permanently.
+        IdentityGate::RefuseDivergent { persisted } => {
+            return Err(SyncError::Retryable(format!(
+                "refusing to sync: the stored account ({}) does not match the signed-in Google \
+                 account ({}); sign out and back in to continue",
+                crate::sync::metadata::account_hash_from_email(&persisted),
+                crate::sync::metadata::account_hash_from_email(&verified_email)
+            )));
+        }
+        // No key at all: an interrupted sign-in — the credential was persisted
+        // but the settings write never happened. This is the only case the
+        // repair (and its `sync_enabled = true`) is for.
+        IdentityGate::RepairMissingKey => {
             match reconcile_persisted_account_key(&verified_email) {
                 Ok(outcome) if outcome == AccountReconcileOutcome::Repaired => {
                     log::info!(
                         "sync: recovered account identity from the stored credential ({}); \
-                         the previous key was {}",
+                         no previous key was recorded",
                         crate::sync::metadata::account_hash_from_email(&verified_email),
-                        prev_hash
                     );
                 }
                 Ok(_) => {}
@@ -1255,6 +1401,45 @@ pub fn resolve_client_secret() -> Result<String, String> {
         );
     }
     resolve_client_secret_from(env.as_deref(), file.as_deref())
+}
+
+/// What a pass must do about the relationship between the PERSISTED account key
+/// and the identity Drive attributes to the live access token.
+///
+/// Extracted as a pure function so the rule is testable directly. The gate used
+/// to live inline in `run_pass`, which meant the only test of it drove
+/// `reconcile_persisted_account_key` DIRECTLY — bypassing the gate entirely and
+/// therefore "certifying" the opposite of shipped behaviour for the divergence
+/// case. This is the seam that makes the real rule assertable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityGate {
+    /// The key already names the credential's account: no write, no log.
+    AlreadyBound,
+    /// No key recorded — an interrupted sign-in (the credential was persisted
+    /// but the settings write never landed). This is the ONLY case the repair,
+    /// and its `sync_enabled = true`, is for.
+    RepairMissingKey,
+    /// A DIFFERENT account's key is recorded: the credential and the recorded
+    /// key disagree about who the user is. Refuse; never adopt.
+    RefuseDivergent { persisted: String },
+}
+
+pub(crate) fn identity_gate(
+    persisted_email: Option<&str>,
+    verified_email: &str,
+) -> IdentityGate {
+    match persisted_email {
+        // F10: full-Unicode fold via the shared helper — NOT
+        // `eq_ignore_ascii_case`, which called `ÜSER@…` and `üser@…` two
+        // identities.
+        Some(key) if crate::sync::metadata::account_keys_match(key, verified_email) => {
+            IdentityGate::AlreadyBound
+        }
+        Some(key) => IdentityGate::RefuseDivergent {
+            persisted: key.to_string(),
+        },
+        None => IdentityGate::RepairMissingKey,
+    }
 }
 
 /// Extract the account key (email) from the Drive `about` response
@@ -1886,6 +2071,85 @@ mod tests {
         assert!(!c.take_run(NOW));
     }
 
+    // -- Audit finding C5: a credential-store failure is not a sign-out -----
+
+    #[test]
+    fn store_failed_at_seed_time_does_not_park_the_session() {
+        use crate::credentials::SyncRefreshTokenRead as Read;
+        // The bug: `Err(..)`/`StoreFailed(..)` collapsed to `signed_in=false`,
+        // so `wait_ms` returned None, the thread fell into the 1-hour idle poll
+        // with no error and no retry, and the Sync page rendered "signed out"
+        // plus a reconnect prompt for an account that is signed in.
+        for read in [
+            Ok(Read::StoreFailed(
+                "CredReadW failed: access is denied.".to_string(),
+            )),
+            Err(anyhow::anyhow!(
+                "Credential Manager not supported on this platform"
+            )),
+        ] {
+            let seed = seed_credential_state(&read);
+            assert!(
+                seed.signed_in,
+                "a store failure must not disarm the scheduler: {read:?}"
+            );
+            let mut c = SchedulerCore::new(true, seed.signed_in);
+            c.last_error = seed.last_error.clone();
+            let err = seed
+                .last_error
+                .expect("a store failure must surface its reason, not a sign-out");
+            assert!(
+                err.contains("credential store read failed"),
+                "the diagnostic must name the real problem, got {err:?}"
+            );
+
+            // Seeded into a live core: armed, scheduled, and retrying.
+            assert_eq!(c.wait_ms(NOW), Some(0), "armed, so not parked");
+            assert!(c.take_run(NOW), "the first pass runs immediately");
+            assert!(c.signed_in, "still reported as signed in");
+            assert!(c.last_error.is_some(), "and it says why");
+        }
+    }
+
+    #[test]
+    fn seeded_store_failure_matches_the_retryable_pass_diagnostic() {
+        use crate::credentials::SyncRefreshTokenRead as Read;
+        // Same wording as `run_pass`'s `credential_store_error` branch, so the
+        // Sync page shows one message rather than two for one condition.
+        let msg = "CredReadW failed: Element not found.";
+        let seeded = seed_credential_state(&Ok(Read::StoreFailed(msg.to_string())));
+        let (kind, error, hint) = classify_pass(Err(credential_store_error(msg.to_string())));
+        assert_eq!(kind, PassOutcomeKind::Retryable);
+        assert_eq!(hint, None);
+        assert_eq!(seeded.last_error.as_deref(), error.as_deref());
+        // And it survives the redaction the status payload applies.
+        assert!(sanitize_status_error(seeded.last_error.as_deref().unwrap()).is_some());
+    }
+
+    #[test]
+    fn seeded_absent_credential_still_reports_signed_out_without_an_error() {
+        use crate::credentials::SyncRefreshTokenRead as Read;
+        // Absence is the real signed-out state and must look exactly like it
+        // used to: disarmed, no error, no reconnect prompt manufactured by an
+        // error string.
+        for read in [
+            Ok(Read::Missing),
+            Ok(Read::Present("   ".to_string())),
+            Ok(Read::Present(String::new())),
+        ] {
+            let seed = seed_credential_state(&read);
+            assert!(!seed.signed_in, "{read:?} is a signed-out account");
+            assert_eq!(seed.last_error, None);
+            let mut c = SchedulerCore::new(true, seed.signed_in);
+            c.last_error = seed.last_error.clone();
+            assert_eq!(c.wait_ms(NOW), None, "a signed-out session is parked");
+        }
+        // A real token seeds armed and clean.
+        let seed = seed_credential_state(&Ok(Read::Present("refresh-token".to_string())));
+        assert!(seed.signed_in);
+        assert_eq!(seed.last_error, None);
+    }
+
     #[test]
     fn partial_retryable_pass_keeps_last_sync_at() {
         let mut c = core();
@@ -2320,6 +2584,17 @@ mod tests {
         // capped) backoff delay and this hint, so an unclamped header would
         // park the scheduler - and every command behind it, including "Sync
         // now" - for an hour. The cap must cover the header too.
+        //
+        // CHANGED EXPECTATION (audit finding F16). This test used to assert
+        // `c.take_run(NOW + SYNC_BACKOFF_CAP_MS)` succeeds, i.e. that the
+        // automatic schedule became runnable one cap after an hour-long
+        // `Retry-After` - which is precisely the 60-second-ish polling loop
+        // #16 was about. The clamp on `retry_delay_ms` is unchanged and still
+        // asserted below; what changed is that an above-cap hint now also
+        // holds AUTOMATIC passes until the time Drive actually asked for. The
+        // manual override that motivated the original cap is untouched and is
+        // asserted separately in
+        // `quota_hold_does_not_block_a_manual_sync_now`.
         let mut c = core();
         assert!(c.take_run(NOW));
         c.note_retry_after(Some(3_600_000));
@@ -2329,22 +2604,32 @@ mod tests {
             "an above-cap Retry-After is clamped to the backoff cap"
         );
 
-        // And the gate really is capped: the next attempt is reachable.
+        // The gate is still a real gate: nothing runs before it opens.
         assert!(
             !c.take_run(NOW + SYNC_BACKOFF_CAP_MS as i64 - 1),
             "a capped Retry-After still delays the retry"
         );
         assert!(
-            c.take_run(NOW + SYNC_BACKOFF_CAP_MS as i64),
-            "the capped retry is not parked past the cap"
+            !c.take_run(NOW + SYNC_BACKOFF_CAP_MS as i64),
+            "an above-cap Retry-After defers the AUTOMATIC pass past the cap"
+        );
+        assert!(
+            c.take_run(NOW + 3_600_000),
+            "the automatic pass becomes runnable at the requested delay"
         );
 
-        // A hint at or under the cap is honored exactly as sent.
+        // A hint at or under the cap is honored exactly as sent, and sets up
+        // no hold at all.
         let mut c = core();
         assert!(c.take_run(NOW));
         c.note_retry_after(Some(SYNC_BACKOFF_CAP_MS));
         c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
         assert_eq!(c.retry_delay_ms, SYNC_BACKOFF_CAP_MS);
+        assert_eq!(c.quota_hold_until_ms, None, "a sub-cap hint is not a hold");
+        assert!(
+            c.take_run(NOW + SYNC_BACKOFF_CAP_MS as i64),
+            "a sub-cap Retry-After is reachable one cap later, as before"
+        );
 
         // A zero/absent hint stays absent (no zero-width gate).
         let mut c = core();
@@ -2352,6 +2637,201 @@ mod tests {
         c.note_retry_after(None);
         c.finish(PassOutcomeKind::Retryable, Some("boom".into()), NOW);
         assert_eq!(c.retry_delay_ms, SYNC_BACKOFF_BASE_MS);
+        assert_eq!(c.quota_hold_until_ms, None);
+    }
+
+    // -- F16: a quota-shaped 403 must back off for the time Drive asked ----
+
+    /// Drive's own words for an exhausted daily quota, as a response body.
+    const DAILY_LIMIT_403: &str = r#"{"error":{"code":403,"message":"Quota exceeded","errors":[{"domain":"usageLimits","reason":"dailyLimitExceeded"}]}}"#;
+
+    #[test]
+    fn daily_limit_403_carries_its_retry_after_through_the_classifier() {
+        use crate::sync::drive::classify_forbidden_with_retry_after;
+        // 24 h, in the integer seconds Drive actually sends.
+        let hint = 86_400_000u64;
+        let err = classify_forbidden_with_retry_after(DAILY_LIMIT_403, Some(hint));
+        assert_eq!(
+            err,
+            SyncError::Throttled {
+                retry_after_ms: Some(hint)
+            }
+        );
+
+        // ...and the pass that produced it hands the hint to the scheduler.
+        let (kind, _, retry_after_ms) = classify_pass(Err(err));
+        assert_eq!(kind, PassOutcomeKind::Retryable, "still a retryable pass");
+        assert_eq!(retry_after_ms, Some(hint), "the header must survive");
+    }
+
+    #[test]
+    fn daily_limit_403_without_a_header_stays_a_plain_retryable() {
+        use crate::sync::drive::classify_forbidden_with_retry_after;
+        let err = classify_forbidden_with_retry_after(DAILY_LIMIT_403, None);
+        assert!(
+            matches!(err, SyncError::Retryable(_)),
+            "no header, no hint - the pre-existing classification is unchanged"
+        );
+        let (kind, _, retry_after_ms) = classify_pass(Err(err));
+        assert_eq!(kind, PassOutcomeKind::Retryable);
+        assert_eq!(retry_after_ms, None);
+    }
+
+    #[test]
+    fn rate_limited_403_and_429_keep_their_headers_too() {
+        use crate::sync::drive::classify_forbidden_with_retry_after;
+        // 429 was already honored; 403 now matches it.
+        let (kind, _, hint) = classify_pass(Err(SyncError::Throttled {
+            retry_after_ms: Some(2_000),
+        }));
+        assert_eq!(kind, PassOutcomeKind::Retryable);
+        assert_eq!(hint, Some(2_000));
+
+        let body = r#"{"error":{"code":403,"reason":"userRateLimitExceeded"}}"#;
+        let (kind, _, hint) =
+            classify_pass(Err(classify_forbidden_with_retry_after(body, Some(30_000))));
+        assert_eq!(kind, PassOutcomeKind::Retryable);
+        assert_eq!(hint, Some(30_000));
+
+        // A permission-shaped 403 must NOT become a retry loop just because a
+        // header happened to ride along.
+        let (kind, _, hint) = classify_pass(Err(classify_forbidden_with_retry_after(
+            r#"{"error":{"code":403,"reason":"insufficientPermissions"}}"#,
+            Some(3_600_000),
+        )));
+        assert_eq!(kind, PassOutcomeKind::Fatal, "NotOurs is still fatal");
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn daily_limit_defers_automatic_passes_for_hours_not_sixty_seconds() {
+        let mut c = core();
+        assert!(c.take_run(NOW));
+        c.note_retry_after(Some(86_400_000));
+        c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+
+        assert_eq!(
+            c.quota_hold_until_ms,
+            Some(NOW + 86_400_000),
+            "the requested delay, not the backoff cap"
+        );
+        // The old behavior: a pass every 60 s against a server that said "come
+        // back tomorrow". Each of these used to succeed.
+        for offset in [1, 60, 600, 3_600, 21_600, 86_399] {
+            assert!(
+                !c.take_run(NOW + offset * 1000),
+                "automatic pass must not run {offset}s into a 24 h hold"
+            );
+        }
+        assert!(c.take_run(NOW + 86_400_000), "the hold expires on time");
+    }
+
+    #[test]
+    fn quota_hold_does_not_block_a_manual_sync_now() {
+        // The whole reason `retry_delay_ms` stays clamped: a day-long sleep
+        // must not mean a day-long deaf ear. `RunNow` sets `pending_run`,
+        // which both `wait_ms` and `take_run` honor BEFORE the hold.
+        let mut c = core();
+        assert!(c.take_run(NOW));
+        c.note_retry_after(Some(86_400_000));
+        c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+
+        let soon = NOW + 3_600_000;
+        // Idle mid-hold the thread still wakes on the responsiveness slice...
+        assert_eq!(c.wait_ms(soon), Some(SYNC_QUOTA_HOLD_POLL_MS));
+        // ...but a queued command makes it wake immediately.
+        c.apply(&SyncCommand::RunNow);
+        assert_eq!(c.wait_ms(soon), Some(0));
+        assert!(
+            c.take_run(soon),
+            "\"Sync now\" starts a pass in the middle of a 24 h quota hold"
+        );
+    }
+
+    #[test]
+    fn quota_hold_keeps_the_thread_responsive_while_it_is_active() {
+        // Without this the thread would sit in one `recv_timeout` for the whole
+        // hold and a queued command would wait for it; with it, the command is
+        // drained within the poll slice while no pass runs.
+        let mut c = core();
+        assert!(c.take_run(NOW));
+        c.note_retry_after(Some(86_400_000));
+        c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+
+        let sleep = c.wait_ms(NOW).expect("armed, so never parked");
+        assert_eq!(sleep, SYNC_QUOTA_HOLD_POLL_MS, "wakes on a short slice");
+        assert!(sleep <= 60_000, "not for the whole hold");
+        // Still no pass, however many times it wakes.
+        assert!(!c.take_run(NOW + sleep as i64));
+        assert!(!c.take_run(NOW + 3_600_000));
+    }
+
+    #[test]
+    fn quota_hold_is_released_by_any_non_retryable_outcome() {
+        for (kind, err) in [
+            (PassOutcomeKind::Success, None),
+            (PassOutcomeKind::Degraded, Some("degraded".to_string())),
+            (PassOutcomeKind::Rejected, Some("rejected".to_string())),
+            (PassOutcomeKind::Fatal, Some("boom".to_string())),
+            (PassOutcomeKind::AuthRequired, Some("auth".to_string())),
+        ] {
+            let mut c = core();
+            assert!(c.take_run(NOW));
+            c.note_retry_after(Some(86_400_000));
+            c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+            assert!(c.quota_hold_until_ms.is_some());
+
+            c.apply(&SyncCommand::RunNow);
+            assert!(c.take_run(NOW + 1));
+            c.finish(kind, err, NOW + 1);
+            assert_eq!(
+                c.quota_hold_until_ms, None,
+                "{kind:?} must release the quota hold"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_hold_is_bounded_and_released_by_a_fresh_sign_in() {
+        // A hostile or malformed header must not park the automatic schedule
+        // forever.
+        let mut c = core();
+        assert!(c.take_run(NOW));
+        c.note_retry_after(Some(u64::MAX / 4));
+        c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+        assert_eq!(
+            c.quota_hold_until_ms,
+            Some(NOW + SYNC_QUOTA_HOLD_MAX_MS as i64),
+            "an absurd hint is bounded to a day"
+        );
+        assert_eq!(SYNC_QUOTA_HOLD_MAX_MS, 24 * 60 * 60 * 1000);
+
+        c.apply(&SyncCommand::SignedIn);
+        assert_eq!(
+            c.quota_hold_until_ms, None,
+            "a deliberate re-sign-in clears the hold with the rest of the backoff"
+        );
+    }
+
+    #[test]
+    fn a_retryable_pass_without_a_hint_keeps_an_existing_hold_rather_than_shortening_it() {
+        let mut c = core();
+        assert!(c.take_run(NOW));
+        c.note_retry_after(Some(86_400_000));
+        c.finish(PassOutcomeKind::Retryable, Some("rate limited".into()), NOW);
+        let until = c.quota_hold_until_ms;
+
+        // A user-triggered pass mid-hold fails for an unrelated reason and
+        // carries no header; the hold must not be pulled forward.
+        c.apply(&SyncCommand::RunNow);
+        assert!(c.take_run(NOW + 60_000));
+        c.note_retry_after(None);
+        c.finish(
+            PassOutcomeKind::Retryable,
+            Some("network".into()),
+            NOW + 60_000,
+        );
+        assert_eq!(c.quota_hold_until_ms, until);
     }
 
     #[test]
@@ -2463,7 +2943,10 @@ mod tests {
         let mut c = core();
         c.apply_with_time(&SyncCommand::LocalChange, NOW);
         c.apply_with_time(&SyncCommand::RunNow, NOW + 100);
-        assert!(c.take_run(NOW + 101), "Sync now ignores the debounce window");
+        assert!(
+            c.take_run(NOW + 101),
+            "Sync now ignores the debounce window"
+        );
     }
 
     // -- S2: the status payload must not leak provider detail or the email --
@@ -2732,22 +3215,64 @@ mod tests {
         assert_eq!(first, AccountReconcileOutcome::AlreadyBound);
 
         // Case, surrounding whitespace and re-runs all count as already bound.
-        let second = reconcile_persisted_account_key("  USER@Example.com ").expect("must reconcile");
+        let second =
+            reconcile_persisted_account_key("  USER@Example.com ").expect("must reconcile");
         assert_eq!(
             second,
             AccountReconcileOutcome::AlreadyBound,
             "the same identity must not trigger a rewrite"
         );
         let settings = s5h::current_settings();
-        assert_eq!(settings.sync_account_key.as_deref(), Some("user@example.com"));
+        assert_eq!(
+            settings.sync_account_key.as_deref(),
+            Some("user@example.com")
+        );
         assert!(settings.sync_enabled);
         s5h::clear();
     }
 
+    /// The gate a real pass actually takes. This is the test that matters for
+    /// the divergence case: it proves `run_pass` NEVER reaches the repointing
+    /// repair when a DIFFERENT account's key is persisted, which is the exact
+    /// inverse of the helper-level test above.
+    #[test]
+    fn the_identity_gate_refuses_a_divergent_key() {
+        // F10: the fold is full-Unicode, not ASCII.
+        assert_eq!(
+            identity_gate(Some("a@example.com"), "b@example.com"),
+            IdentityGate::RefuseDivergent {
+                persisted: "a@example.com".to_string()
+            }
+        );
+        // Case-insensitively equal -> already bound, nothing written.
+        assert_eq!(
+            identity_gate(Some("A@Example.com"), "a@example.com"),
+            IdentityGate::AlreadyBound
+        );
+        assert_eq!(
+            identity_gate(Some("ÜSER@Example.com"), "üser@example.com"),
+            IdentityGate::AlreadyBound
+        );
+        // No key at all -> the only path that may repair.
+        assert_eq!(
+            identity_gate(None, "b@example.com"),
+            IdentityGate::RepairMissingKey
+        );
+    }
+
     /// Account-switch residue: the credential belongs to B but the persisted key
     /// still names A. The old code refused to sync under a stale key forever.
+    /// Function-level contract of [`reconcile_persisted_account_key`]: given a
+    /// divergent key it DOES repoint it to the credential's identity.
+    ///
+    /// NOTE this is deliberately NOT the shipped behaviour for that case. The
+    /// repair is now reached only through `identity_gate(..) == RepairMissingKey`
+    /// (no key at all). A mismatched key takes `RefuseDivergent` and the pass
+    /// fails closed instead — see `the_identity_gate_refuses_a_divergent_key`.
+    /// This test pins the helper's own contract, which stays correct for the
+    /// interrupted-sign-in path that legitimately calls it.
     #[test]
-    fn s5_a_stale_key_from_an_interrupted_switch_is_repointed() {
+    fn s5_reconcile_helper_repoints_a_divergent_key_when_called_directly() {
         let _guard = crate::sync::stores::store_test_guard();
         s5h::arm_all("refresh-token-B");
         s5h::seed_settings(Some("a@example.com"), true);
@@ -2761,7 +3286,10 @@ mod tests {
             Some("b@example.com"),
             "the key must follow the credential that authenticates the pass"
         );
-        assert!(settings.sync_enabled, "a valid switch must not disable sync");
+        assert!(
+            settings.sync_enabled,
+            "a valid switch must not disable sync"
+        );
         assert!(
             !crate::credentials::test_sync_refresh_token_deleted(),
             "repointing the key must never delete the credential (S5-d)"
@@ -2792,8 +3320,14 @@ mod tests {
         reconcile_persisted_account_key("user@example.com").expect("must reconcile");
 
         let after = s5h::current_settings();
-        assert_eq!(after.hotkey, before_hotkey, "unrelated settings must survive");
-        assert_eq!(after.language, before_language, "unrelated settings must survive");
+        assert_eq!(
+            after.hotkey, before_hotkey,
+            "unrelated settings must survive"
+        );
+        assert_eq!(
+            after.language, before_language,
+            "unrelated settings must survive"
+        );
         s5h::clear();
     }
 
@@ -2821,8 +3355,12 @@ mod tests {
             1,
             "exactly one sign-in credential-persist call site is expected"
         );
-        let persist = src.find(persist_call).expect("sign-in must persist the token");
-        let fetch = src.find(fetch_call).expect("sign-in must fetch the account email");
+        let persist = src
+            .find(persist_call)
+            .expect("sign-in must persist the token");
+        let fetch = src
+            .find(fetch_call)
+            .expect("sign-in must fetch the account email");
         assert!(
             fetch < persist,
             "the account identity must be resolved BEFORE the credential is persisted, \

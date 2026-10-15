@@ -97,16 +97,39 @@ impl SyncMetadata {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(data) = serde_json::to_string_pretty(self) {
-            let tmp = path.with_extension("tmp");
+            // Unique tmp, same as `settings::save_settings`, `stores::atomic_write`
+            // and `account_scope::write_json`. A FIXED `path.with_extension("tmp")`
+            // meant two writers both wrote the same tmp and both renamed it: the
+            // loser either renamed a tmp the winner had already consumed, or
+            // renamed a PARTIALLY written tmp onto the destination. Audit #22
+            // fixed the four writers it happened to touch and left this one.
+            //
+            // This file matters more than its size suggests: it holds the
+            // per-account `max_seen` monotonic floor that LWW ordering depends on,
+            // so truncating it silently rewinds the tie-break clock.
+            let tmp = {
+                static TMP_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut name = path.as_os_str().to_os_string();
+                name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+                std::path::PathBuf::from(name)
+            };
             if let Err(e) = std::fs::write(&tmp, &data) {
                 log::error!("failed to write sync metadata tmp file: {}", e);
+                let _ = std::fs::remove_file(&tmp);
                 return;
             }
-            if let Ok(f) = std::fs::File::open(&tmp) {
+            // WRITE handle required: on Windows `sync_all` -> `FlushFileBuffers`
+            // needs `GENERIC_WRITE`, so the previous `File::open` (O_RDONLY)
+            // performed no flush at all. Best effort, non-fatal, as everywhere else.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
                 let _ = f.sync_all();
             }
             if let Err(e) = std::fs::rename(&tmp, &path) {
                 log::error!("failed to rename sync metadata tmp file: {}", e);
+                // Its name is unpredictable, so nothing else can clean it up.
+                let _ = std::fs::remove_file(&tmp);
             }
         }
     }
@@ -227,11 +250,41 @@ impl SyncMetadata {
     }
 }
 
-// Account hash helper: lowercased trimmed email hashed? For now use lowercased email as hash for simplicity.
-// In production, we use SHA256 hex of lower(trim(email)) to avoid storing raw email in file names? But spec says accountHash stamping.
-// We'll provide a helper.
+/// The single account-key fold rule, shared by the partition hash AND by every
+/// persisted-vs-verified account comparison in the scheduler.
+///
+/// F10 — the platforms had drifted: `scheduler.rs` compared account keys with
+/// `key.trim().eq_ignore_ascii_case(verified_email.trim())` (ASCII-only) while
+/// Android compared with `trim().lowercase()` (full Unicode). For a non-ASCII
+/// local part (`ÜSER@example.com` vs `üser@example.com`) Windows called that two
+/// identities and REPAIRED/re-bound, while Android called it one. One account,
+/// two behaviors, and a silent split-brain on any non-ASCII address.
+///
+/// The rule is now full-Unicode case folding on BOTH sides — which is also what
+/// the hash already did, so the comparison and the partition key can no longer
+/// disagree:
+///
+///   Windows : `email.trim().to_lowercase()`   (Rust, full Unicode mapping)
+///   Android : `email.trim().lowercase()`      (Kotlin, Locale.ROOT)
+///   Android helper: `AccountHash.normalizeAccountKey`
+///   Windows helper: this function
+///
+/// Deliberately NOT ASCII folding: the comparison and the hash must agree, or a
+/// pass could validate one identity and write the payload under another's key.
+pub fn normalize_account_key(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Whether two account keys name the same identity under
+/// [`normalize_account_key`]. Use this — never a bare `eq_ignore_ascii_case` —
+/// for every persisted-vs-verified account comparison.
+pub fn account_keys_match(left: &str, right: &str) -> bool {
+    normalize_account_key(left) == normalize_account_key(right)
+}
+
+// Account hash helper: full 64-hex lowercase SHA-256 of the folded email.
 pub fn account_hash_from_email(email: &str) -> String {
-    let normalized = email.trim().to_lowercase();
+    let normalized = normalize_account_key(email);
     // Use SHA256 hex for stable hash; fallback to normalized if hex crate unavailable
     let hash = sha2::Sha256::digest(normalized.as_bytes());
     hex::encode(hash)
@@ -455,10 +508,7 @@ mod tests {
 
     fn unique_meta_path() -> std::path::PathBuf {
         let n = META_TEST_SEQ.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "fluence-meta-test-{}-{n}.json",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("fluence-meta-test-{}-{n}.json", std::process::id()))
     }
 
     fn remove_quietly(path: &std::path::Path) {
@@ -542,5 +592,71 @@ mod tests {
         assert!(!minted.is_empty(), "explicit ensure must mint");
         assert_eq!(loaded.sync_id, minted);
         remove_quietly(&path);
+    }
+
+    // ------------------------------------------------------------------
+    // F10 — the account-key fold rule. The two platforms MUST agree: Android
+    // folds with `String.lowercase()` (full Unicode, Locale.ROOT) and this
+    // module folds with `str::to_lowercase()`. An ASCII-only fold here
+    // (`eq_ignore_ascii_case`) called `ÜSER@example.com` and
+    // `üser@example.com` two identities while Android called them one.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn account_key_fold_is_trim_plus_full_unicode_lowercase() {
+        assert_eq!(
+            normalize_account_key("  ÜSER@example.com  "),
+            "üser@example.com"
+        );
+        assert_eq!(
+            normalize_account_key("üser@example.com"),
+            "üser@example.com"
+        );
+        assert_eq!(
+            normalize_account_key("ISSER@example.com"),
+            "isser@example.com"
+        );
+        // ß is NOT mapped to "ss" by Rust's to_lowercase or Kotlin's
+        // lowercase(). Asserted so a future "improvement" cannot silently
+        // re-partition accounts that already sync.
+        assert_eq!(
+            normalize_account_key("Straße@example.com"),
+            "straße@example.com"
+        );
+    }
+
+    #[test]
+    fn account_keys_match_folds_non_ascii_local_parts_to_one_identity() {
+        // The exact case eq_ignore_ascii_case called divergent.
+        assert!(account_keys_match("ÜSER@example.com", "üser@example.com"));
+        assert!(account_keys_match(
+            "  ÜsEr@Example.com ",
+            "üser@example.com"
+        ));
+        assert!(account_keys_match("ÉLÈVE@example.com", "élève@example.com"));
+        // ASCII casing and padding still fold.
+        assert!(account_keys_match("USER@EXAMPLE.COM", "user@example.com"));
+        // A genuinely different account still does not match.
+        assert!(!account_keys_match(
+            "someone.else@example.com",
+            "user@example.com"
+        ));
+        assert!(!account_keys_match(
+            "old-name@example.com",
+            "user@example.com"
+        ));
+    }
+
+    #[test]
+    fn the_partition_hash_folds_exactly_like_the_comparison() {
+        let a = account_hash_from_email("ÜSER@example.com");
+        let b = account_hash_from_email("  üser@EXAMPLE.com ");
+        assert_eq!(a, b, "casing/whitespace must not re-partition an account");
+        assert_eq!(a.len(), 64, "the hash is the full 64-char hex digest");
+        assert_ne!(
+            account_hash_from_email("other@example.com"),
+            a,
+            "a different account must get a different partition key"
+        );
     }
 }

@@ -4,6 +4,7 @@ import { Field } from '@/components/ui/field';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/fluence/Toasts';
 import { SettingsSectionHeader } from '@/components/fluence/SettingsSection';
+import { describeSignInError } from '@/lib/signinError';
 import {
   getSyncStatus,
   setSyncEnabled,
@@ -21,6 +22,13 @@ import {
 //   routes are not migrated yet and own no React state to refresh.
 // - the sync-status event is subscribed per-mount instead of globally;
 //   visible behavior is identical.
+// S7 audit note: the two toasts that still render `String(err)` (here and in
+// `onToggle`) are deliberately left raw. Neither command can return sign-in or
+// provider content — `sync_get_status` fails only on the ACL gate, and
+// `sync_toggle` fails on that gate or on a local settings read/write — so
+// routing them through `describeSignInError` would change user-visible copy
+// without closing a provider-string leak. A local io error (a settings.json
+// path) is still surfaced; that is a known residual, not an oversight.
 export function SyncPage() {
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [pendingEnabled, setPendingEnabled] = useState<boolean | null>(null);
@@ -84,11 +92,13 @@ export function SyncPage() {
       );
       setStatus(s);
     } catch (err) {
-      toast(
-        'Sign-in failed: ' + String(err).replace(/^Error:\s*/, ''),
-        'error',
-      );
-      setStatus((prev) => ({ ...(prev ?? {}), last_error: String(err) }));
+      toast(describeSignInError(err), 'error');
+      // The stored `last_error` is sanitized too, not just the toast: it is
+      // component state read by `syncErr`, and keeping the raw provider string
+      // around means the next render — or the next feature that surfaces
+      // `last_error` verbatim — re-opens the same leak. `syncErr` maps every
+      // sanitized string to the same fixed copy it produced from the raw one.
+      setStatus((prev) => ({ ...(prev ?? {}), last_error: describeSignInError(err) }));
     } finally {
       setSigningIn(false);
     }
@@ -100,7 +110,7 @@ export function SyncPage() {
       toast('Signed out. Existing sync data stays in Drive.', 'success');
       await load();
     } catch (err) {
-      toast('Sign-out failed: ' + String(err), 'error');
+      toast(describeSignInError(err, 'Sign-out'), 'error');
     }
   };
 
@@ -116,10 +126,7 @@ export function SyncPage() {
       // yet; the follow-up sync-status event is the source of truth.
       toast('Sync requested', 'success');
     } catch (err) {
-      toast(
-        'Failed to start sync: ' + String(err).replace(/^Error:\s*/, ''),
-        'error',
-      );
+      toast(describeSignInError(err, 'Sync'), 'error');
     }
   };
 

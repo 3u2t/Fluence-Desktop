@@ -149,16 +149,53 @@ pub(crate) fn save_dictionary_internal(entries: &[DictionaryEntry]) -> Result<()
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(entries)?;
-    // Atomic write: tmp + sync_all + rename (prevents half-written file on power loss)
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &data)?;
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // Atomic write: tmp + flush + rename.
+    //
+    // Durability, stated precisely: the tmp's CONTENTS are flushed before the
+    // rename, so a power loss can never expose a half-written store under the
+    // real name. The rename's own directory entry is NOT flushed — that needs a
+    // parent-directory flush, which none of these writers do. On power loss the
+    // destination may therefore still hold the PREVIOUS good copy rather than
+    // the new one. That is the safe direction (no truncation, no corruption),
+    // but it is not "durable" in the strict sense and should not be described as
+    // such.
+    //
+    // The tmp name MUST be unique per caller. This used to be the fixed
+    // `path.with_extension("json.tmp")`, the exact bug `settings.rs:371-379`
+    // documents and `sync/stores.rs` + `account_scope.rs` already fixed: two
+    // concurrent writers both wrote the SAME tmp, then both renamed it, so the
+    // loser either renamed a tmp the winner had already consumed (os error 2) or
+    // renamed a partially-written tmp onto the destination — truncating a live
+    // store. Audit #22 fixed the two files it happened to touch and left these
+    // two. pid + monotonic sequence, in the destination's own directory so the
+    // rename stays same-volume atomic, exactly as settings.rs does it.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
+    let write_result = (|| -> Result<()> {
+        fs::write(&tmp_path, &data)?;
+        // WRITE handle required: on Windows `sync_all` -> `FlushFileBuffers` needs
+        // `GENERIC_WRITE`, so the previous `File::open` (O_RDONLY) made this a no-op
+        // despite the durability intent. Best effort, non-fatal.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&tmp_path, &path)?;
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = f.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Never leave a stray tmp behind on the failure path. Its name is
+        // unpredictable, so nothing else can clean it up.
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &path)?;
-    if let Ok(f) = fs::File::open(&path) {
-        let _ = f.sync_all();
-    }
+    write_result?;
     // Sync imports write through this function too. Drop compiled rules so
     // the next transcription uses the merged file immediately.
     invalidate_cache();

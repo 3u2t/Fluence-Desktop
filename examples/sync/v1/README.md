@@ -111,3 +111,34 @@ Shard content rule: a shard holds exactly the merged rows of its month
 that are NOT byte-identical to the legacy `stats.json` version — history
 is never recopied, moved, or deleted. Old clients list `stats.json` by
 exact name and never see shard siblings.
+
+## Agents and Styles (account-partitioned additive domains)
+
+Phase 6 adds two synced domains, `agents.json` and `styles.json`. They are
+ADDITIVE: a client that predates them simply never reads or writes them, and
+the four original domains are unchanged.
+
+- Storage: `appDataFolder/fluence/v1/acct-<segment>/{agents,styles}.json`,
+  where `<segment>` is a SECOND, tagged derivation of the account hash
+  (`SHA-256("fluence/acct-path/v1\0" + accountHash)`). It is deliberately
+  not correlatable with the locally stored account hash.
+- Envelope: a normal v1 envelope, same shape, key order and caps as above.
+- `businessKey` is NOT derived from mutable content: it IS the record's own
+  stable id, minted at creation as `agent:<uuid>` / `custom:<uuid>` and
+  never rewritten. Renaming an agent therefore cannot fork it into two records.
+  Because identity arrives from the wire it is VALIDATED on ingest
+  (`<prefix>` + strict UUID); an unvalidated key would let a corrupt or
+  hostile file forge a merge identity and win an LWW against a real record.
+- Key order is `syncId, businessKey, name, hint, updatedAt, deletedAt, deviceId`
+  with `deletedAt` ALWAYS present (explicit `null` when absent).
+- Caps: `name` <= 1024 code points, `hint` <= 8192 code points.
+- `name` is validated with the Unicode `White_Space` trim set (Rust
+  `str::trim`), NOT Kotlin's `String.trim()` or `Char.isBlank` — those
+  disagree in both directions and make ingest asymmetric.
+- A tombstone (`deletedAt` present) is a VALID record: dropping it at ingest
+  would resurrect the deleted record on the next merge.
+- Sort: `businessKey` then `syncId`, UTF-8 byte order.
+
+These two domains carry NO cross-platform fixture coverage in
+`convergence/scenario-*.json`; the corpus asserts dictionary, snippets,
+settings and stats only.

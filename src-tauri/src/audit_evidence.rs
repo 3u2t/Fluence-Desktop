@@ -368,10 +368,22 @@ mod tests {
         // Non-atomic: fs::write can leave truncated file if killed mid-write
         // Atomic: write tmp, sync_all, rename
         let atomic_path = tmp.join("settings_atomic.json");
-        let tmp_path = atomic_path.with_extension("json.tmp");
+        // Unique tmp, so the "atomic write" this evidence demonstrates is the
+        // same shape the real writers use. A fixed name here would teach the
+        // wrong pattern while claiming to demonstrate the right one.
+        let tmp_path = {
+            let mut n = atomic_path.as_os_str().to_os_string();
+            n.push(format!(".tmp.{}.0", std::process::id()));
+            std::path::PathBuf::from(n)
+        };
         fs::write(&tmp_path, valid).unwrap();
-        // Best-effort sync_all - on Windows with AV, open may fail, so tolerate
-        if let Ok(f) = fs::File::open(&tmp_path) {
+        // Best-effort flush. It MUST be opened for WRITE: `File::open` is
+        // O_RDONLY, and on Windows `sync_all` maps to `FlushFileBuffers`, which
+        // requires `GENERIC_WRITE` — so the read-only form performed no flush at
+        // all. That is the practice this evidence is demonstrating, so it should
+        // actually do it. Tolerate failure either way (antivirus and virtualised
+        // filesystems can refuse a flush); a save must not fail because of one.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
             let _ = f.sync_all();
         }
         // Atomic rename - fallback to copy+delete on permission race
@@ -399,9 +411,22 @@ mod tests {
         // Regression: verifies settings.rs now uses atomic tmp+rename and corrupt-rename recovery
         // This would fail against the old buggy implementation (direct fs::write, Err return)
         let src = include_str!("settings.rs");
+        // Assert the flush actually CAN flush. The previous assertion here was
+        // `src.contains("sync_all")`, which passed whether or not the flush did
+        // anything — and it did not: `fs::File::open` is O_RDONLY and on Windows
+        // `sync_all` maps to `FlushFileBuffers`, which requires `GENERIC_WRITE`,
+        // so the call always failed and `let _ =` discarded it. Asserting the
+        // bare string let a no-op satisfy a durability requirement for the whole
+        // tree. Pin the WRITE-handle form, and pin the absence of the read-only
+        // form, so this cannot regress silently again.
         assert!(
-            src.contains("sync_all"),
-            "H3 REGRESSION: atomic save must fsync tmp file"
+            src.contains("OpenOptions::new().write(true).open(&tmp_path)"),
+            "H3 REGRESSION: the tmp flush must open a WRITE handle — a read-only handle \
+             makes FlushFileBuffers fail, so the flush silently does nothing"
+        );
+        assert!(
+            !src.contains("fs::File::open(&tmp_path)"),
+            "H3 REGRESSION: the O_RDONLY tmp flush is a no-op on Windows; use a WRITE handle"
         );
         assert!(
             src.contains("fs::rename(&tmp_path, &path)"),
@@ -836,9 +861,30 @@ mod tests {
             !has_fs_default,
             "fs:default must be removed - use scoped fs:allow-* + fs:scope for hardening"
         );
+        // POLICY CHANGE (sync audit #27): the renderer has no consumer for the
+        // fs plugin. `web/src/**`, `src/js/**` and the built `src/dist/assets/*.js`
+        // contain no `plugin-fs` import, no `plugin:fs` invoke and no
+        // readTextFile/writeTextFile/readBinaryFile call; every store file is read
+        // and written server-side by Rust. The previous invariant required a
+        // SCOPED fs:allow-read; that grant still covered `settings.json`,
+        // `dictionary.json`, `snippets.json` and `sync-oauth.json`, so it remained
+        // a standing capability that any future renderer-level injection could
+        // exfiltrate without a further permission change.
+        //
+        // The renderer reads nothing from disk, so the grant is removed outright.
+        // This assertion is therefore STRICTER than the one it replaces: it
+        // requires the absence of every fs read capability, not merely the absence
+        // of the broad one. Re-granting fs:allow-read now fails this test.
         assert!(
-            has_fs_allow_read,
-            "fs:allow-read with scoped allow required"
+            !has_fs_allow_read,
+            "fs:allow-read must be removed - the renderer never reads files directly \
+             (imports and store IO are server-side), so any fs read grant is a \
+             standing exfiltration capability"
+        );
+        assert!(
+            !has_fs_scope,
+            "fs:scope must be removed along with fs:allow-read - a scope with no \
+             consuming permission is a re-granting trap"
         );
         assert!(!has_fs_allow_write, "fs:allow-write must be removed - the renderer never writes files directly (imports read server-side)");
         let scope_paths: Vec<String> = perms
@@ -847,10 +893,12 @@ mod tests {
             .flat_map(|v| v["allow"].as_array().cloned().unwrap_or_default())
             .filter_map(|a| a["path"].as_str().map(str::to_string))
             .collect();
-        assert!(
-            !scope_paths.is_empty(),
-            "fs:scope with explicit allow required"
-        );
+        // Retained deliberately even though fs:scope is now expected to be
+        // ABSENT (asserted above). This still passes vacuously today, and it is
+        // the guard that fires if anyone re-adds an fs:scope later: a scope must
+        // never be a tree wildcard. The two "fs:scope must exist" assertions that
+        // preceded the policy change were dropped - they required the grant this
+        // audit removed, and their absence is now asserted above instead.
         assert!(
             !scope_paths.iter().any(|p| {
                 *p == "$APPDATA/**"
@@ -861,12 +909,6 @@ mod tests {
             "fs:scope must list explicit app-owned files, not tree wildcards"
         );
         assert!(
-            scope_paths
-                .iter()
-                .any(|p| p.ends_with("Fluence/settings.json")),
-            "fs:scope must include the explicit settings.json path"
-        );
-        assert!(
             !has_dialog_default,
             "dialog:default remains granted - should be narrowed"
         );
@@ -874,6 +916,6 @@ mod tests {
             has_dialog_open,
             "dialog:allow-open present - only dialog.open() is used (settings import)"
         );
-        println!("[HARDENING] VERIFIED FIXED: dialog narrowed to dialog:allow-open; fs:default removed, scoped fs:allow-* + fs:scope present");
+        println!("[HARDENING] VERIFIED FIXED: dialog narrowed to dialog:allow-open; fs access removed entirely (no fs:default, no fs:allow-read, no fs:scope) - renderer has no filesystem consumer");
     }
 }

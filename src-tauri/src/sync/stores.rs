@@ -41,6 +41,13 @@ use crate::sync::metadata::SyncMetadata;
 /// 3. The Windows Known Folder for local app data — the production path,
 ///    which a test build cannot reach.
 pub(crate) fn base_data_dir() -> PathBuf {
+    // The env override is a PRODUCTION/development affordance only. Reading it
+    // before the `#[cfg(test)]` branch let an exported FLUENCE_DATA_DIR collapse
+    // every `cargo test` run on the machine into one fixed directory — across
+    // processes and across time — which is exactly the recycled-pid /
+    // shared-root collision the per-process temp key below exists to prevent.
+    // No test sets the variable, so nothing is lost by ignoring it under test.
+    #[cfg(not(test))]
     if let Ok(dir) = std::env::var("FLUENCE_DATA_DIR") {
         return PathBuf::from(dir);
     }
@@ -117,16 +124,59 @@ pub(crate) fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
     STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn atomic_write(path: &PathBuf, data: &str) -> Result<(), SyncError> {
+/// Unique temp sibling for one atomic write.
+///
+/// Audit #22: the tmp name was a FIXED `path.with_extension("tmp")`, the exact
+/// bug class this repo already paid for in `settings.rs::save_settings`: two
+/// concurrent writers both write the same tmp, then both rename it - the loser
+/// renames a tmp the winner already consumed (os error 2) or renames a
+/// *partially written* tmp onto the destination, i.e. a truncated store. The
+/// proven settings.rs pattern is mirrored here: pid + monotonic sequence, in the
+/// destination's own directory so the rename stays same-volume atomic.
+fn atomic_tmp_path(path: &std::path::Path) -> PathBuf {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+    PathBuf::from(name)
+}
+
+/// Flush `path`'s contents to stable storage, best effort.
+///
+/// The handle MUST be opened for WRITE. `File::open` is `O_RDONLY`, and on
+/// Windows `sync_all` maps to `FlushFileBuffers`, which requires
+/// `GENERIC_WRITE` on the handle and fails otherwise — so the previous
+/// `if let Ok(f) = File::open(p) { let _ = f.sync_all(); }` idiom performed no
+/// flush at all while its doc comment promised "prevents half-written file on
+/// power loss". Errors stay non-fatal on purpose: this turns a flush that never
+/// happened into one that happens when the platform allows it, and can never
+/// turn a previously-succeeding store write into a failing one.
+fn best_effort_flush(path: &std::path::Path) {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                log::warn!("sync: flush {} failed: {e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("sync: could not open {} for flush: {e}", path.display()),
+    }
+}
+
+fn atomic_write(path: &std::path::Path, data: &str) -> Result<(), SyncError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SyncError::Fatal(e.to_string()))?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data).map_err(|e| SyncError::Fatal(e.to_string()))?;
-    if let Ok(f) = std::fs::File::open(&tmp) {
-        let _ = f.sync_all();
+    let tmp = atomic_tmp_path(path);
+    let write_result = (|| -> Result<(), SyncError> {
+        std::fs::write(&tmp, data).map_err(|e| SyncError::Fatal(e.to_string()))?;
+        best_effort_flush(&tmp);
+        std::fs::rename(&tmp, path).map_err(|e| SyncError::Fatal(e.to_string()))
+    })();
+    if write_result.is_err() {
+        // Never leave a stray tmp behind on the failure path.
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| SyncError::Fatal(e.to_string()))
+    write_result
 }
 
 /// Resolve the wire device id for a record lacking its own. An empty
@@ -195,21 +245,55 @@ impl DictionaryDirtyStore {
             quarantine_reason: None,
         }
     }
-}
 
-impl DirtyStore for DictionaryDirtyStore {
-    type Item = DictionaryItem;
-
-    fn load(&self, account_hash: &str) -> Vec<Self::Item> {
-        load_dictionary_internal()
-            .unwrap_or_default()
+    /// Fallible read of this account's rows. Audit #6b: the trait's `load`
+    /// cannot return an error, so the raw read lives here and the infallible
+    /// wrapper below degrades *loudly* instead of `unwrap_or_default()`.
+    fn load_strict(&self, account_hash: &str) -> Result<Vec<DictionaryItem>, SyncError> {
+        let all = load_dictionary_internal().map_err(|e| {
+            SyncError::Fatal(format!("dictionary store unreadable: {e}"))
+        })?;
+        Ok(all
             .iter()
             .filter(|e| e.sync_account.as_deref() == Some(account_hash))
             // F3: quarantined rows are held for recovery — they must never
             // enter the merge input (Android excludeQuarantined parity).
             .filter(|e| e.quarantine_reason.is_none())
             .filter_map(Self::to_domain_item)
-            .collect()
+            .collect())
+    }
+
+    /// Fail-closed `has_dirty`: an unreadable store must never read as CLEAN.
+    ///
+    /// The old `unwrap_or_default()` path made a corrupt dictionary report
+    /// "no dirty rows, nothing to push", so the pass ended in a clean,
+    /// successful, completely silent state with no local data in it. Unknown
+    /// state is reported as dirty so the pass never concludes "nothing to do".
+    fn has_dirty_strict(&self, account_hash: &str) -> Result<bool, SyncError> {
+        let all = load_dictionary_internal().map_err(|e| {
+            SyncError::Fatal(format!("dictionary store unreadable: {e}"))
+        })?;
+        Ok(all
+            .iter()
+            .any(|e| e.sync_account.as_deref() == Some(account_hash) && e.dirty))
+    }
+}
+
+impl DirtyStore for DictionaryDirtyStore {
+    type Item = DictionaryItem;
+
+    fn load(&self, account_hash: &str) -> Vec<Self::Item> {
+        // Audit #6b: an unreadable store is NOT an empty store. The trait
+        // signature has no error channel, so the failure is logged at error
+        // level (never swallowed) and `has_dirty` below reports dirty, which
+        // keeps the pass from concluding "clean, nothing to do".
+        match self.load_strict(account_hash) {
+            Ok(items) => items,
+            Err(e) => {
+                log::error!("Dictionary load degraded to an empty view: {e:?}");
+                Vec::new()
+            }
+        }
     }
 
     fn stamp_account(&mut self, account_hash: &str) -> Result<usize, SyncError> {
@@ -257,10 +341,16 @@ impl DirtyStore for DictionaryDirtyStore {
     }
 
     fn has_dirty(&self, account_hash: &str) -> bool {
-        load_dictionary_internal()
-            .unwrap_or_default()
-            .iter()
-            .any(|e| e.sync_account.as_deref() == Some(account_hash) && e.dirty)
+        // Audit #6b: fail closed. `true` is the only answer that cannot be
+        // wrong in the destructive direction - an unreadable store might hold
+        // unpushed rows, and claiming "clean" is what silently dropped them.
+        match self.has_dirty_strict(account_hash) {
+            Ok(dirty) => dirty,
+            Err(e) => {
+                log::error!("Dictionary has_dirty failing closed (reporting dirty): {e:?}");
+                true
+            }
+        }
     }
 
     fn save_merged(
@@ -414,14 +504,12 @@ impl SnippetDirtyStore {
             quarantine_reason: None,
         }
     }
-}
 
-impl DirtyStore for SnippetDirtyStore {
-    type Item = SnippetItem;
-
-    fn load(&self, account_hash: &str) -> Vec<Self::Item> {
-        load_snippets_internal()
-            .unwrap_or_default()
+    /// Fallible read; see [`DictionaryDirtyStore::load_strict`] (audit #6b).
+    fn load_strict(&self, account_hash: &str) -> Result<Vec<SnippetItem>, SyncError> {
+        let store = load_snippets_internal()
+            .map_err(|e| SyncError::Fatal(format!("snippets store unreadable: {e}")))?;
+        Ok(store
             .snippets
             .iter()
             .filter(|s| s.sync_account.as_deref() == Some(account_hash))
@@ -429,7 +517,32 @@ impl DirtyStore for SnippetDirtyStore {
             // enter the merge input (Android excludeQuarantined parity).
             .filter(|s| s.quarantine_reason.is_none())
             .filter_map(Self::to_domain_item)
-            .collect()
+            .collect())
+    }
+
+    /// Fail-closed `has_dirty`; see [`DictionaryDirtyStore::has_dirty_strict`].
+    fn has_dirty_strict(&self, account_hash: &str) -> Result<bool, SyncError> {
+        let store = load_snippets_internal()
+            .map_err(|e| SyncError::Fatal(format!("snippets store unreadable: {e}")))?;
+        Ok(store
+            .snippets
+            .iter()
+            .any(|s| s.sync_account.as_deref() == Some(account_hash) && s.dirty))
+    }
+}
+
+impl DirtyStore for SnippetDirtyStore {
+    type Item = SnippetItem;
+
+    fn load(&self, account_hash: &str) -> Vec<Self::Item> {
+        // Audit #6b: log the failure, never `unwrap_or_default()` it away.
+        match self.load_strict(account_hash) {
+            Ok(items) => items,
+            Err(e) => {
+                log::error!("Snippet load degraded to an empty view: {e:?}");
+                Vec::new()
+            }
+        }
     }
 
     fn stamp_account(&mut self, account_hash: &str) -> Result<usize, SyncError> {
@@ -475,11 +588,14 @@ impl DirtyStore for SnippetDirtyStore {
     }
 
     fn has_dirty(&self, account_hash: &str) -> bool {
-        load_snippets_internal()
-            .unwrap_or_default()
-            .snippets
-            .iter()
-            .any(|s| s.sync_account.as_deref() == Some(account_hash) && s.dirty)
+        // Audit #6b: fail closed - see the dictionary counterpart.
+        match self.has_dirty_strict(account_hash) {
+            Ok(dirty) => dirty,
+            Err(e) => {
+                log::error!("Snippet has_dirty failing closed (reporting dirty): {e:?}");
+                true
+            }
+        }
     }
 
     fn save_merged(
@@ -590,12 +706,55 @@ struct SettingsMetaDoc {
     /// baseline only; they are never uploaded unless the user edits them.
     #[serde(default)]
     activation_baseline: Option<HashMap<String, String>>,
+    /// Live values observed at the START of the current pass, keyed as `keys` is.
+    ///
+    /// Written by `load`, compared in `apply_merged`. Without it a user edit
+    /// landing DURING the GET→PUT window is silently destroyed: the edit is not
+    /// in `merged` (computed from the pre-edit snapshot), `meta.keys` still
+    /// holds the pre-edit baseline so the winner still "beats baseline", the
+    /// winner is applied over the user's edit, and the baseline then advances —
+    /// no dirty residue, no retry, no trace. Android's `decideSettingsApply`
+    /// closes exactly this; this is its missing twin.
+    ///
+    /// Purely derived bookkeeping (no user data), same status as `keys`.
+    #[serde(default)]
+    pass_snapshot: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeyMeta {
     v: String,
     t: i64,
+    /// `deviceId` of the record this baseline came from (audit #4).
+    ///
+    /// The baseline is compared against incoming merge winners with the SAME
+    /// total order `merge_settings` uses, and that order is
+    /// `(updatedAt, deviceId, value)`. Without the device id there is nothing
+    /// to compare at the second level, so an exact timestamp tie - which the
+    /// merge resolves and this path used to drop - could never be resolved
+    /// here. `#[serde(default)]` keeps every pre-existing meta document
+    /// readable; an empty id sorts lowest, i.e. an incoming winner wins the
+    /// tie and this device re-bases on it, which is the safe direction.
+    #[serde(default)]
+    d: String,
+}
+
+/// Side effects one settings apply pass performs outside the meta document.
+///
+/// Injected rather than hard-wired so a pass can be exercised against temp
+/// paths: `settings::settings_path()` resolves through `dirs::data_local_dir()`
+/// and IGNORES the test data-dir redirect, so any test that reached real
+/// settings would write the real user profile (see the
+/// `production_settings_survive_the_activity_read_path` guard).
+struct SettingsIo<'a> {
+    meta_path: &'a std::path::Path,
+    load_settings: &'a dyn Fn() -> Result<AppSettings, String>,
+    save_settings: &'a dyn Fn(&AppSettings) -> Result<(), String>,
+    /// Writes `enabled` into the snippets store (a separate local file).
+    apply_snippets_enabled: &'a dyn Fn(bool) -> Result<(), String>,
+    /// Re-checked between writes: settings are machine-global, so nothing may
+    /// be applied for an account that stopped being active mid-pass.
+    still_active: &'a dyn Fn() -> bool,
 }
 
 /// The keys this platform emits/accepts, mapped onto real settings. See
@@ -624,8 +783,17 @@ impl SettingsDirtyStore {
     /// settings. The next pass will pull that account's remote values, or
     /// treat the captured values as a non-uploaded baseline if no file exists.
     pub fn activate_account(account_hash: &str) -> Result<(), SyncError> {
+        // Audit #22: `save_meta` is an atomic write against the shared per-account
+        // meta doc; take the same io_lock every other meta writer holds.
+        let _io = crate::sync::io_lock::io_lock_guard();
         let settings = load_settings().map_err(|e| SyncError::Fatal(e.to_string()))?;
-        let baseline = Self::live_values(&settings).into_iter().collect();
+        // Audit #15: an unreadable snippets store must never be captured as
+        // `snippets_enabled=false` - that baseline would classify the user's
+        // real `true` as a local edit one pass later and upload it.
+        let baseline = Self::live_values_strict(&settings)
+            .map_err(|e| SyncError::Fatal(format!("cannot capture activation baseline: {e}")))?
+            .into_iter()
+            .collect();
         let mut meta = Self::load_meta(account_hash);
         meta.activation_baseline = Some(baseline);
         Self::save_meta(account_hash, &meta)
@@ -635,9 +803,15 @@ impl SettingsDirtyStore {
         let Some(baseline) = meta.activation_baseline.as_ref() else {
             return false;
         };
-        Self::live_values(settings)
-            .into_iter()
-            .all(|(key, value)| baseline.get(&key) == Some(&value))
+        match Self::live_values_strict(settings) {
+            Ok(live) => live
+                .into_iter()
+                .all(|(key, value)| baseline.get(&key) == Some(&value)),
+            Err(e) => {
+                log::error!("Activation baseline check failing closed: {e}");
+                false
+            }
+        }
     }
 
     fn load_meta(account_hash: &str) -> SettingsMetaDoc {
@@ -663,15 +837,27 @@ impl SettingsDirtyStore {
     }
 
     fn save_meta(account_hash: &str, doc: &SettingsMetaDoc) -> Result<(), SyncError> {
+        Self::save_meta_to(&Self::meta_path(account_hash), doc)
+    }
+
+    /// Path-parameterized core of [`save_meta`].
+    fn save_meta_to(path: &std::path::Path, doc: &SettingsMetaDoc) -> Result<(), SyncError> {
         let data =
             serde_json::to_string_pretty(doc).map_err(|e| SyncError::Fatal(e.to_string()))?;
-        atomic_write(&Self::meta_path(account_hash), &data)
+        atomic_write(path, &data)
     }
 
     /// Live values for the emitted keys, read from real application settings.
-    fn live_values(settings: &AppSettings) -> Vec<(String, String)> {
-        let snippets_enabled = load_snippets_internal().map(|s| s.enabled).unwrap_or(false);
-        vec![
+    ///
+    /// Audit #15: `snippets_enabled` comes from a SEPARATE local file, so a
+    /// read failure there is a failure to observe the value - never evidence
+    /// that the user turned snippets off. This is the fallible core; every
+    /// caller that stamps or uploads must use it.
+    fn live_values_strict(settings: &AppSettings) -> Result<Vec<(String, String)>, String> {
+        let snippets_enabled = load_snippets_internal()
+            .map_err(|e| e.to_string())?
+            .enabled;
+        Ok(vec![
             ("language".to_string(), settings.language.clone()),
             ("snippets_enabled".to_string(), snippets_enabled.to_string()),
             (
@@ -682,25 +868,184 @@ impl SettingsDirtyStore {
                 "ai_polish_style".to_string(),
                 settings.ai_polish_style.clone(),
             ),
-        ]
+        ])
     }
 
-    /// Apply an incoming winner to real settings. Only allowed keys are ever
-    /// touched; provider credentials/hotkeys/audio can never arrive here.
-    fn apply_winner(settings: &mut AppSettings, key: &str, value: &str) {
+    /// Non-strict view for pure comparisons. An unreadable snippets store
+    /// yields NO value rather than a fabricated `false`, so a caller can never
+    /// mistake "unknown" for "user set it to false".
+    ///
+    /// Production stamping/uploading paths deliberately do NOT use this: they
+    /// use `live_values_strict` so a read failure aborts the pass. What is left
+    /// is the pure key-set test, which is `#[cfg(test)]`-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn live_values(settings: &AppSettings) -> Vec<(String, String)> {
+        Self::live_values_strict(settings).unwrap_or_else(|e| {
+            log::error!("Live settings values unreadable; treating {e} as no values");
+            Vec::new()
+        })
+    }
+
+    /// Mid-pass edit guard — Android `decideSettingsApply`, ported.
+    ///
+    /// `snapshot` is what the key held when this pass started; `live` is what it
+    /// holds now. They differ only if the user edited it during the GET→PUT
+    /// window, in which case the winner (computed from the pre-edit snapshot)
+    /// must NOT be applied. A missing side means "not observed", which applies —
+    /// the fail-open direction here only ever means we behave exactly as this
+    /// platform did before the guard existed.
+    pub(crate) fn decide_settings_apply(snapshot: Option<&String>, live: Option<&String>) -> bool {
+        match (snapshot, live) {
+            (Some(s), Some(l)) => s == l,
+            _ => true,
+        }
+    }
+
+    /// Stage an incoming winner onto the in-memory settings.
+    ///
+    /// Only allowed keys are ever touched; provider credentials/hotkeys/audio
+    /// can never arrive here. `snippets_enabled` is NOT applied here: it lives
+    /// in another local file, so it is returned for the caller to persist as a
+    /// sequenced side effect (audit #19 - a failed write must abort the pass
+    /// instead of being recorded as applied).
+    fn apply_winner(settings: &mut AppSettings, key: &str, value: &str) -> Option<bool> {
         match key {
             "language" => settings.language = value.to_string(),
             "auto_learn_enabled" => settings.auto_learn_enabled = value == "true",
             "ai_polish_style" => settings.ai_polish_style = value.to_string(),
-            "snippets_enabled" => {
-                if let Ok(mut store) = load_snippets_internal() {
-                    store.enabled = value == "true";
-                    let _ = save_snippets_internal(&store);
-                }
-            }
+            "snippets_enabled" => return Some(value == "true"),
             // "dictionary_enabled": recorded in meta but not applied on Windows.
             _ => {}
         }
+        None
+    }
+
+    /// Persist `snippets_enabled` into the snippets store, propagating failure.
+    fn set_snippets_enabled(enabled: bool) -> Result<(), String> {
+        let mut store = load_snippets_internal().map_err(|e| e.to_string())?;
+        store.enabled = enabled;
+        save_snippets_internal(&store).map_err(|e| e.to_string())
+    }
+
+    /// Does this merge winner beat the baseline we last synced for this key?
+    ///
+    /// Audit #4: this used to be `item.updated_at > known.t`. `merge_settings`
+    /// resolves exact timestamp ties by `deviceId` and then by `value`, so the
+    /// strict `>` silently DROPPED a tie the merge had deliberately resolved,
+    /// the two paths disagreed about who won, and two devices could diverge
+    /// permanently on one setting. Use the canonical total comparator - the
+    /// very same `clock::cmp_settings_winner` `merge_settings` calls - so there
+    /// is exactly one settings order in the codebase.
+    fn winner_beats_baseline(item: &SettingsItem, known: &KeyMeta) -> bool {
+        crate::sync::clock::cmp_settings_winner(
+            item.updated_at,
+            &item.device_id,
+            &item.value,
+            known.t,
+            &known.d,
+            &known.v,
+        ) == std::cmp::Ordering::Greater
+    }
+
+    /// Apply one pass of merged settings winners: values first, meta LAST.
+    ///
+    /// Audit #29: meta records the baseline of what was synced. Writing it
+    /// before the values leaves a crash window where meta says "the remote
+    /// winner is applied" while the value on disk is still the stale local one.
+    /// The next pass then sees a local value that differs from its baseline,
+    /// classifies it as a local edit, stamps it `edit_now` (the account's
+    /// highest timestamp) and uploads it - permanently reverting the remote
+    /// winner and self-healing toward the WRONG state. So every value write
+    /// happens first; any failure returns before meta is touched, and the next
+    /// pass simply re-applies the same remote winner.
+    ///
+    /// Audit #19: a failed `snippets_enabled` write aborts here too, so the
+    /// winner is never recorded in meta while the live store is stale (which
+    /// would make the next pass re-upload the old value with a higher
+    /// timestamp - a toggle that flips forever).
+    fn apply_merged(io: &SettingsIo, merged: &[SettingsItem]) -> Result<(), SyncError> {
+        let _lock = crate::sync::io_lock::io_lock_guard();
+        let mut meta = Self::load_meta_from(io.meta_path);
+        let activation_pending = meta.activation_baseline.is_some();
+        let mut settings =
+            (io.load_settings)().map_err(|e| SyncError::Fatal(format!("settings unreadable: {e}")))?;
+        // Live values observed NOW, read BEFORE this loop mutates `settings`.
+        // Compared against the pre-pass snapshot so an edit the user made during
+        // the GET→PUT window is not overwritten by a winner computed without it.
+        // Read failure yields an empty map, so `decide_settings_apply` sees
+        // "unobserved" and applies — i.e. exactly this platform's behaviour
+        // before the guard existed, never a new failure mode.
+        let live_now: HashMap<String, String> = Self::live_values_strict(&settings)
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_else(|e| {
+                log::error!("Settings mid-pass live read failed; applying winners unguarded: {e}");
+                HashMap::new()
+            });
+        let mut settings_changed = false;
+        let mut snippets_toggle: Option<bool> = None;
+        for item in merged {
+            if !(io.still_active)() {
+                return Ok(());
+            }
+            // Mid-pass edit guard. Deferring leaves `meta.keys` untouched, so
+            // the winner still beats its baseline next pass and the user's edit
+            // rides the following PUT instead of being clobbered.
+            if !Self::decide_settings_apply(
+                meta.pass_snapshot.as_ref().and_then(|m| m.get(&item.key)),
+                live_now.get(&item.key),
+            ) {
+                log::debug!(
+                    "sync: settings key {} changed during this pass; deferring the winner",
+                    item.key
+                );
+                continue;
+            }
+            let known = meta.keys.get(&item.key).cloned();
+            let is_newer = match known.as_ref() {
+                None => true,
+                Some(k) => Self::winner_beats_baseline(item, k),
+            };
+            if !is_newer {
+                continue;
+            }
+            if known.as_ref().map_or(true, |k| k.v != item.value) {
+                if let Some(enabled) = Self::apply_winner(&mut settings, &item.key, &item.value) {
+                    snippets_toggle = Some(enabled);
+                }
+                settings_changed = true;
+            }
+            meta.keys.insert(
+                item.key.clone(),
+                KeyMeta {
+                    v: item.value.clone(),
+                    t: item.updated_at,
+                    d: item.device_id.clone(),
+                },
+            );
+        }
+        // Values, in dependency order, BEFORE the baseline that claims they
+        // were applied.
+        if let Some(enabled) = snippets_toggle {
+            (io.apply_snippets_enabled)(enabled).map_err(|e| {
+                SyncError::Fatal(format!(
+                    "snippets_enabled={enabled} could not be persisted ({e}); winner NOT recorded"
+                ))
+            })?;
+        }
+        if settings_changed {
+            if !(io.still_active)() {
+                return Ok(());
+            }
+            (io.save_settings)(&settings).map_err(|e| {
+                SyncError::Fatal(format!(
+                    "settings values could not be persisted ({e}); baselines NOT advanced"
+                ))
+            })?;
+        }
+        if activation_pending {
+            meta.activation_baseline = None;
+        }
+        Self::save_meta_to(io.meta_path, &meta)
     }
 }
 
@@ -712,21 +1057,90 @@ impl DirtyStore for SettingsDirtyStore {
         let Ok(settings) = load_settings() else {
             return Vec::new();
         };
+        // Audit #15: `snippets_enabled` is one of the four values this pass
+        // stamps and uploads, and it lives in another local file. Reading it
+        // with `unwrap_or(false)` turned "the snippets store is unreadable"
+        // into "the user disabled snippets" - a value stamped with `edit_now`
+        // (the account's highest timestamp) and uploaded, so it wins LWW
+        // fleet-wide and silently switches snippet expansion off on every
+        // device. An unreadable store therefore emits NOTHING at all: no value
+        // is stamped, nothing is uploaded, and the next pass retries once the
+        // bytes are repaired (or quarantined, after which the read succeeds).
+        let live_values = match Self::live_values_strict(&settings) {
+            Ok(values) => values,
+            Err(e) => {
+                log::error!(
+                    "Settings pass emitting nothing: live values unreadable ({e}); \
+                     refusing to stamp or upload an unobserved setting"
+                );
+                return Vec::new();
+            }
+        };
         if meta.activation_baseline.is_some() {
-            if Self::activation_baseline_unchanged(&meta, &settings) {
+            let baseline = meta.activation_baseline.as_ref().expect("checked above");
+            if live_values
+                .iter()
+                .all(|(key, value)| baseline.get(key) == Some(value))
+            {
                 return Vec::new();
             }
             meta.activation_baseline = None;
+            // Audit #22: this write is a real atomic write against the shared
+            // per-account doc - take the io_lock the other writers hold.
+            let _io = crate::sync::io_lock::io_lock_guard();
             let _ = Self::save_meta(account_hash, &meta);
+        }
+        // Capture the pre-pass live values so `apply_merged` can tell "the user
+        // edited this key during the GET→PUT window" from "the value simply has
+        // not changed since we looked". Derived bookkeeping only; written under
+        // io_lock like every other writer of this shared per-account doc.
+        {
+            let mut with_snapshot = meta.clone();
+            with_snapshot.pass_snapshot = Some(
+                live_values
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+            let _io = crate::sync::io_lock::io_lock_guard();
+            // A failed snapshot write must NOT leave the previous pass's values
+            // on disk to be compared against forever. A stale snapshot makes a
+            // legitimate user edit look like a mid-pass edit, the winner is
+            // deferred, and since every later pass re-defers against the same
+            // never-updated snapshot, that setting stops syncing PERMANENTLY.
+            //
+            // Clearing the field on failure degrades to "no snapshot", which is
+            // exactly this platform's PRE-GUARD behaviour (`decide_settings_apply`
+            // fails open on a missing side) — i.e. we may clobber a mid-pass
+            // edit, which is what shipped before the guard existed and is not data
+            // loss. Deliberately not a pass-fatal: this is derived bookkeeping,
+            // and latching sync off over it would be a far worse outcome.
+            if let Err(e) = Self::save_meta(account_hash, &with_snapshot) {
+                log::warn!(
+                    "sync: failed to persist the settings pass snapshot ({e}); the \
+                     concurrent-edit guard is disabled until the next successful pass"
+                );
+                let mut cleared = with_snapshot.clone();
+                cleared.pass_snapshot = None;
+                let _ = Self::save_meta(account_hash, &cleared);
+            }
         }
         // Global preferences may still contain the previous account's values
         // immediately after sign-in. Baseline a new account without emitting
         // those values; a later user edit is detected against this baseline.
         if meta.keys.is_empty() {
             let mut seeded = SettingsMetaDoc::default();
-            for (key, value) in Self::live_values(&settings) {
-                seeded.keys.insert(key, KeyMeta { v: value, t: 0 });
+            for (key, value) in live_values {
+                seeded.keys.insert(
+                    key,
+                    KeyMeta {
+                        v: value,
+                        t: 0,
+                        d: String::new(),
+                    },
+                );
             }
+            let _io = crate::sync::io_lock::io_lock_guard();
             let _ = Self::save_meta(account_hash, &seeded);
             return Vec::new();
         }
@@ -741,7 +1155,7 @@ impl DirtyStore for SettingsDirtyStore {
         let (edit_now, _) = crate::sync::clock::monotonic_now(max_seen);
         let device_id = global_meta.device_id;
         let mut out = Vec::new();
-        for (key, live) in Self::live_values(&settings) {
+        for (key, live) in live_values {
             match meta.keys.get(&key) {
                 None => {
                     // First observation of a locally-set key: adopt it with sentinel 0 so remote wins.
@@ -750,6 +1164,7 @@ impl DirtyStore for SettingsDirtyStore {
                         value: live,
                         updated_at: 0,
                         device_id: device_id.clone(),
+                        deleted_at: None,
                     }]);
                 }
                 Some(known) if known.t == 0 && known.v == live => {
@@ -765,6 +1180,7 @@ impl DirtyStore for SettingsDirtyStore {
                         value: live,
                         updated_at: edit_now,
                         device_id: device_id.clone(),
+                        deleted_at: None,
                     });
                 }
                 Some(known) => {
@@ -773,6 +1189,7 @@ impl DirtyStore for SettingsDirtyStore {
                         value: known.v.clone(),
                         updated_at: known.t,
                         device_id: device_id.clone(),
+                        deleted_at: None,
                     });
                 }
             }
@@ -791,10 +1208,20 @@ impl DirtyStore for SettingsDirtyStore {
         let Ok(settings) = load_settings() else {
             return false;
         };
+        // Audit #15 + #6b: an unreadable snippets store must not read as
+        // "unchanged" - fail closed (dirty) so the pass never concludes
+        // "nothing to do" on a value it could not observe.
+        let live_values = match Self::live_values_strict(&settings) {
+            Ok(values) => values,
+            Err(e) => {
+                log::error!("Settings has_dirty failing closed (reporting dirty): {e}");
+                return true;
+            }
+        };
         if Self::activation_baseline_unchanged(&meta, &settings) {
             return false;
         }
-        Self::live_values(&settings)
+        live_values
             .iter()
             .any(|(key, live)| meta.keys.get(key).map_or(true, |known| known.v != *live))
     }
@@ -808,42 +1235,19 @@ impl DirtyStore for SettingsDirtyStore {
             return Ok(());
         }
         let _io = crate::sync::io_lock::io_lock_guard();
-        let mut meta = Self::load_meta(account_hash);
-        let activation_pending = meta.activation_baseline.is_some();
-        let mut settings_changed = false;
-        let mut settings = load_settings().map_err(|e| SyncError::Fatal(e.to_string()))?;
-        for item in merged {
-            if !Self::active_account_matches(account_hash) {
-                return Ok(());
-            }
-            let known = meta.keys.get(&item.key);
-            let is_newer = known.map_or(true, |k| item.updated_at > k.t);
-            if is_newer {
-                if known.map_or(true, |k| k.v != item.value) {
-                    Self::apply_winner(&mut settings, &item.key, &item.value);
-                    settings_changed = true;
-                }
-                meta.keys.insert(
-                    item.key.clone(),
-                    KeyMeta {
-                        v: item.value,
-                        t: item.updated_at,
-                    },
-                );
-            }
-        }
-        if activation_pending {
-            meta.activation_baseline = None;
-        }
-        Self::save_meta(account_hash, &meta)?;
-        if settings_changed {
-            if !Self::active_account_matches(account_hash) {
-                return Ok(());
-            }
-            crate::settings::save_settings(&settings)
-                .map_err(|e| SyncError::Fatal(e.to_string()))?;
-        }
-        Ok(())
+        let meta_path = Self::meta_path(account_hash);
+        let load_settings = || load_settings().map_err(|e| e.to_string());
+        let save_settings =
+            |settings: &AppSettings| crate::settings::save_settings(settings).map_err(|e| e.to_string());
+        let still_active = || Self::active_account_matches(account_hash);
+        let io = SettingsIo {
+            meta_path: &meta_path,
+            load_settings: &load_settings,
+            save_settings: &save_settings,
+            apply_snippets_enabled: &Self::set_snippets_enabled,
+            still_active: &still_active,
+        };
+        Self::apply_merged(&io, &merged)
     }
 }
 
@@ -928,7 +1332,17 @@ impl StatsDirtyStore {
     }
 
     fn load_rows() -> Vec<StatEventRow> {
-        Self::load_rows_strict().unwrap_or_default()
+        // Audit #6b: an unreadable ledger is NOT an empty ledger. Pure views
+        // (dashboard, gauges) have no error channel, so the failure is logged
+        // at error level instead of being swallowed - the write paths below
+        // still fail closed via `load_rows_strict`.
+        match Self::load_rows_strict() {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::error!("Stats ledger unreadable; view degraded to empty: {e:?}");
+                Vec::new()
+            }
+        }
     }
 
     /// Fallible ledger read. Missing file is a fresh ledger; corrupt bytes
@@ -948,27 +1362,47 @@ impl StatsDirtyStore {
     /// commit path. The event id is UUIDv5 of the history row id, so even a
     /// duplicated call (or a later backfill of the same row) collapses under
     /// union dedup. Safe offline: the event rides the next successful sync.
+    ///
+    /// Audit #20: this used to swallow the ledger write (`let _ = save_rows`).
+    /// A dictation event is NOT re-derivable from the ledger (its id is a
+    /// one-shot backfill UUID minted here), so a failed save drops it
+    /// permanently and silently. The fallible core returns the error and the
+    /// wrapper logs it loudly instead of pretending the event was recorded.
     pub fn record_dictation_event(
         history_id: &str,
         timestamp_ms: i64,
         text: &str,
         duration_ms: i64,
     ) {
+        if let Err(e) =
+            Self::record_dictation_event_checked(history_id, timestamp_ms, text, duration_ms)
+        {
+            log::error!(
+                "Dictation event {history_id} was NOT recorded (stats ledger write failed): {e}"
+            );
+        }
+    }
+
+    /// Fallible core of [`record_dictation_event`]. `Ok(false)` means the event
+    /// was already present (idempotent by construction), `Ok(true)` that it is
+    /// durably in the ledger.
+    pub(crate) fn record_dictation_event_checked(
+        history_id: &str,
+        timestamp_ms: i64,
+        text: &str,
+        duration_ms: i64,
+    ) -> Result<bool, SyncError> {
         let _io = crate::sync::io_lock::io_lock_guard();
         let item = StatsItem::from_history_row(history_id, timestamp_ms, text, duration_ms);
         // Fail closed on an unreadable ledger: appending to an empty read and
         // persisting it would replace the whole ledger with one event. The
         // corrupt bytes are preserved aside; skipping one event is the safe
         // trade (Phase E).
-        let mut rows = match Self::load_rows_strict() {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("Skipping dictation event; stats ledger unreadable: {e:?}");
-                return;
-            }
-        };
+        let mut rows = Self::load_rows_strict().map_err(|e| {
+            SyncError::Fatal(format!("stats ledger unreadable; event {history_id} skipped: {e:?}"))
+        })?;
         if rows.iter().any(|r| r.item.event_id == item.event_id) {
-            return; // idempotent by construction
+            return Ok(false); // idempotent by construction
         }
         rows.push(StatEventRow {
             item,
@@ -976,8 +1410,11 @@ impl StatsDirtyStore {
             dirty: true,
             ever_pushed: false,
         });
-        let _ = Self::save_rows(&rows);
+        // Audit #20: propagate. A dropped write here is a permanently lost,
+        // non-re-derivable dictation event.
+        Self::save_rows(&rows)?;
         Self::invalidate_activity_cache();
+        Ok(true)
     }
 
     /// One-time per-account seed: convert pre-existing history rows into
@@ -1400,9 +1837,19 @@ impl DirtyStore for StatsDirtyStore {
     }
 
     fn has_dirty(&self, account_hash: &str) -> bool {
-        Self::load_rows()
-            .iter()
-            .any(|r| r.account.as_deref() == Some(account_hash) && r.dirty)
+        // Audit #6b: fail closed. `load_rows().unwrap_or_default()` made a
+        // corrupt ledger report "clean, nothing to push", so a pass completed
+        // successfully and silently with no events in it - the exact shape of
+        // a user whose dictation history quietly stopped syncing.
+        match Self::load_rows_strict() {
+            Ok(rows) => rows
+                .iter()
+                .any(|r| r.account.as_deref() == Some(account_hash) && r.dirty),
+            Err(e) => {
+                log::error!("Stats has_dirty failing closed (reporting dirty): {e:?}");
+                true
+            }
+        }
     }
 
     fn save_merged(
@@ -1584,7 +2031,11 @@ impl DirtyStore for AgentDirtyStore {
             return Ok(0);
         }
         let _io = crate::sync::io_lock::io_lock_guard();
-        let mut store = crate::account_scope::load_account_agents(account_hash);
+        // Fail closed: an unusable account store must not be stamped as "no
+        // agents" and then saved back over the user's data. The error stops the
+        // domain and leaves the dirty rows for the next pass.
+        let mut store = crate::account_scope::load_account_agents_checked(account_hash)
+            .map_err(SyncError::Fatal)?;
         if store.custom_agents.iter().all(|e| !Self::is_dirty(e)) {
             return Ok(0);
         }
@@ -1632,10 +2083,13 @@ impl DirtyStore for AgentDirtyStore {
         if !crate::account_scope::valid_account_hash(account_hash) {
             return false;
         }
-        crate::account_scope::load_account_agents(account_hash)
-            .custom_agents
-            .iter()
-            .any(Self::is_dirty)
+        // Fail closed. `.any(is_dirty)` over a store that failed to read is
+        // empty, so it reported CLEAN and the domain silently skipped itself
+        // forever instead of surfacing a problem. True here routes to the
+        // reconcile, which refuses with the same error and keeps the rows dirty.
+        crate::account_scope::load_account_agents_checked(account_hash)
+            .map(|s| s.custom_agents.iter().any(Self::is_dirty))
+            .unwrap_or(true)
     }
 
     fn save_merged(
@@ -1658,7 +2112,11 @@ impl DirtyStore for AgentDirtyStore {
         // account writer holds `io_lock` too, so no mutation can interleave
         // between them. The lock is never held across network I/O - the pass
         // releases it before `put_scope` and re-takes it here.
-        let current = crate::account_scope::load_account_agents(account_hash).custom_agents;
+        // Fail closed — a reconcile over an empty view of an unusable store
+        // would persist the merge winners alone and delete everything else.
+        let current = crate::account_scope::load_account_agents_checked(account_hash)
+            .map_err(SyncError::Fatal)?
+            .custom_agents;
         let mut rows: Vec<crate::account_scope::AccountAgent> = Vec::with_capacity(current.len());
         for e in current {
             match merged.iter().find(|m| m.business_key == e.id) {
@@ -1796,7 +2254,9 @@ impl DirtyStore for StyleDirtyStore {
             return Ok(0);
         }
         let _io = crate::sync::io_lock::io_lock_guard();
-        let mut store = crate::account_scope::load_account_styles(account_hash);
+        // Fail closed — see AgentDirtyStore::stamp_account.
+        let mut store = crate::account_scope::load_account_styles_checked(account_hash)
+            .map_err(SyncError::Fatal)?;
         if store.custom_styles.iter().all(|e| !Self::is_dirty(e)) {
             return Ok(0);
         }
@@ -1837,10 +2297,10 @@ impl DirtyStore for StyleDirtyStore {
         if !crate::account_scope::valid_account_hash(account_hash) {
             return false;
         }
-        crate::account_scope::load_account_styles(account_hash)
-            .custom_styles
-            .iter()
-            .any(Self::is_dirty)
+        // Fail closed — see AgentDirtyStore::has_dirty.
+        crate::account_scope::load_account_styles_checked(account_hash)
+            .map(|s| s.custom_styles.iter().any(Self::is_dirty))
+            .unwrap_or(true)
     }
 
     fn save_merged(
@@ -1859,7 +2319,10 @@ impl DirtyStore for StyleDirtyStore {
         // `io_lock` critical section; every local account writer takes the
         // same lock, and it is never held across network I/O. The rule is
         // byte-identical to Android's, so both platforms converge.
-        let current = crate::account_scope::load_account_styles(account_hash).custom_styles;
+        // Fail closed — see AgentDirtyStore::save_merged.
+        let current = crate::account_scope::load_account_styles_checked(account_hash)
+            .map_err(SyncError::Fatal)?
+            .custom_styles;
         let mut rows: Vec<crate::account_scope::AccountStyle> = Vec::with_capacity(current.len());
         for e in current {
             match merged.iter().find(|m| m.business_key == e.id) {
@@ -4385,5 +4848,612 @@ mod dirty_lifecycle {
                 "vector 3: content equals the winner, so the winner is authoritative and the row goes clean"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Sync-audit regression tests (findings #4, #6, #15, #19, #20, #22, #29).
+//
+// Hermetic by construction: every test either redirects a store to a unique
+// temp path (`StatsDirtyStore::set_test_ledger_path`), drives a
+// path-parameterized core, or injects `SettingsIo` fakes. Nothing here reaches
+// `settings.json` - its path resolves through `dirs::data_local_dir()` and
+// IGNORES the test data-dir redirect, so touching it would write the real user
+// profile.
+// ===========================================================================
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// Truth table for the mid-pass settings guard.
+    ///
+    /// The guard exists because a user edit landing during the GET→PUT window
+    /// was silently destroyed: the edit is absent from `merged`, `meta.keys`
+    /// still holds the pre-edit baseline so the winner still "beats baseline",
+    /// the winner is applied over the edit, and the baseline then advances — no
+    /// dirty residue, no retry, no trace.
+    ///
+    /// The `false` case is the one that matters: `(Some, Some)` that DIFFER is
+    /// the mid-pass edit, and the only correct answer is "defer". Every
+    /// unobserved arm must be `true` (apply), because that is exactly this
+    /// platform's behaviour before the guard existed — never a new failure mode.
+    #[test]
+    fn decide_settings_apply_truth_table() {
+        let same = "fr".to_string();
+        let other = "de".to_string();
+        // Unchanged -> apply.
+        assert!(SettingsDirtyStore::decide_settings_apply(
+            Some(&same),
+            Some(&same)
+        ));
+        // Changed during the pass -> DEFER. This is the regression guard.
+        assert!(!SettingsDirtyStore::decide_settings_apply(
+            Some(&same),
+            Some(&other)
+        ));
+        // Unobserved on either side -> apply (pre-guard behaviour).
+        assert!(SettingsDirtyStore::decide_settings_apply(None, Some(&same)));
+        assert!(SettingsDirtyStore::decide_settings_apply(Some(&same), None));
+        assert!(SettingsDirtyStore::decide_settings_apply(None, None));
+    }
+
+
+    fn unique(tag: &str, ext: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fluence-audit-{}-{}-{}.{ext}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Remove a path and every `*.corrupt[.N]` sibling `read_json_file` may
+    /// have left behind while quarantining it.
+    fn wipe(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("json.corrupt.json"));
+        for n in 1..64u32 {
+            let p = path.with_extension(format!("json.corrupt.{n}.json"));
+            if !p.exists() {
+                break;
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    // ── #22: the fixed tmp filename ─────────────────────────────────────
+
+    #[test]
+    fn atomic_write_uses_a_unique_temp_name_per_call() {
+        // Audit #22: `path.with_extension("tmp")` is the settings.rs incident
+        // verbatim: two concurrent writers share one tmp, so one renames a file
+        // the other is still writing (truncated store on the destination).
+        let dir = unique("atomic-tmp", "d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings_sync_probe.json");
+
+        let first = super::atomic_tmp_path(&path);
+        let second = super::atomic_tmp_path(&path);
+
+        assert_ne!(
+            first, second,
+            "every atomic write needs its own temp file name"
+        );
+        assert_eq!(
+            first.parent(),
+            path.parent(),
+            "the temp must be a sibling of the destination so the rename stays same-volume atomic"
+        );
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(path.file_name().unwrap().to_string_lossy().as_ref()),
+            "the temp name must derive from the destination file name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_never_publish_a_partial_file() {
+        let dir = unique("atomic-race", "d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats_events.json");
+        // Big enough that a torn write is unmistakable.
+let payloads: Vec<String> = (0..8)
+            .map(|i| format!("[{i:04}]").to_string() + &"x".repeat(256 * 1024))
+            .collect();
+        let dest = &path;
+        std::thread::scope(|s| {
+            for payload in payloads.clone() {
+                s.spawn(move || {
+                    for _ in 0..3 {
+                        super::atomic_write(dest, &payload).expect("atomic write");
+                    }
+                });
+            }
+        });
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            payloads.iter().any(|p| p == &after),
+            "the destination must hold exactly one complete payload, never a \
+             partial one renamed over it"
+        );
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "stats_events.json")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "no temp file may be left behind: {strays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #6b: an unreadable local store must never read as empty/clean ────
+
+    #[test]
+    fn corrupt_dictionary_store_never_reports_a_clean_pass() {
+        let _guard = super::store_test_guard();
+        let hash = format!("audit-dict-{}", uuid::Uuid::new_v4());
+        let path = super::data_dir().join("dictionary.json");
+        let before = load_dictionary_internal().unwrap_or_default();
+
+        // A healthy store with one dirty row for this account.
+        let mut seeded = before.clone();
+        seeded.push(DictionaryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            spoken: "auditword".to_string(),
+            corrected: "audit corrected".to_string(),
+            kind: crate::dictionary::KIND_CORRECTION.to_string(),
+            created_at: Some(1_000),
+            deleted_at: None,
+            updated_at: Some(2_000),
+            device_id: Some("audit-device".to_string()),
+            is_enabled: true,
+            dirty: true,
+            ever_pushed: false,
+            sync_account: Some(hash.clone()),
+            sync_state: None,
+            server_file_id: None,
+            quarantine_reason: None,
+        });
+        save_dictionary_internal(&seeded).unwrap();
+        let store = DictionaryDirtyStore;
+        assert!(
+            store.has_dirty(&hash),
+            "precondition: a readable dirty row reports dirty"
+        );
+
+        // Audit #6b: the corruption is quarantined by the first read, so each
+        // assertion re-corrupts the file to get a fresh unreadable state.
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        assert!(
+            store.has_dirty(&hash),
+            "an UNREADABLE dictionary store must fail closed, never report clean \
+             (a clean report is a silent, successful pass with no data)"
+        );
+        assert!(
+            path.with_extension("json.corrupt.json").exists(),
+            "the evidence must be preserved, not deleted"
+        );
+
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        let err = store
+            .load_strict(&hash)
+            .expect_err("load must surface an unreadable store, not invent an empty one");
+        assert!(
+            matches!(err, SyncError::Fatal(_)),
+            "unreadable local state is Fatal, exactly like stamp_account: {err:?}"
+        );
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        assert!(
+            store.load(&hash).is_empty(),
+            "the infallible wrapper degrades to empty but has_dirty already \
+             reported dirty, so the pass cannot conclude 'nothing to do'"
+        );
+
+        save_dictionary_internal(&before).unwrap();
+        wipe(&path);
+    }
+
+    #[test]
+    fn corrupt_stats_ledger_never_reports_a_clean_pass() {
+        let _guard = super::store_test_guard();
+        let ledger = unique("audit-stats", "json");
+        StatsDirtyStore::set_test_ledger_path(Some(ledger.clone()));
+        let hash = format!("audit-stats-{}", uuid::Uuid::new_v4());
+
+        std::fs::write(&ledger, b"[[[ not a ledger").unwrap();
+        let store = StatsDirtyStore;
+        assert!(
+            store.has_dirty(&hash),
+            "an UNREADABLE stats ledger must fail closed: reporting clean \
+             completes a successful pass that silently drops every event"
+        );
+
+        std::fs::write(&ledger, b"[[[ not a ledger").unwrap();
+        let err = StatsDirtyStore::load_rows_strict()
+            .expect_err("the ledger read must surface corruption");
+        assert!(
+            matches!(
+                err,
+                crate::sync::recover::ReadError::Parse { .. }
+                    | crate::sync::recover::ReadError::Io(_)
+            ),
+            "unreadable ledger: {err:?}"
+        );
+        std::fs::write(&ledger, b"[[[ not a ledger").unwrap();
+        assert!(
+            StatsDirtyStore::load_rows().is_empty(),
+            "the pure view degrades to empty; it must never be a silent 'no data'"
+        );
+
+        StatsDirtyStore::set_test_ledger_path(None);
+        wipe(&ledger);
+    }
+
+    // ── #15: unreadable snippets store must not become snippets=false ────
+
+    #[test]
+    fn an_unreadable_snippets_store_emits_no_settings_items() {
+        let _guard = super::store_test_guard();
+        let hash = format!("audit-settings-{}", uuid::Uuid::new_v4());
+let snippets = super::data_dir().join("snippets.json");
+        std::fs::create_dir_all(super::data_dir()).expect("test data dir");
+        let meta_path = SettingsDirtyStore::meta_path(&hash);
+        let _ = std::fs::remove_file(&meta_path);
+        let original = std::fs::read(&snippets).ok();
+
+        // A healthy store with snippets ON, captured as the account baseline.
+        std::fs::write(&snippets, r#"{"enabled":true,"snippets":[]}"#).unwrap();
+        SettingsDirtyStore::activate_account(&hash).expect("capture baseline");
+        let meta = SettingsDirtyStore::load_meta(&hash);
+        assert_eq!(
+            meta.activation_baseline
+                .as_ref()
+                .and_then(|b| b.get("snippets_enabled"))
+                .map(String::as_str),
+            Some("true"),
+            "precondition: the baseline observed snippets_enabled=true"
+        );
+
+        // Audit #15: with the snippets store unreadable, the old
+        // `unwrap_or(false)` produced `snippets_enabled=false`, which the pass
+        // stamped with `edit_now` (the account's highest timestamp) and
+        // uploaded - winning LWW fleet-wide and disabling expansion everywhere.
+        std::fs::write(&snippets, b"{ unreadable snippets store {{").unwrap();
+        let items = SettingsDirtyStore.load(&hash);
+        assert!(
+            items.iter().all(|i| i.key != "snippets_enabled"),
+            "an unobserved value must never be emitted: {items:?}"
+        );
+        assert!(
+            items.is_empty(),
+            "nothing may be stamped or uploaded from an unreadable snippets \
+             store, not even the three keys that were readable: {items:?}"
+        );
+        let meta_after = SettingsDirtyStore::load_meta(&hash);
+        assert!(
+            !meta_after.keys.contains_key("snippets_enabled"),
+            "no baseline may be recorded for a value that was never observed"
+        );
+
+        match original {
+            Some(bytes) => std::fs::write(&snippets, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&snippets);
+            }
+        }
+        let _ = std::fs::remove_file(&meta_path);
+        wipe(&snippets);
+    }
+
+    // ── settings pass harness (injected io, never the real profile) ──────
+
+    struct FakeSettingsIo {
+        meta_path: PathBuf,
+        settings: RefCell<AppSettings>,
+        save_calls: Cell<usize>,
+        save_fails: Cell<bool>,
+        snippet_calls: RefCell<Vec<bool>>,
+        snippet_fails: Cell<bool>,
+    }
+
+    impl FakeSettingsIo {
+        fn new(tag: &str) -> Self {
+            let meta_path = unique(tag, "json");
+            let _ = std::fs::remove_file(&meta_path);
+            Self {
+                meta_path,
+                settings: RefCell::new(AppSettings::default()),
+                save_calls: Cell::new(0),
+                save_fails: Cell::new(false),
+                snippet_calls: RefCell::new(Vec::new()),
+                snippet_fails: Cell::new(false),
+            }
+        }
+
+/// Build a [`SettingsIo`] over this fake and run `f` with it. The closures
+        /// must live in one frame that outlives the borrow, so they are
+        /// created here rather than returned.
+        fn with_io<R>(&self, f: impl FnOnce(&SettingsIo) -> R) -> R {
+            let load_settings = || Ok(self.settings.borrow().clone());
+            let save_settings = |s: &AppSettings| {
+                self.save_calls.set(self.save_calls.get() + 1);
+                if self.save_fails.get() {
+                    Err("injected settings write failure".to_string())
+                } else {
+                    self.settings.replace(s.clone());
+                    Ok(())
+                }
+            };
+            let apply_snippets_enabled = |enabled: bool| {
+                self.snippet_calls.borrow_mut().push(enabled);
+                if self.snippet_fails.get() {
+                    Err("injected snippets write failure".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            let still_active = || true;
+            let io = SettingsIo {
+                meta_path: &self.meta_path,
+                load_settings: &load_settings,
+                save_settings: &save_settings,
+                apply_snippets_enabled: &apply_snippets_enabled,
+                still_active: &still_active,
+            };
+            f(&io)
+        }
+
+        fn meta(&self) -> SettingsMetaDoc {
+            SettingsDirtyStore::load_meta_from(&self.meta_path)
+        }
+
+        /// Record a last-synced baseline, i.e. "we already applied {v} at {t}
+        /// from device {d}".
+        fn seed_baseline(&self, key: &str, v: &str, t: i64, d: &str) {
+            let mut meta = self.meta();
+            meta.keys.insert(
+                key.to_string(),
+                KeyMeta {
+                    v: v.to_string(),
+                    t,
+                    d: d.to_string(),
+                },
+            );
+            SettingsDirtyStore::save_meta_to(&self.meta_path, &meta).expect("seed meta");
+        }
+
+        fn cleanup(&self) {
+            wipe(&self.meta_path);
+        }
+    }
+
+fn winner(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsItem {
+        SettingsItem {
+            key: key.to_string(),
+            value: value.to_string(),
+            updated_at,
+            device_id: device_id.to_string(),
+            deleted_at: None,
+        }
+    }
+
+    // ── #4: the winner test must be the merge's total order ──────────────
+
+    #[test]
+    fn settings_timestamp_tie_resolves_by_device_id() {
+let fake = FakeSettingsIo::new("tie-device");
+        fake.seed_baseline("language", "en", 1_000, "dev-a");
+
+        // Identical updatedAt, larger deviceId: `merge_settings` resolves this
+        // tie by deviceId, so `save_merged` must accept the same winner. The
+        // old strict `>` dropped it, and the two paths disagreed about who
+        // owned `language` - permanent divergence between two devices.
+        fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(io, &[winner("language", "fr", 1_000, "dev-b")])
+                .expect("tie resolved by deviceId")
+        });
+
+        assert_eq!(
+            fake.settings.borrow().language,
+            "fr",
+            "the merge's winner must be applied, not dropped"
+        );
+        let meta = fake.meta();
+        assert_eq!(meta.keys["language"].v, "fr");
+        assert_eq!(meta.keys["language"].t, 1_000);
+        assert_eq!(
+            meta.keys["language"].d, "dev-b",
+            "the baseline must remember the winning device so the next tie is \
+             comparable"
+        );
+        fake.cleanup();
+    }
+
+    #[test]
+    fn settings_full_tie_resolves_by_value() {
+        // Same updatedAt AND same deviceId: only the value separates them, and
+        // the canonical comparator (`cmp_settings_winner`, shared with
+        // `merge_settings` and Android) says the larger value wins.
+let fake = FakeSettingsIo::new("tie-value");
+        fake.seed_baseline("ai_polish_style", "dark", 2_000, "dev-a");
+        // Pin the comparator itself against the canonical order: equal time,
+        // equal device, LARGER value wins (`cmp_settings_winner`, the very
+        // comparator `merge_settings` folds with). "light" sorts after "dark".
+        assert!(
+            SettingsDirtyStore::winner_beats_baseline(
+                &winner("ai_polish_style", "light", 2_000, "dev-a"),
+                &KeyMeta {
+                    v: "dark".to_string(),
+                    t: 2_000,
+                    d: "dev-a".to_string(),
+                },
+            ),
+            "the canonical settings order says the larger value wins a full tie"
+        );
+        fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(io, &[winner("ai_polish_style", "light", 2_000, "dev-a")])
+                .expect("full tie resolved by value")
+        });
+        assert_eq!(
+            fake.settings.borrow().ai_polish_style,
+            "light",
+            "the larger value wins a total tie, exactly as merge_settings decides"
+        );
+        assert_eq!(fake.save_calls.get(), 1);
+        assert_eq!(fake.meta().keys["ai_polish_style"].v, "light");
+
+        // The mirror image: a smaller value on the same tie LOSES, so the live
+        // value and the baseline must both stay put.
+        let loser = FakeSettingsIo::new("tie-value-loser");
+        loser.seed_baseline("ai_polish_style", "light", 2_000, "dev-a");
+        loser.with_io(|io| {
+            SettingsDirtyStore::apply_merged(
+                io,
+                &[winner("ai_polish_style", "dark", 2_000, "dev-a")],
+            )
+            .expect("losing tie is a no-op")
+        });
+        assert_eq!(
+            loser.save_calls.get(),
+            0,
+            "a losing winner must not rewrite settings"
+        );
+        assert_eq!(loser.meta().keys["ai_polish_style"].v, "light");
+        assert_ne!(loser.settings.borrow().ai_polish_style, "dark");
+        fake.cleanup();
+        loser.cleanup();
+    }
+
+    // ── #29: values before baselines ─────────────────────────────────────
+
+    #[test]
+    fn a_failed_value_write_does_not_advance_the_meta_baseline() {
+        let fake = FakeSettingsIo::new("crash-window");
+        fake.seed_baseline("language", "en", 1_000, "dev-a");
+
+        // Audit #29: writing meta first means a crash between the two writes
+        // leaves meta claiming the remote winner while the value on disk is
+        // still the stale local one. The next pass then sees "local edit",
+        // stamps it `edit_now` and uploads it - reverting the remote winner
+        // for good, self-healing toward the wrong state.
+fake.save_fails.set(true);
+        let err = fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(io, &[winner("language", "fr", 2_000, "dev-b")])
+        });
+        let err = err.expect_err("a failed value write must surface");
+        assert!(matches!(err, SyncError::Fatal(_)), "{err:?}");
+
+        let meta = fake.meta();
+        assert_eq!(
+            meta.keys["language"].v, "en",
+            "meta must NOT record a winner whose value was never written"
+        );
+        assert_eq!(meta.keys["language"].t, 1_000);
+
+        // The next pass therefore re-applies the SAME remote winner rather
+        // than re-uploading the stale local value.
+fake.save_fails.set(false);
+        fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(io, &[winner("language", "fr", 2_000, "dev-b")])
+                .expect("retry re-applies the remote winner")
+        });
+        assert_eq!(fake.settings.borrow().language, "fr");
+        assert_eq!(fake.meta().keys["language"].v, "fr");
+        fake.cleanup();
+    }
+
+    // ── #19: a failed snippets write must not record the winner ───────────
+
+    #[test]
+    fn a_failed_snippets_write_does_not_record_the_winner_in_meta() {
+        let fake = FakeSettingsIo::new("snippets-write");
+        fake.seed_baseline("snippets_enabled", "false", 5_000, "dev-a");
+
+fake.snippet_fails.set(true);
+        let err = fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(
+                io,
+                &[winner("snippets_enabled", "true", 6_000, "dev-b")],
+            )
+        });
+        let err = err.expect_err("audit #19: the snippets save failure must propagate");
+        assert!(matches!(err, SyncError::Fatal(_)), "{err:?}");
+        assert_eq!(
+            fake.snippet_calls.borrow().clone(),
+            vec![true],
+            "the winner must actually have been attempted"
+        );
+        assert_eq!(
+            fake.save_calls.get(),
+            0,
+            "no further value writes may follow a failed one"
+        );
+        let meta = fake.meta();
+        assert_eq!(
+            meta.keys["snippets_enabled"].v, "false",
+            "recording the winner while the live store is stale makes the next \
+             pass re-upload the OLD value with a higher timestamp - a toggle \
+             that flips forever"
+        );
+        assert_eq!(meta.keys["snippets_enabled"].t, 5_000);
+
+        // Once the store is writable the toggle converges instead of flipping.
+fake.snippet_fails.set(false);
+        fake.with_io(|io| {
+            SettingsDirtyStore::apply_merged(
+                io,
+                &[winner("snippets_enabled", "true", 6_000, "dev-b")],
+            )
+            .expect("retry applies the winner")
+        });
+        assert_eq!(fake.meta().keys["snippets_enabled"].v, "true");
+        fake.cleanup();
+    }
+
+    // ── #20: a failed ledger save must not drop a dictation event ─────────
+
+    #[test]
+    fn a_failed_ledger_save_is_never_silently_dropped() {
+        let _guard = super::store_test_guard();
+        // A regular FILE where a directory must be: every write into this
+        // ledger path fails, while the read still reports "no ledger yet".
+        let blocker = unique("ledger-blocked", "bin");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let ledger = blocker.join("nested").join("stats_events.json");
+        StatsDirtyStore::set_test_ledger_path(Some(ledger.clone()));
+
+        // Audit #20: `let _ = Self::save_rows(&rows)` dropped the event for
+        // good. A dictation event is not re-derivable - its id is a one-shot
+        // backfill UUID - so this is permanent, silent data loss.
+        let err = StatsDirtyStore::record_dictation_event_checked("audit-row", 1_000, "hi", 500)
+            .expect_err("a failed ledger save must surface, not vanish");
+        assert!(
+            matches!(err, SyncError::Fatal(_)),
+            "a dictation event must never be dropped silently: {err:?}"
+        );
+        assert!(
+            !ledger.exists(),
+            "no partial ledger may be written when the save fails"
+        );
+
+        // The public wrapper (what history.rs calls) stays infallible but must
+        // not panic and must not fabricate a ledger.
+        StatsDirtyStore::record_dictation_event("audit-row", 1_000, "hi", 500);
+        assert!(
+            !ledger.exists(),
+            "the infallible wrapper must not paper over the failure"
+        );
+
+        StatsDirtyStore::set_test_ledger_path(None);
+        let _ = std::fs::remove_file(&blocker);
     }
 }

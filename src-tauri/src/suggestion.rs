@@ -126,7 +126,16 @@ fn load_from_disk() -> Result<SuggestionDatabase> {
 /// Writes to .tmp file first, then renames to prevent corruption.
 fn save_to_disk(database: &SuggestionDatabase) -> Result<()> {
     let path = suggestions_path();
-    let tmp_path = path.with_extension("json.tmp");
+    // Unique tmp, matching `settings::save_settings` / `agents::save_store`.
+    // A FIXED name let two writers collide on one tmp and rename a partially
+    // written file onto the destination.
+    let tmp_path = {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+        PathBuf::from(name)
+    };
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -137,10 +146,13 @@ fn save_to_disk(database: &SuggestionDatabase) -> Result<()> {
     // Write to temp file
     fs::write(&tmp_path, &data)?;
 
-    // Flush to disk (best-effort: Windows denies sync on read-only handles,
-    // so a sync failure must never fail the save - matches dictionary.rs,
-    // settings.rs, snippets.rs and audit_evidence.rs).
-    if let Ok(f) = fs::File::open(&tmp_path) {
+    // Flush to disk. The handle must be opened for WRITE: the previous
+    // `fs::File::open` is O_RDONLY, and on Windows `sync_all` maps to
+    // `FlushFileBuffers`, which requires `GENERIC_WRITE` — so the old code
+    // performed NO flush at all. The earlier comment blamed antivirus software;
+    // that was the wrong diagnosis for a deterministic no-op.
+    // Still best-effort (non-fatal) so a flush failure can never fail the save.
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp_path) {
         let _ = f.sync_all();
     }
 

@@ -231,11 +231,41 @@ mod sys {
         }
         match serde_json::to_string(st) {
             Ok(data) => {
-                let tmp = path.with_extension("json.tmp");
+                // Unique tmp per writer, matching `settings::save_settings` and
+                // `account_scope::write_json`. A FIXED `<store>.json.tmp` let two
+                // writers both write the same tmp and both rename it, so the loser
+                // renamed a tmp the winner had already consumed — or a PARTIALLY
+                // written one — onto the destination. Audit #22 fixed the files
+                // it happened to touch; this one was missed by a search whose
+                // regex required a LEADING dot and so never matched
+                // `with_extension("json.tmp")`.
+                let tmp = {
+                    static TMP_SEQ: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut name = path.as_os_str().to_os_string();
+                    name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+                    std::path::PathBuf::from(name)
+                };
                 if std::fs::write(&tmp, data).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
+                    // Flush via a WRITE handle, like every other writer in the
+                    // tree. `File::open` is O_RDONLY and on Windows `sync_all`
+                    // maps to `FlushFileBuffers`, which needs `GENERIC_WRITE`, so
+                    // the read-only form is a guaranteed no-op. Best-effort and
+                    // non-fatal, so a flush failure can never fail the save.
+                    if let Ok(f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&tmp)
+                    {
+                        let _ = f.sync_all();
+                    }
+                    if std::fs::rename(&tmp, &path).is_err() {
+                        log::warn!("ducking: failed to rename sidecar temp file");
+                        let _ = std::fs::remove_file(&tmp);
+                    }
                 } else {
                     log::warn!("ducking: failed to write sidecar temp file");
+                    let _ = std::fs::remove_file(&tmp);
                 }
             }
             Err(e) => log::warn!("ducking: sidecar serialize failed: {e}"),
