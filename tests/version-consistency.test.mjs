@@ -44,3 +44,47 @@ test('all four version declarations agree', () => {
   const v = Object.values(versions)[0];
   assert.match(v, /^\d+\.\d+\.\d+$/, `version must be semver-ish, got ${v}`);
 });
+
+// Release notes exist in exactly ONE place (.github/RELEASE_BODY.md). An
+// earlier state had the same narrative duplicated inline in release.yml,
+// so editing one left the other publishing stale prose — and a HARD
+// coded future tag would re-publish this release's story by accident.
+// There must be no inline narrative block and no "keep in sync" contract.
+test('release notes have a single source of truth', () => {
+  const workflow = readFileSync(
+    join(root, '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  const bodyFile = readFileSync(join(root, '.github', 'RELEASE_BODY.md'), 'utf8');
+
+  assert.match(
+    workflow,
+    /releaseBody:\s*\$\{\{\s*steps\.notes\.outputs\.body\s*\}\}/,
+    'releaseBody must come from the notes-extraction step',
+  );
+  assert.ok(
+    workflow.includes('.github/RELEASE_BODY.md'),
+    'workflow must name the single source file',
+  );
+  assert.ok(
+    !workflow.includes("releaseBody: |"),
+    'releaseBody must not carry an inline narrative block',
+  );
+  const narrativeSentinel = 'public build of the sync reliability work';
+  const narrativeCount =
+    (workflow.split(narrativeSentinel).length - 1) +
+    (bodyFile.split(narrativeSentinel).length - 1);
+  assert.equal(
+    narrativeCount,
+    1,
+    'specific release narrative must appear exactly once across workflow + notes',
+  );
+  assert.ok(
+    !workflow.includes('Keep in sync'),
+    'no dual-copy contract: editors must only touch RELEASE_BODY.md',
+  );
+  assert.ok(
+    bodyFile.includes('steps:notes') || workflow.includes('id: notes'),
+    'notes file references or workflow declares the extraction step id',
+  );
+});

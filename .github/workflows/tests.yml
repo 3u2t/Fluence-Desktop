@@ -46,8 +46,13 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned by SHA as required by release.yml's pin policy; the explicit
+      # toolchain pins the compiler to the version validated locally
+      # (rustc 1.97.1), so CI results mean the same thing as dev runs.
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.97.1"
 
       - name: fetch moonshine v2 vendor bundle
         shell: pwsh

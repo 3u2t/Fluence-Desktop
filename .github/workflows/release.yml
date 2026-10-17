@@ -27,8 +27,14 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned by SHA (matching the pin policy above); the explicit
+      # toolchain pins the compiler to the version validated locally
+      # (rustc 1.97.1) so release artifacts and test results come from the
+      # same compiler the dev tree is validated with.
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.97.1"
 
       # Moonshine v2 sidecar (experiment branch, opt-in engines only).
       # Fetches the official prebuilt C++ core + ONNX Runtime and verifies
@@ -125,6 +131,22 @@ jobs:
           npm test --prefix web
           pwsh -File tests/verify-security.ps1
 
+      # Release notes live in exactly one place (.github/RELEASE_BODY.md,
+      # the file reviewers read first). Publishing extracts them verbatim
+      # at tag-push time with a heredoc output, so a future tag can never
+      # publish this release's narrative by accident — it publishes
+      # whatever that file contains when the tag lands.
+      - name: prepare release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $body = Get-Content -LiteralPath .github/RELEASE_BODY.md -Raw
+          if ([string]::IsNullOrWhiteSpace($body)) {
+            throw ".github/RELEASE_BODY.md is empty: refusing to publish notes-less release"
+          }
+          $heredoc = "body<<EOF_MULTI`n" + $body + "`nEOF_MULTI"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $heredoc
+
       - name: build and release
         uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
         env:
@@ -135,58 +157,6 @@ jobs:
           projectPath: src-tauri
           tagName: v__VERSION__
           releaseName: 'Fluence v__VERSION__'
-          # Keep in sync with .github/RELEASE_BODY.md (the reviewable
-          # template): update both for every release body change.
-          releaseBody: |
-            ## Sync reliability release
-
-            A deep audit of the cloud sync engine turned up several bugs that
-            could quietly lose your data or leave sync silently broken. All of
-            them are fixed here.
-
-            > **Why this is v1.27.1:** the `v1.27.0` tag was cut from the same
-            > code but never produced a download. Its release pipeline stopped
-            > at its own test gate before anything was built or published, and a
-            > regression test for these very fixes was the step that failed.
-            > Nothing was ever released under `v1.27.0`, so this is the first
-            > public build of the sync reliability work.
-
-            ### Data safety
-
-            - **A corrupt snippet file can no longer delete your other snippets.**
-              If one cloud file failed to parse, it could be treated as valid and
-              the readable copy beside it removed. That is fixed.
-            - **Turning a setting off now sticks.** Changing any other setting
-              could silently switch sync back on, and it only revealed itself
-              after a restart. Fixed.
-            - **Your custom Agents and Styles are protected.** A damaged store
-              used to read as "you have none", and your next edit overwrote the
-              real file. Writes now refuse to touch an account store they could
-              not read.
-            - **Edits made while sync was running are no longer discarded.** A
-              setting you changed mid-sync could be overwritten with no trace.
-              It is now deferred and carried to the next sync instead.
-            - **Saving is genuinely durable now.** Every store flush was writing
-              through a read-only handle, so the flush silently did nothing. Ten
-              call sites fixed, and eight files that could be corrupted by two
-              concurrent writers now write through uniquely named temporary files.
-
-            ### Cloud sync correctness
-
-            - **Sync stops immediately if the signed-in account does not match
-              the account on file**, instead of quietly switching you to a
-              different account in the background.
-            - **Duplicate cloud files are now merged instead of ignored.**
-            - **Rate limits are respected.** If Google asks us to wait, we wait,
-              instead of retrying every minute against an exhausted quota.
-            - **Sync no longer gets stuck** on a slow or unresponsive connection.
-
-            ### For the technical minded
-
-            The sync wire format is unchanged and still compatible with previous
-            releases - same envelope version, same folders, same conflict
-            resolution rules. All fixes are in how this client reads, merges and
-            writes those files, so you can upgrade and downgrade freely and your
-            data stays readable either way.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false

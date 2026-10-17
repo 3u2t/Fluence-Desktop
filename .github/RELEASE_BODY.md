@@ -1,34 +1,56 @@
-# Release notes template
+<!-- Release notes convention: this file ALWAYS contains the notes the next
+     pushed tag publishes. release.yml reads it verbatim into `releaseBody`
+     (steps:notes), so there is exactly one copy — edit here, never in the
+     workflow. Never add secrets, internal hostnames, or model URLs not
+     already pinned by digest in src-tauri/moonshine-v2-server/VENDOR.json. -->
 
-`release.yml` publishes its `releaseBody` for the tagged version. Keep this
-file and the inline block in `.github/workflows/release.yml` semantically in
-sync — this markdown is the reviewable copy reviewers read first, without
-sifting through the workflow YAML.
+## Sync reliability release
 
-Copy the template below and edit it per release. Never add release notes that
-contain secrets, internal hostnames, or model download URLs that are not
-already pinned by digest in `src-tauri/moonshine-v2-server/VENDOR.json`.
+A deep audit of the cloud sync engine turned up several bugs that
+could quietly lose your data or leave sync silently broken. All of
+them are fixed here.
 
----
-
-```markdown
-## <headline for this release>
-
-<2-3 sentence plain-language summary of what changed and why it matters.>
-
-> **Why this is vX.Y.Z:** <one line explaining renamed/rereleased versions,
-> if applicable; drop for a clean version jump.>
+> **Why this is v1.27.1:** the `v1.27.0` tag was cut from the same
+> code but never produced a download. Its release pipeline stopped
+> at its own test gate before anything was built or published, and a
+> regression test for these very fixes was the step that failed.
+> Nothing was ever released under `v1.27.0`, so this is the first
+> public build of the sync reliability work.
 
 ### Data safety
 
-- **<User-visible data-safety fix, in user terms>**
+- **A corrupt snippet file can no longer delete your other snippets.**
+  If one cloud file failed to parse, it could be treated as valid and
+  the readable copy beside it removed. That is fixed.
+- **Turning a setting off now sticks.** Changing any other setting
+  could silently switch sync back on, and it only revealed itself
+  after a restart. Fixed.
+- **Your custom Agents and Styles are protected.** A damaged store
+  used to read as "you have none", and your next edit overwrote the
+  real file. Writes now refuse to touch an account store they could
+  not read.
+- **Edits made while sync was running are no longer discarded.** A
+  setting you changed mid-sync could be overwritten with no trace.
+  It is now deferred and carried to the next sync instead.
+- **Saving is genuinely durable now.** Every store flush was writing
+  through a read-only handle, so the flush silently did nothing. Ten
+  call sites fixed, and eight files that could be corrupted by two
+  concurrent writers now write through uniquely named temporary files.
 
-### <Feature-area section, e.g. Cloud sync correctness>
+### Cloud sync correctness
 
-- **<Fix or change, one bullet each, user orientation>**
+- **Sync stops immediately if the signed-in account does not match
+  the account on file**, instead of quietly switching you to a
+  different account in the background.
+- **Duplicate cloud files are now merged instead of ignored.**
+- **Rate limits are respected.** If Google asks us to wait, we wait,
+  instead of retrying every minute against an exhausted quota.
+- **Sync no longer gets stuck** on a slow or unresponsive connection.
 
 ### For the technical minded
 
-<One short paragraph: on-disk/wire compatibility, and where a security
-reviewer can find the hardening changes (e.g. CLAUDE-AUDIT.md or PR link).>
-```
+The sync wire format is unchanged and still compatible with previous
+releases - same envelope version, same folders, same conflict
+resolution rules. All fixes are in how this client reads, merges and
+writes those files, so you can upgrade and downgrade freely and your
+data stays readable either way.
