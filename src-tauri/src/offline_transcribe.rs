@@ -497,12 +497,15 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn ASR server: {}", e))?;
-        // Private handshake: pipe the fresh token, then close stdin. If the
-        // pipe fails, kill the sidecar and fail the start instead of
-        // entering a half-secret state.
+        // Private handshake: pipe the fresh token as ONE newline-terminated
+        // line, then close stdin. The sidecar reads it with `read_line` and
+        // trims CR/LF, so the terminator is the actual protocol — do not rely
+        // on the pipe reaching EOF to complete the line. If the pipe fails,
+        // kill the sidecar and fail the start instead of entering a
+        // half-secret state.
         if let (Some(token), Some(mut stdin)) = (spawn_token.as_deref(), child.stdin.take()) {
             if let Err(e) = stdin
-                .write_all(token.as_bytes())
+                .write_all(format!("{token}\n").as_bytes())
                 .and_then(|_| stdin.flush())
             {
                 log::error!("Failed to pipe auth token to ASR sidecar: {}", e);
