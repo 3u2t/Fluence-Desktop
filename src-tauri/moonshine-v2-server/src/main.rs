@@ -4,19 +4,25 @@
 // SAME localhost WebSocket protocol as the sherpa-onnx sidecar, so the main
 // app needs no protocol changes:
 //
-//   client -> server: binary [u32LE sample_rate][u32LE byte_len][f32 ...]
+//   client -> server: binary [32-byte auth token][u32LE sample_rate][u32LE
+//                     byte_len][f32 ...]  (token == the --auth-token value)
 //   server -> client: text {"text": "..."} (or raw text)
 //   client -> server: text "Done", then close
 //
 // Whole-utterance mode only (`moonshine_transcribe_without_streaming`):
 // the app UI never shows live partials.
 //
-// CLI: moonshine-v2-server --port=6006 --model-dir=<8 .ort/bin/json files>
-//      --arch=small|medium
+// CLI: moonshine-v2-server --port=6006 --auth-token=<hex> --model-dir=... --arch=small|medium
+//      --auth-token is REQUIRED: the socket is localhost-only, but any local
+//      process (another user session's process, a hostile webview page)
+//      could connect to it otherwise. The app generates a fresh uuid per
+//      spawn and the sidecar refuses connections without the matching
+//      32-byte token; no token value is ever logged.
 
 use futures_util::{SinkExt, StreamExt};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -24,6 +30,23 @@ use tokio::sync::Mutex;
 const MOONSHINE_HEADER_VERSION: i32 = 30000;
 const ARCH_SMALL_STREAMING: u32 = 4;
 const ARCH_MEDIUM_STREAMING: u32 = 5;
+
+/// Required first bytes of every client audio payload (= "--auth-token=").
+const TOKEN_LEN: usize = 32;
+
+/// Max concurrent client connections. Each connection is one utterance,
+/// so 2 covers overlapping UI flows while bounding per-session memory.
+const MAX_CONCURRENT: usize = 2;
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Wall socket for guarding the connection counter. Decrements once when the
+/// task ends (success, error, or panic).
+struct ConnSlot;
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// One transcript line. Only `text` (offset 0) is read; the remaining fields
 /// replicate the C layout so array indexing strides correctly. A unit test
@@ -192,13 +215,23 @@ fn parse_arg(prefix: &str) -> Option<String> {
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     transcriber: Arc<Transcriber>,
+    token: String,
 ) -> Result<(), String> {
-    let mut ws = tokio_tungstenite::accept_async(stream)
+    // Bound message sizes: a 10-minute utterance at 16 kHz f32 is ~38.4 MB;
+    // 64 MB refuses memory bombs without ever clipping legitimate audio.
+    let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(64 * 1024 * 1024),
+        max_frame_size: Some(64 * 1024 * 1024),
+        ..Default::default()
+    };
+    let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(cfg))
         .await
         .map_err(|e| format!("websocket accept failed: {e}"))?;
 
     // One utterance per connection: binary payload, then text result.
-    let payload = loop {
+    // The first MESSAGE must carry the spawn-shared auth token (32 bytes)
+    // ahead of the [rate][len] header; anything else is refused.
+    let full = loop {
         match ws.next().await {
             Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => break data,
             Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return Ok(()),
@@ -207,6 +240,10 @@ async fn handle_connection(
             None => return Ok(()),
         }
     };
+    if full.len() < TOKEN_LEN + 8 || full[0..TOKEN_LEN] != token.as_bytes()[0..TOKEN_LEN] {
+        return Err("unauthorized: missing or invalid auth token".to_string());
+    }
+    let payload = full[TOKEN_LEN..].to_vec();
     if payload.len() < 8 {
         return Err("payload too short for [rate][len] header".to_string());
     }
@@ -278,6 +315,16 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // No value is logged: the token exists to keep other local processes
+    // away from the transcript channel.
+    let token = parse_arg("--auth-token=").unwrap_or_else(|| {
+        eprintln!("missing --auth-token=TOKEN (always needed when spawned by the app)");
+        std::process::exit(2);
+    });
+    if token.len() < TOKEN_LEN {
+        eprintln!("invalid --auth-token (expected at least {TOKEN_LEN} chars)");
+        std::process::exit(2);
+    }
 
     eprintln!("moonshine-v2-server: loading arch {arch} from {model_dir}");
     let transcriber = match Transcriber::load(&model_dir, arch) {
@@ -298,9 +345,16 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) >= MAX_CONCURRENT {
+                    eprintln!("moonshine-v2-server: connection refused: at capacity");
+                    continue; // drops the stream immediately
+                }
                 let transcriber = transcriber.clone();
+                let token = token.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, transcriber).await {
+                    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+                    let _slot = ConnSlot;
+                    if let Err(e) = handle_connection(stream, transcriber, token).await {
                         eprintln!("moonshine-v2-server: connection error: {e}");
                     }
                 });

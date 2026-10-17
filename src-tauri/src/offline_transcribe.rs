@@ -80,6 +80,9 @@ struct ServerInstance {
     child: Child,
     port: u16,
     engine: OfflineEngine,
+    // Loopback shared secret handed to our moonshine sidecar at spawn.
+    // None for the sherpa sidecar (which predates the token protocol).
+    auth_token: Option<String>,
 }
 static SERVER_INSTANCE: Lazy<Mutex<Option<ServerInstance>>> = Lazy::new(|| Mutex::new(None));
 static LAST_USED: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
@@ -378,6 +381,8 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
 
     let port_arg = format!("--port={}", port);
     let threads_arg = "--num-threads=3".to_string();
+    // Populated by the moonshine branch below; None for the sherpa sidecar.
+    let mut spawn_token: Option<String> = None;
 
     let mut cmd = Command::new(&exe_path);
     cmd.current_dir(&offline_dir);
@@ -398,7 +403,16 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
             let arch = engine.v2_arch().unwrap_or("small");
             let model_dir_arg = format!("--model-dir={}", offline_dir.display());
             let arch_arg = format!("--arch={arch}");
-            cmd.args([&model_dir_arg, &arch_arg, &port_arg]);
+            // Fresh shared secret per spawn: the sidecar binds localhost,
+            // which means ANY local process can attempt to connect; the
+            // token (sent with each utterance) keeps stray processes from
+            // receiving transcripts. No secret in logs.
+            spawn_token = Some(uuid::Uuid::new_v4().simple().to_string());
+            let token_arg = format!(
+                "--auth-token={}",
+                spawn_token.as_deref().unwrap_or_default()
+            );
+            cmd.args([&model_dir_arg, &arch_arg, &port_arg, &token_arg]);
         }
     }
 
@@ -411,6 +425,7 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
             child,
             port,
             engine,
+            auth_token: spawn_token,
         });
         *LAST_USED.lock().unwrap() = Instant::now();
     }
@@ -459,6 +474,15 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
     let port = ensure_server_running(engine).await?;
     *LAST_USED.lock().unwrap() = Instant::now();
 
+    // Copy the spawn-shared auth token for this engine instance (None for
+    // sherpa). Guarded by the same engine check the server lookup implies.
+    let auth_token = {
+        let lock = SERVER_INSTANCE.lock().unwrap();
+        lock.as_ref()
+            .filter(|i| i.engine == engine)
+            .and_then(|i| i.auth_token.clone())
+    };
+
     let url = format!("ws://127.0.0.1:{}", port);
     let (mut ws_stream, _) = tokio::time::timeout(
         Duration::from_secs(10),
@@ -472,7 +496,13 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
     // Format: [int32LE sample_rate][int32LE num_audio_bytes][float32 samples...]
     let sample_rate = 16000u32;
     let byte_len = (samples.len() * 4) as u32;
-    let mut payload = Vec::with_capacity(8 + samples.len() * 4);
+    // The moonshine sidecar requires the spawn-shared token as the first
+    // bytes of the binary payload; sherpa (no token) keeps the bare header.
+    let token_len = auth_token.as_deref().map(str::len).unwrap_or(0);
+    let mut payload = Vec::with_capacity(token_len + 8 + samples.len() * 4);
+    if let Some(token) = auth_token.as_deref() {
+        payload.extend_from_slice(token.as_bytes());
+    }
     payload.extend_from_slice(&sample_rate.to_le_bytes());
     payload.extend_from_slice(&byte_len.to_le_bytes());
     for &sample in samples {
