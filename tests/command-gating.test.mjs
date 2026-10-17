@@ -46,7 +46,7 @@ function gateFor(file, fn) {
   const start = srcText.indexOf(`fn ${fn}(`);
   assert.notEqual(start, -1, `${file}: ${fn} not found`);
   const region = srcText.slice(start, start + 900);
-  const gateIdx = region.indexOf('crate::acl::require_caller(&window');
+  const gateIdx = region.search(/require_caller\(\s*&window/);
   assert.notEqual(gateIdx, -1, `${file}: ${fn} has no require_caller gate`);
   const rest = region.slice(gateIdx);
   const end = rest.indexOf(';');
@@ -76,10 +76,10 @@ test('no accidental empty allow-lists', () => {
   for (const file of files) {
     const text = src(file);
     assert.ok(
-      text.includes('crate::acl::require_caller(&window'),
+      /\brequire_caller\(\s*&window/.test(text),
       `${file} should contain gated commands`,
     );
-    assert.ok(!text.includes('&[]'), `${file}: empty allow-list found`);
+    assert.ok(!/\&\[\s*\]/.test(text), `${file}: empty allow-list found`);
   }
 });
 
