@@ -95,6 +95,30 @@ test('destructive agent actions require confirmation before execution', () => {
     overlay.includes("AGENT_DANGEROUS_ACTIONS = new Set(['delete_chars', 'select_all', 'submit'])"),
   );
   assert.ok(overlay.includes('requestActionConfirmation'));
-  assert.ok(overlay.includes('prepareForegroundForInjection'));
-  assert.ok(overlay.includes('reshowOverlayForSession'));
+});
+
+// The overlay window is created with "focus": false (WS_EX_NOACTIVATE,
+// tauri.conf.json): clicks on it never move the OS foreground window, so
+// there is nothing to "restore" before injecting, and hiding the overlay
+// first would only hide the recovery UI. Injections run against the
+// still-foreground target, whose identity Inject already fail-closed-validates.
+test('overlay never hides itself to hand back foreground before injecting', () => {
+  assert.ok(
+    !overlay.includes('prepareForegroundForInjection'),
+    'focus-transfer helper must stay removed',
+  );
+  assert.ok(
+    !overlay.includes('reshowOverlayForSession'),
+    'reshow helper was only needed by the removed hide dance',
+  );
+  const execute = bodyOf(overlay, 'async function attemptKeyboardAction');
+  const recovery = overlay.indexOf('function setupPasteRecovery');
+  const windowAroundInjection = overlay.slice(
+    execute,
+    recovery > 0 ? recovery : overlay.length,
+  );
+  assert.ok(
+    !windowAroundInjection.includes("invoke('hide_overlay')"),
+    'injection/retry paths must not hide the overlay',
+  );
 });

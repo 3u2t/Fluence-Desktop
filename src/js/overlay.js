@@ -861,27 +861,14 @@ async function attemptKeyboardAction(action, charCount) {
   );
 }
 
-// Clicking Confirm/Retry/copy hands focus to the overlay window; SendInput
-// reaches only the foreground window. Hide the overlay so the OS hands
-// focus back to the recording target before any keys are sent (150ms
-// matches observed focus-restore latency for hidden windows).
-async function prepareForegroundForInjection(sessionId) {
-  if (!isSessionActive(sessionId)) throw new Error('Session ended');
-  await invoke('hide_overlay').catch(() => {});
-  await new Promise((r) => setTimeout(r, 150));
-  if (!isSessionActive(sessionId)) throw new Error('Session ended');
-}
-
-async function reshowOverlayForSession(sessionId) {
-  if (!isSessionActive(sessionId)) return;
-  const position = (cachedSettings || {}).overlay_position || 'bottom_right';
-  try {
-    await invoke('show_overlay', { position });
-    if (overlayRoot) overlayRoot.classList.add('active');
-  } catch {
-    // Window stays hidden; the transcript remains recoverable from history.
-  }
-}
+// Clicking Confirm/Retry/copy does NOT move the foreground window: the
+// overlay window is configured with "focus": false (WS_EX_NOACTIVATE,
+// tauri.conf.json), so the recording target keeps OS focus and SendInput
+// reaches it directly. Hiding the overlay first — the approach used for
+// focusable windows — would only add latency and a window of lost UI, so
+// injection runs while the overlay stays visible: failures stay recoverable
+// (Copy/Retry below) and success states remain readable. Target validation
+// (fail-closed on a changed foreground) lives inside the inject_* commands.
 
 function showCopy() {
   const btn = document.getElementById('status-copy');
@@ -917,7 +904,6 @@ async function retryPendingInjection(sessionId) {
   hideCopy();
   setStatusMessage('');
   try {
-    await prepareForegroundForInjection(sessionId);
     if (pending.kind === 'text') {
       await attemptPaste(pending.text, pending.monitorAutoLearn);
     } else {
@@ -933,9 +919,6 @@ async function retryPendingInjection(sessionId) {
   } catch (err) {
     console.error('Paste retry failed:', err);
     await handlePasteFailure(pending, err, sessionId);
-    // The overlay window was hidden to restore foreground focus; bring the
-    // recovery UI back so Retry/Copy stay reachable.
-    await reshowOverlayForSession(sessionId);
   }
 }
 
@@ -1435,10 +1418,9 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
 
       let executed = false;
       try {
-        // A click on the confirmation panel hands focus to the overlay;
-        // SendInput only reaches the foreground window, so the overlay is
-        // hidden first to return focus to the target application.
-        await prepareForegroundForInjection(sessionId);
+        // The overlay cannot take OS focus (WS_EX_NOACTIVATE), so the
+        // confirmed keystroke goes straight to the still-foreground target;
+        // validation lives in the inject_* backend commands.
         if (action.action === 'insert' || action.action === 'rewrite') {
           await attemptPaste(action.content || '', false);
           executed = true;
@@ -1458,7 +1440,6 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
           ? { sessionId, kind: 'text', text: action.content || '', monitorAutoLearn: false }
           : { sessionId, kind: 'keyboard', action: action.action, charCount: action.action === 'delete_chars' ? (action.char_count || 0) : null };
         await handlePasteFailure(pending, err, sessionId);
-        await reshowOverlayForSession(sessionId);
         return;
       }
 
