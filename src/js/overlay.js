@@ -11,6 +11,16 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// Session-level tracking: superseded sessions whose in-flight transcription
+// result should be preserved in history, sessions the user explicitly
+// discarded (their late results are dropped), the foreground HWND captured
+// at recording start so paste can validate the target, and one recoverable
+// pending injection for the paste-retry/copy UI.
+const supersededSessions = new Set();
+const discardedSessions = new Set();
+let sessionTargetWindow = null;
+let pendingInjection = null;
+
 // DOM refs
 const overlayRoot = document.getElementById('overlay-root');
 const recLabel    = document.getElementById('rec-label');
@@ -47,6 +57,7 @@ let agentPickerPlacement = 'above'; // 'above' | 'below'
 const AGENT_LLM_WATCHDOG_MS = 25000;
 
 function beginSession(explicitId) {
+  const supersededId = activeSessionId;
   if (typeof explicitId === 'number' && explicitId > 0) {
     activeSessionId = explicitId;
     if (explicitId > nextSessionId) {
@@ -54,6 +65,17 @@ function beginSession(explicitId) {
     }
   } else {
     activeSessionId = ++nextSessionId;
+  }
+  // A transcription still in flight for the previous session can outlive
+  // this one; remember the superseded session so its late result can be
+  // preserved in history (unless the user explicitly discarded that take).
+  if (supersededId > 0 && supersededId !== activeSessionId) {
+    supersededSessions.add(supersededId);
+    discardedSessions.delete(supersededId);
+    // Bounded tracking: keep only the most recent 20 ids.
+    if (supersededSessions.size > 20) {
+      supersededSessions.delete(supersededSessions.values().next().value);
+    }
   }
   return activeSessionId;
 }
@@ -69,10 +91,13 @@ function completeSession(sessionId) {
 function resetTransientUi() {
   clearAutoDismiss();
   hideRetry();
+  hideCopy();
+  hideActionConfirm();
   hideRecHint();
   setStatusMessage('');
   hideAppPill();
   activeAgentId = null;
+  pendingInjection = null;
   // A new recording invalidates any cached agent retry (A2).
   agentRetryContext = null;
 }
@@ -136,6 +161,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   await setupEventListeners();
   setupDiscardButton();
   setupRetryButton();
+  setupPasteRecovery();
+  setupActionConfirmation();
   setupHotkeyBusyFeedback();
   // Reset synchronously before any awaits so a hotkey that fires while the
   // settings fetch is in flight never observes a stale state (which would
@@ -172,6 +199,9 @@ async function setupEventListeners() {
     // Capture the foreground app while the overlay is still hidden so the
     // target app owns focus (timing-sensitive).
     const appIcon = loadAppIcon(sessionId);
+    // Capture the target HWND for paste validation (same timing window:
+    // the target app must own the foreground here).
+    captureTargetForSession(sessionId);
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -260,6 +290,9 @@ async function setupEventListeners() {
     // Capture the foreground app while the overlay is still hidden so the
     // target app owns focus (timing-sensitive).
     const appIcon = loadAppIcon(sessionId);
+    // Capture the target HWND for paste validation (same timing window:
+    // the target app must own the foreground here).
+    captureTargetForSession(sessionId);
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -766,6 +799,12 @@ function setupRetryButton() {
       setStatusMessage('');
       const sessionId = activeSessionId;
       if (!isSessionActive(sessionId)) return;
+      // P0-B: a recoverable paste failure replays just the injection (with
+      // fresh foreground validation) instead of re-transcribing audio.
+      if (pendingInjection && pendingInjection.sessionId === sessionId) {
+        await retryPendingInjection(sessionId);
+        return;
+      }
       // Agent retry (A2): re-send the cached LLM request on the still-active
       // session instead of forcing a re-record. STT path below is unchanged.
       if (agentRetryContext && agentRetryContext.sessionId === sessionId) {
@@ -779,6 +818,212 @@ function setupRetryButton() {
       setState('transcribing');
       if (recLabel) recLabel.textContent = 'PROCESSING';
        await runSttFlow(sessionId, true);
+    });
+  }
+}
+
+// ── Paste Recovery + Agent Action Confirmation ──────────────────
+// P0-B: a failed paste is reported truthfully and stays recoverable (the
+// transcript is already in history). P2: dangerous agent actions require an
+// explicit confirm click before any destructive keystroke is sent.
+
+let actionConfirmResolve = null;
+let actionConfirmTimer = null;
+
+function captureTargetForSession(sessionId) {
+  invoke('capture_target_window')
+    .then((hwnd) => {
+      if (isSessionActive(sessionId)) {
+        sessionTargetWindow = typeof hwnd === 'number' && hwnd > 0 ? hwnd : null;
+      }
+    })
+    .catch(() => {
+      // No captured target: injection runs without foreground validation,
+      // exactly like sessions before this hardening existed.
+      if (isSessionActive(sessionId)) sessionTargetWindow = null;
+    });
+}
+
+function injectionArgsWithTarget(args) {
+  const merged = { ...args };
+  if (sessionTargetWindow) merged.targetWindow = sessionTargetWindow;
+  return merged;
+}
+
+async function attemptPaste(text, monitorAutoLearn) {
+  return invoke('inject_text', injectionArgsWithTarget({ text, monitorAutoLearn }));
+}
+
+async function attemptKeyboardAction(action, charCount) {
+  return invoke(
+    'execute_keyboard_action',
+    injectionArgsWithTarget({ action, charCount }),
+  );
+}
+
+// Clicking Confirm/Retry/copy hands focus to the overlay window; SendInput
+// reaches only the foreground window. Hide the overlay so the OS hands
+// focus back to the recording target before any keys are sent (150ms
+// matches observed focus-restore latency for hidden windows).
+async function prepareForegroundForInjection(sessionId) {
+  if (!isSessionActive(sessionId)) throw new Error('Session ended');
+  await invoke('hide_overlay').catch(() => {});
+  await new Promise((r) => setTimeout(r, 150));
+  if (!isSessionActive(sessionId)) throw new Error('Session ended');
+}
+
+async function reshowOverlayForSession(sessionId) {
+  if (!isSessionActive(sessionId)) return;
+  const position = (cachedSettings || {}).overlay_position || 'bottom_right';
+  try {
+    await invoke('show_overlay', { position });
+    if (overlayRoot) overlayRoot.classList.add('active');
+  } catch {
+    // Window stays hidden; the transcript remains recoverable from history.
+  }
+}
+
+function showCopy() {
+  const btn = document.getElementById('status-copy');
+  if (btn) btn.hidden = false;
+}
+
+function hideCopy() {
+  const btn = document.getElementById('status-copy');
+  if (btn) btn.hidden = true;
+}
+
+async function handlePasteFailure(pending, err, sessionId) {
+  if (!isSessionActive(sessionId)) {
+    // Session is over: the transcript was already saved to history before
+    // injection was attempted, so nothing is lost.
+    pendingInjection = null;
+    return;
+  }
+  pendingInjection = pending;
+  const changedTarget = String(err || '').includes('TARGET_WINDOW_CHANGED');
+  setState('error');
+  setStatusMessage(changedTarget ? 'Return to target window' : 'Insert failed');
+  if (pending.kind === 'text') showCopy();
+  hideActionConfirm();
+  showRetry();
+  scheduleAutoDismiss(12000);
+}
+
+async function retryPendingInjection(sessionId) {
+  const pending = pendingInjection;
+  pendingInjection = null;
+  hideRetry();
+  hideCopy();
+  setStatusMessage('');
+  try {
+    await prepareForegroundForInjection(sessionId);
+    if (pending.kind === 'text') {
+      await attemptPaste(pending.text, pending.monitorAutoLearn);
+    } else {
+      await attemptKeyboardAction(pending.action, pending.charCount);
+    }
+    if (!isSessionActive(sessionId)) return;
+    setState('success');
+    setStatusMessage(pending.kind === 'text' ? 'Inserted' : 'Executed');
+    playCompletionChime();
+    agentRetryContext = null;
+    await new Promise(r => setTimeout(r, 800));
+    await fadeAndHide(sessionId);
+  } catch (err) {
+    console.error('Paste retry failed:', err);
+    await handlePasteFailure(pending, err, sessionId);
+    // The overlay window was hidden to restore foreground focus; bring the
+    // recovery UI back so Retry/Copy stay reachable.
+    await reshowOverlayForSession(sessionId);
+  }
+}
+
+function setupPasteRecovery() {
+  const copyBtn = document.getElementById('status-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const pending = pendingInjection;
+      if (!pending || pending.kind !== 'text') return;
+      clearAutoDismiss();
+      copyBtn.disabled = true;
+      try {
+        await invoke('copy_text', { text: pending.text });
+        pendingInjection = null;
+        hideCopy();
+        setStatusMessage('Copied - paste with Ctrl+V');
+        scheduleAutoDismiss(5000);
+      } catch (err) {
+        console.error('Copy failed:', err);
+        setStatusMessage('Copy failed');
+        scheduleAutoDismiss(6000);
+      } finally {
+        copyBtn.disabled = false;
+      }
+    });
+  }
+}
+
+const AGENT_DANGEROUS_ACTIONS = new Set(['delete_chars', 'select_all', 'submit']);
+
+function describeAgentAction(action) {
+  if (action.action === 'submit') return 'Press Enter (submit)?';
+  if (action.action === 'select_all') return 'Select all text (Ctrl+A)?';
+  if (action.action === 'delete_chars') {
+    const n = Number(action.char_count || 0);
+    return n > 0 ? `Delete ${n} characters?` : 'Delete text?';
+  }
+  return `${action.action}?`;
+}
+
+// Dangerous agent actions (submit/select-all/delete) rewrite or press keys
+// in the user's document: they require an explicit Confirm click. Cancel,
+// timeout (20s), and any session UI reset resolve false and the queued
+// keystroke is never executed.
+function requestActionConfirmation(action) {
+  const panel = document.getElementById('action-confirm');
+  const textEl = document.getElementById('action-confirm-text');
+  const yes = document.getElementById('action-confirm-yes');
+  const no = document.getElementById('action-confirm-no');
+  if (!panel || !textEl || !yes || !no) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    if (actionConfirmResolve) {
+      // A previous prompt was somehow left open; it is superseded.
+      clearTimeout(actionConfirmTimer);
+      actionConfirmResolve(false);
+    }
+    actionConfirmResolve = (value) => {
+      clearTimeout(actionConfirmTimer);
+      actionConfirmResolve = null;
+      panel.hidden = true;
+      resolve(value);
+    };
+    textEl.textContent = describeAgentAction(action);
+    panel.hidden = false;
+    clearAutoDismiss();
+    actionConfirmTimer = setTimeout(() => {
+      if (actionConfirmResolve) actionConfirmResolve(false);
+    }, 20000);
+  });
+}
+
+function hideActionConfirm() {
+  if (actionConfirmResolve) actionConfirmResolve(false);
+  const panel = document.getElementById('action-confirm');
+  if (panel) panel.hidden = true;
+}
+
+function setupActionConfirmation() {
+  const yes = document.getElementById('action-confirm-yes');
+  const no = document.getElementById('action-confirm-no');
+  if (yes) {
+    yes.addEventListener('click', () => {
+      if (actionConfirmResolve) actionConfirmResolve(true);
+    });
+  }
+  if (no) {
+    no.addEventListener('click', () => {
+      if (actionConfirmResolve) actionConfirmResolve(false);
     });
   }
 }
@@ -846,7 +1091,14 @@ function setupDiscardButton() {
     // orphaned backend LLM request (if any) still runs to completion but can
     // no longer touch UI, clipboard, or history. Accepted behavior - true
     // backend cancellation is Class B (needs explicit approval).
+    const supersededId = activeSessionId;
     const sessionId = beginSession();
+    // Explicit user discard: the superseded take must NOT be preserved by
+    // the orphan-save path in runSttFlow.
+    if (supersededId > 0 && supersededId !== sessionId) {
+      supersededSessions.delete(supersededId);
+      discardedSessions.add(supersededId);
+    }
     resetTransientUi();
     try {
       await invoke('stop_recording');
@@ -895,6 +1147,8 @@ async function fadeAndHide(sessionId = activeSessionId) {
   stopTimer();
   clearAutoDismiss();
   hideRetry();
+  hideCopy();
+  hideActionConfirm();
   setStatusMessage('');
   hideAppPill();
   if (overlayRoot) {
@@ -995,7 +1249,22 @@ async function runSttFlow(sessionId, retry = false) {
       return;
     }
 
-    if (!isSessionActive(sessionId)) return;
+    if (!isSessionActive(sessionId)) {
+      // Superseded take: a newer hotkey started the next session while this
+      // transcription was still running. Preserve the finished transcript in
+      // history (injection is skipped - the foreground belongs to whatever
+      // the new session is now recording). A take the user explicitly
+      // discarded is intentionally dropped.
+      if (!discardedSessions.has(sessionId) && (result.text || '').trim()) {
+        invoke('save_history_entry', {
+          text: result.text,
+          mode: 'transcription',
+          durationMs: result.durationMs || (Date.now() - startTs),
+          provider: result.provider,
+        }).catch(err => console.error('Failed to save history entry:', err));
+      }
+      return;
+    }
 
     invoke('save_history_entry', {
       text: result.text,
@@ -1005,7 +1274,7 @@ async function runSttFlow(sessionId, retry = false) {
     }).catch(err => console.error('Failed to save history entry:', err));
 
     try {
-      await invoke('inject_text', { text: result.text, monitorAutoLearn: true });
+      await attemptPaste(result.text, true);
       if (!isSessionActive(sessionId)) return;
       setState('success');
       setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
@@ -1014,10 +1283,7 @@ async function runSttFlow(sessionId, retry = false) {
       await fadeAndHide(sessionId);
     } catch (err) {
       console.error('Inject failed:', err);
-      if (!isSessionActive(sessionId)) return;
-      setState('error');
-      setStatusMessage('Insert failed');
-      scheduleAutoDismiss(8000);
+      await handlePasteFailure({ sessionId, kind: 'text', text: result.text, monitorAutoLearn: true }, err, sessionId);
     }
   } catch (err) {
     console.error('Transcription error:', err);
@@ -1090,7 +1356,6 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       if (preGrabbedSelection && preGrabbedSelection.trim()) {
         clipboardCtx = preGrabbedSelection;
         grabbed = true;
-        console.log('Successfully grabbed text selection as context:', preGrabbedSelection);
       }
     }
 
@@ -1154,23 +1419,47 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       await new Promise(r => setTimeout(r, 900));
       await fadeAndHide(sessionId);
     } else {
+      // Dangerous agent actions (submit/select-all/delete) rewrite or press
+      // keys in the user's document: they require an explicit user Confirm
+      // first. insert/rewrite/copy stay one-click as before.
+      if (AGENT_DANGEROUS_ACTIONS.has(action.action)) {
+        const confirmed = await requestActionConfirmation(action);
+        if (!isSessionActive(sessionId)) return;
+        if (!confirmed) {
+          setStatusMessage('Cancelled');
+          await new Promise(r => setTimeout(r, 600));
+          await fadeAndHide(sessionId);
+          return;
+        }
+      }
+
       let executed = false;
-      if (action.action === 'insert' || action.action === 'rewrite') {
-        const textToInsert = action.content || '';
-        await invoke('inject_text', { text: textToInsert, monitorAutoLearn: false });
-        executed = true;
-      } else if (action.action === 'delete_chars') {
-        await invoke('execute_keyboard_action', {
-          action: 'delete_chars',
-          charCount: action.char_count || 0,
-        });
-        executed = true;
-      } else if (action.action === 'select_all') {
-        await invoke('execute_keyboard_action', { action: 'select_all', charCount: null });
-        executed = true;
-      } else if (action.action === 'submit') {
-        await invoke('execute_keyboard_action', { action: 'submit', charCount: null });
-        executed = true;
+      try {
+        // A click on the confirmation panel hands focus to the overlay;
+        // SendInput only reaches the foreground window, so the overlay is
+        // hidden first to return focus to the target application.
+        await prepareForegroundForInjection(sessionId);
+        if (action.action === 'insert' || action.action === 'rewrite') {
+          await attemptPaste(action.content || '', false);
+          executed = true;
+        } else if (action.action === 'delete_chars') {
+          await attemptKeyboardAction('delete_chars', action.char_count || 0);
+          executed = true;
+        } else if (action.action === 'select_all') {
+          await attemptKeyboardAction('select_all', null);
+          executed = true;
+        } else if (action.action === 'submit') {
+          await attemptKeyboardAction('submit', null);
+          executed = true;
+        }
+      } catch (err) {
+        console.error('Agent action failed:', err);
+        const pending = (action.action === 'insert' || action.action === 'rewrite')
+          ? { sessionId, kind: 'text', text: action.content || '', monitorAutoLearn: false }
+          : { sessionId, kind: 'keyboard', action: action.action, charCount: action.action === 'delete_chars' ? (action.char_count || 0) : null };
+        await handlePasteFailure(pending, err, sessionId);
+        await reshowOverlayForSession(sessionId);
+        return;
       }
 
       if (!isSessionActive(sessionId)) return;

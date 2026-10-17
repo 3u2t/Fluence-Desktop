@@ -888,6 +888,161 @@ body.agent-placement-above .app-pill {
   pointer-events: all;
 }
 
+/* ── Manual Copy fallback (recoverable paste failures) ─────────── */
+.status-copy {
+  position: absolute;
+  left: 50%;
+  top: 72%;
+  translate: -50% -50%;
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-on-surface);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 4px 14px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease, background 150ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.status-copy:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.status-copy:focus-visible {
+  outline: 1.5px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+.overlay-root.state-error .status-copy:not([hidden]) {
+  opacity: 1;
+  pointer-events: all;
+}
+
+/* The minimal bubble/compact tiers have no room for the copy pill; the
+   transcript stays recoverable via Retry and the History page. */
+.overlay-root.style-bubble .status-copy {
+  display: none;
+}
+
+.overlay-root.style-compact .status-copy {
+  display: none !important;
+}
+
+/* ── Agent Action Confirmation (dangerous actions) ─────────────── */
+.action-confirm {
+  position: absolute;
+  left: 50%;
+  top: 60%;
+  translate: -50% -50%;
+  width: max-content;
+  max-width: 90%;
+  background: rgba(16, 16, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--font-body), system-ui, sans-serif;
+  -webkit-app-region: no-drag;
+  z-index: 30;
+}
+
+.action-confirm[hidden] {
+  display: none;
+}
+
+.action-confirm-text {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--color-on-surface);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.action-confirm-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.action-confirm-btn {
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-on-surface);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 4px 14px;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.action-confirm-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.action-confirm-btn:focus-visible {
+  outline: 1.5px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+.action-confirm-no {
+  color: var(--color-on-surface-variant);
+}
+
+/* Compact tier: smaller buttons keep the confirm reachable on the 180px
+   window. */
+.overlay-root.style-compact .action-confirm {
+  top: 34%;
+  padding: 6px 8px;
+  gap: 5px;
+}
+
+.overlay-root.style-compact .action-confirm-text {
+  font-size: 10px;
+}
+
+.overlay-root.style-compact .action-confirm-btn {
+  font-size: 10px;
+  padding: 2px 9px;
+}
+
+/* Bubble tier: the orb is only 44px but the window is 130px wide — the
+   panel renders over the orb area with a single row of two small buttons. */
+.overlay-root.style-bubble .action-confirm {
+  top: 38%;
+  width: 116px;
+  max-width: none;
+  padding: 4px;
+  gap: 3px;
+  border-radius: 8px;
+}
+
+.overlay-root.style-bubble .action-confirm-text {
+  font-size: 8px;
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.overlay-root.style-bubble .action-confirm-btn {
+  font-size: 8px;
+  padding: 2px 6px;
+}
+
 /* ── Processing Pulse ──────────────────────────────────────────── */
 @keyframes pulse-processing {
   0%, 100% { opacity: 1; }
