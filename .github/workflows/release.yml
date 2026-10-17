@@ -17,10 +17,13 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned by commit SHA (verified via
+      # `git ls-remote`): tag refs like `v4` are mutable and could be
+      # repointed to malicious code between two release runs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
         with:
           node-version: lts/*
 
@@ -50,7 +53,9 @@ jobs:
           }
           # Layout must match build.rs default:
           # <repo>/.vendor/moonshine/moonshine-voice-windows-x86_64/{include,lib}
-          tar -xzf $dest -C .vendor/moonshine
+          # Absolute path: a repo-local tar.exe on PATH must not be able to
+          # repoint the archive extraction step of a release run.
+          C:\Windows\System32\tar.exe -xzf $dest -C .vendor/moonshine
           if (-not (Test-Path ".vendor/moonshine/moonshine-voice-windows-x86_64/lib/onnxruntime.dll")) {
             throw "Vendor extract missing onnxruntime.dll"
           }
@@ -121,7 +126,7 @@ jobs:
           pwsh -File tests/verify-security.ps1
 
       - name: build and release
-        uses: tauri-apps/tauri-action@v0.6.2
+        uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -130,6 +135,8 @@ jobs:
           projectPath: src-tauri
           tagName: v__VERSION__
           releaseName: 'Fluence v__VERSION__'
+          # Keep in sync with .github/RELEASE_BODY.md (the reviewable
+          # template): update both for every release body change.
           releaseBody: |
             ## Sync reliability release
 
