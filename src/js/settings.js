@@ -839,7 +839,9 @@ function setupHistory() {
   const acceptMarkedWord = async (mark) => {
     const id = mark?.dataset?.suggestionId;
     if (!id) return;
-    await acceptSuggestion(id);
+    const spokenWord = mark?.textContent || '';
+    const info = pendingSuggestionMap?.get(spokenWord.toLowerCase());
+    await acceptSuggestion(id, spokenWord, info?.corrected);
     await loadPendingSuggestionMap(true);
     loadHistory(true, document.getElementById('history-search')?.value);
   };
@@ -2437,7 +2439,7 @@ function appendSuggestionRow(tbody, s, preserved) {
     <button class="btn-ghost btn-small suggestion-accept-btn" data-suggestion-id="${escapeAttr(s.id)}">Accept</button>
     <button class="btn-ghost btn-small suggestion-dismiss-btn" data-suggestion-id="${escapeAttr(s.id)}">Dismiss</button>
   `, `${s.frequency}x`);
-  tr.querySelector('.suggestion-accept-btn')?.addEventListener('click', () => acceptSuggestion(s.id));
+  tr.querySelector('.suggestion-accept-btn')?.addEventListener('click', () => acceptSuggestion(s.id, s.spoken, s.corrected));
   tr.querySelector('.suggestion-dismiss-btn')?.addEventListener('click', () => dismissSuggestion(s.id));
   tr.querySelector('.suggestion-select')?.addEventListener('change', refreshBulkBar);
   const selectCb = tr.querySelector('.suggestion-select');
@@ -2518,7 +2520,11 @@ async function dismissSelectedSuggestions() {
   }
 }
 
-window.acceptSuggestion = async (id) => {
+window.acceptSuggestion = async (id, spoken, corrected) => {
+  const detail = spoken && corrected
+    ? `Add "${spoken}" → "${corrected}" to the dictionary? This will automatically rewrite future dictations.`
+    : 'Add this suggestion to the dictionary? This will automatically rewrite future dictations.';
+  if (!window.confirm(detail)) return;
   try {
     await invoke('accept_suggestion_command', { id });
     showToast('Added to dictionary ✓', 'success');

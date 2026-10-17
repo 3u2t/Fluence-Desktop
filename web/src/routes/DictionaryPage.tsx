@@ -24,6 +24,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ConfirmDialog } from '@/components/ui/dialog';
 import { SettingsSectionHeader } from '@/components/fluence/SettingsSection';
 import { toast } from '@/components/fluence/Toasts';
 import {
@@ -36,6 +37,7 @@ import {
   exportDictionaryJson,
   getAutoAccepted,
   getDictionary,
+  getLearningSuggestions,
   getSuggestions,
   importDictionaryFile,
   type DictEntry,
@@ -79,6 +81,8 @@ export function DictionaryPage() {
   const spokenRef = useRef<HTMLInputElement>(null);
 
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [confirmAccept, setConfirmAccept] = useState<{ id: string; detail: string } | null>(null);
+  const [learning, setLearning] = useState<Suggestion[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const sigRef = useRef<string | null>(null);
 
@@ -127,6 +131,16 @@ export function DictionaryPage() {
     }
   }, []);
 
+  // Read-only learning signals: observed but below the review threshold.
+  // Loaded once per mount; never accepted or dismissed from this view.
+  const loadLearning = useCallback(async () => {
+    try {
+      setLearning(await getLearningSuggestions());
+    } catch (err) {
+      console.error('Failed to load learning signals:', err);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -138,6 +152,7 @@ export function DictionaryPage() {
       if (cancelled) return;
       await loadDict();
       await loadSugg();
+      await loadLearning();
       if (!cancelled) setLoading(false);
       void expireStaleSuggestions().catch(() => undefined);
     })();
@@ -148,7 +163,7 @@ export function DictionaryPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [loadDict, loadSugg]);
+  }, [loadDict, loadSugg, loadLearning]);
 
   const openAdd = () => {
     setShowAdd(true);
@@ -218,7 +233,17 @@ export function DictionaryPage() {
     }
   };
 
-  const onAccept = async (id: string) => {
+  const onAccept = (id: string) => {
+    const s = suggestions.find((x) => x.id === id);
+    setConfirmAccept({
+      id,
+      detail: s
+        ? `Add "${s.spoken}" → "${s.corrected}" to the dictionary? This will automatically rewrite future dictations.`
+        : 'Add this suggestion to the dictionary? This will automatically rewrite future dictations.',
+    });
+  };
+
+  const doAccept = async (id: string) => {
     try {
       await acceptSuggestion(id);
       toast('Added to dictionary', 'success');
@@ -323,6 +348,26 @@ export function DictionaryPage() {
               </Field>
             </div>
           </div>
+        </Card>
+        <SettingsSectionHeader
+          title="Learning signals"
+          description="Corrections observed but still below the review threshold. These are not suggestions yet and cannot be accepted from here."
+        />
+        <Card className="settings-card">
+          {learning.length === 0 ? (
+            <p className="dict-empty-note">No learning signals yet.</p>
+          ) : (
+            <ul className="learning-signal-list">
+              {learning.map((s) => (
+                <li key={s.id}>
+                  <span className="spoken-word">{s.spoken}</span>
+                  {' → '}
+                  <span className="corrected-word">{s.corrected}</span>
+                  <span className="col-meta seen-col frequency"> ({s.frequency}x)</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </Card>
       </TabsContent>
 
@@ -530,6 +575,18 @@ export function DictionaryPage() {
         </div>
       </TabsContent>
       </Tabs>
+      <ConfirmDialog
+        open={confirmAccept !== null}
+        onOpenChange={(open) => { if (!open) setConfirmAccept(null); }}
+        title="Add to dictionary"
+        body={confirmAccept?.detail ?? ''}
+        confirmLabel="Add"
+        onConfirm={() => {
+          const id = confirmAccept?.id;
+          setConfirmAccept(null);
+          if (id) void doAccept(id);
+        }}
+      />
     </section>
   );
 }

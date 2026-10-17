@@ -38,6 +38,11 @@ export const getAutoAccepted = () =>
 export const getSuggestions = () =>
   invokeCmd<Suggestion[]>('get_suggestions');
 
+// Sub-threshold learning signals (observed but not yet reviewable).
+// Read-only: this surface never accepts, dismisses, or mutates rows.
+export const getLearningSuggestions = () =>
+  invokeCmd<Suggestion[]>('get_learning_suggestions');
+
 export const acceptSuggestion = (id: string) =>
   invokeCmd<void>('accept_suggestion_command', { id });
 
