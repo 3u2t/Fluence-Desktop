@@ -42,6 +42,7 @@ use windows::Win32::{
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
         VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
     },
+    UI::WindowsAndMessaging::GetForegroundWindow,
 };
 
 #[cfg(target_os = "windows")]
@@ -230,79 +231,57 @@ fn restore_modifiers(released: &[VIRTUAL_KEY]) {
     }
 }
 
-/// Send Ctrl+V keystroke via SendInput
+/// Send Ctrl+V keystroke via SendInput. Returns the number of events the
+/// system actually accepted so callers can detect and report partial
+/// delivery instead of presenting a paste that never happened as success.
 #[cfg(target_os = "windows")]
-fn send_ctrl_v() {
+fn send_ctrl_v() -> u32 {
     let inputs = [
         make_key_input(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
         make_key_input(VK_V, KEYBD_EVENT_FLAGS(0)),
         make_key_input(VK_V, KEYEVENTF_KEYUP),
         make_key_input(VK_CONTROL, KEYEVENTF_KEYUP),
     ];
-    unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != inputs.len() as u32 {
-            log::warn!(
-                "SendInput (ctrl_v): sent {} of {} events",
-                sent,
-                inputs.len()
-            );
-        }
-    }
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
-/// Send N backspace keystrokes via SendInput
+/// Send N backspace keystrokes via SendInput. Returns the number of events
+/// the system actually accepted; the caller compares against `count * 2`.
 #[cfg(target_os = "windows")]
-pub fn send_backspaces(count: usize) {
+pub fn send_backspaces(count: usize) -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_BACK;
     const MAX_DELETE_CHARS: usize = 10_000;
     if count == 0 {
-        return;
+        return 0;
     }
     if count > MAX_DELETE_CHARS {
         log::warn!("Ignoring oversized backspace request: {}", count);
-        return;
+        return 0;
     }
     let mut inputs: Vec<INPUT> = Vec::with_capacity(count.saturating_mul(2));
     for _ in 0..count {
         inputs.push(make_key_input(VK_BACK, KEYBD_EVENT_FLAGS(0)));
         inputs.push(make_key_input(VK_BACK, KEYEVENTF_KEYUP));
     }
-    unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != inputs.len() as u32 {
-            log::warn!(
-                "SendInput (backspaces): sent {} of {} events",
-                sent,
-                inputs.len()
-            );
-        }
-    }
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
-/// Send Enter key via SendInput
+/// Send Enter key via SendInput. Returns the accepted event count (2 is a
+/// full press+release pair).
 #[cfg(target_os = "windows")]
-pub fn send_enter() {
+pub fn send_enter() -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
     let inputs = [
         make_key_input(VK_RETURN, KEYBD_EVENT_FLAGS(0)),
         make_key_input(VK_RETURN, KEYEVENTF_KEYUP),
     ];
-    unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != inputs.len() as u32 {
-            log::warn!(
-                "SendInput (enter): sent {} of {} events",
-                sent,
-                inputs.len()
-            );
-        }
-    }
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
-/// Send Ctrl+A (select all) via SendInput
+/// Send Ctrl+A (select all) via SendInput. Returns the accepted event count
+/// (4 is a full chord).
 #[cfg(target_os = "windows")]
-pub fn send_select_all() {
+pub fn send_select_all() -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_A;
     let inputs = [
         make_key_input(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
@@ -310,25 +289,43 @@ pub fn send_select_all() {
         make_key_input(VK_A, KEYEVENTF_KEYUP),
         make_key_input(VK_CONTROL, KEYEVENTF_KEYUP),
     ];
-    unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != inputs.len() as u32 {
-            log::warn!(
-                "SendInput (select_all): sent {} of {} events",
-                sent,
-                inputs.len()
-            );
-        }
-    }
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
 /// Main Tauri command: inject text into the focused application
 /// Saves clipboard → sets text → Ctrl+V → restores clipboard after delay
 #[tauri::command]
-pub async fn inject_text(text: String, monitor_auto_learn: Option<bool>) -> Result<(), String> {
+pub async fn inject_text(
+    window: tauri::Window,
+    text: String,
+    monitor_auto_learn: Option<bool>,
+    target_window: Option<u64>,
+) -> Result<(), String> {
+    // Text injection simulates paste into the user's applications: the
+    // overlay is its only legitimate caller.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     check_inject_text_len(&text)?;
     #[cfg(target_os = "windows")]
     {
+        // Fail closed BEFORE any clipboard mutation when the caller captured
+        // the intended target window at recording start: if the foreground
+        // owner changed while the user recorded/edited, pasting now would
+        // inject the transcript into the wrong application. No check is
+        // performed when the caller did not capture a target (None), which
+        // keeps older flows and tests working unchanged.
+        if let Some(target) = target_window {
+            if !foreground_window_matches(target) {
+                log::warn!(
+                    "inject_text: foreground window no longer matches captured target {}; refusing to paste",
+                    target
+                );
+                return Err(
+                    "TARGET_WINDOW_CHANGED: recording target window is no longer focused"
+                        .to_string(),
+                );
+            }
+        }
+
         let _transaction = CLIPBOARD_INJECTION_LOCK.lock().await;
         let start_time = std::time::Instant::now();
         // Save current clipboard
@@ -345,25 +342,31 @@ pub async fn inject_text(text: String, monitor_auto_learn: Option<bool>) -> Resu
         // Release physical modifier keys held down by the user
         let released = release_held_modifiers();
 
-        // Send Ctrl+V
-        send_ctrl_v();
+        // Send Ctrl+V. SendInput can be partially or fully blocked (secure
+        // desktop, focus transition, UIPI restrictions); the delivered count
+        // is the only truth about whether the chord actually happened.
+        let ctrlv_sent = send_ctrl_v();
+        let paste_ok = ctrlv_sent == 4;
 
         // Restore physical modifier keys
         restore_modifiers(&released);
         let ctrlv_duration = ctrlv_start.elapsed();
 
         log::info!(
-            "inject_text performance: total = {:?}, save_clip = {:?}, set_clip = {:?}, send_ctrl_v = {:?}",
+            "inject_text performance: total = {:?}, save_clip = {:?}, set_clip = {:?}, send_ctrl_v = {:?} ({}/4 events)",
             start_time.elapsed(),
             save_duration,
             set_duration,
-            ctrlv_duration
+            ctrlv_duration,
+            ctrlv_sent
         );
 
         // Only the normal transcription flow opts into post-injection
         // learning. Agent-generated inserts use the same clipboard command
-        // but are not transcription evidence.
-        let should_monitor = monitor_auto_learn.unwrap_or(false)
+        // but are not transcription evidence. A paste that was never
+        // delivered is not transcription evidence either.
+        let should_monitor = paste_ok
+            && monitor_auto_learn.unwrap_or(false)
             && crate::settings::load_settings()
                 .map(|settings| settings.auto_learn_enabled)
                 .unwrap_or(false);
@@ -373,7 +376,8 @@ pub async fn inject_text(text: String, monitor_auto_learn: Option<bool>) -> Resu
 
         // Restore only if Fluence still owns the clipboard. If the user or
         // another application copied something during the paste window, do
-        // not overwrite that newer clipboard content.
+        // not overwrite that newer clipboard content. This runs even on a
+        // partial paste so the user's clipboard is returned.
         sleep(Duration::from_millis(200)).await;
         if clipboard_sequence_number() == fluence_clipboard_sequence
             && get_clipboard_text().as_deref() == Some(text.as_str())
@@ -383,7 +387,18 @@ pub async fn inject_text(text: String, monitor_auto_learn: Option<bool>) -> Resu
             }
         }
 
-        Ok(())
+        if paste_ok {
+            Ok(())
+        } else {
+            log::warn!(
+                "inject_text: SendInput delivered {} of 4 key events; reporting paste failure",
+                ctrlv_sent
+            );
+            Err(format!(
+                "PASTE_FAILED: SendInput delivered {} of 4 key events",
+                ctrlv_sent
+            ))
+        }
     }
     #[cfg(not(target_os = "windows"))]
     Err("Text injection not supported on this platform".to_string())
@@ -394,10 +409,55 @@ fn clipboard_sequence_number() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
+/// Capture the foreground window so text injection can later verify that the
+/// same window is still focused immediately before pasting. Returns `None`
+/// when there is no foreground window (secure desktop, screensaver) or on
+/// non-Windows platforms, in which case the frontend simply skips validation
+/// and injection behaves exactly as it did before this command existed.
+/// Only the raw HWND value is compared back; it is never dereferenced, so a
+/// window that was closed between capture and validation is handled safely
+/// as an ordinary mismatch.
+#[tauri::command]
+pub fn capture_target_window(window: tauri::Window) -> Option<u64> {
+    // Only the overlay captures paste targets for its recording sessions.
+    if crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW]).is_err() {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0.is_null() {
+            None
+        } else {
+            Some(foreground.0 as usize as u64)
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// True when the current foreground window equals `target`. HWNDs are
+/// compared as raw values only (never dereferenced), so destroyed or
+/// recycled targets fail closed with an error, never a crash or a wrong
+/// window paste.
+#[cfg(target_os = "windows")]
+fn foreground_window_matches(target: u64) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    (foreground.0 as usize as u64) == target
+}
+
 /// Copy text while participating in the same clipboard transaction lock as
 /// text injection and active-selection capture.
 #[tauri::command]
-pub async fn copy_text(text: String) -> Result<(), String> {
+pub async fn copy_text(window: tauri::Window, text: String) -> Result<(), String> {
+    // Agent results are copied from the overlay; the History page reuses
+    // the same command for its copy buttons (main window).
+    crate::acl::require_caller(
+        &window,
+        &[crate::acl::OVERLAY_WINDOW, crate::acl::MAIN_WINDOW],
+    )?;
     check_inject_text_len(&text)?;
     #[cfg(target_os = "windows")]
     {
@@ -408,29 +468,77 @@ pub async fn copy_text(text: String) -> Result<(), String> {
     Err("Clipboard operations are not supported on this platform".to_string())
 }
 
-/// Execute a keyboard action from agent mode
+/// Execute a keyboard action from agent mode. Delivery is reported
+/// truthfully: a partially delivered SendInput is an error, and unknown
+/// actions are rejected instead of silently doing nothing.
 #[tauri::command]
 pub async fn execute_keyboard_action(
+    window: tauri::Window,
     action: String,
     char_count: Option<usize>,
+    target_window: Option<u64>,
 ) -> Result<(), String> {
+    // Keyboard simulation acts on the user's focused application: the
+    // overlay is its only legitimate caller.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     #[cfg(target_os = "windows")]
     {
+        // Same foreground guarantee as inject_text: the caller may verify
+        // that the recording target still owns focus before any keystroke
+        // (select-all/delete/submit are destructive) is sent.
+        if let Some(target) = target_window {
+            if !foreground_window_matches(target) {
+                log::warn!(
+                    "execute_keyboard_action: foreground window no longer matches captured target {}; refusing to send '{}'",
+                    target,
+                    action
+                );
+                return Err(
+                    "TARGET_WINDOW_CHANGED: recording target window is no longer focused"
+                        .to_string(),
+                );
+            }
+        }
         sleep(Duration::from_millis(80)).await;
         match action.as_str() {
             "delete_chars" => {
-                if let Some(n) = char_count {
-                    if n > 10_000 {
-                        return Err("Delete action exceeds maximum length".to_string());
-                    }
-                    send_backspaces(n);
+                let count =
+                    char_count.ok_or_else(|| "delete_chars requires a charCount".to_string())?;
+                if count > 10_000 {
+                    return Err("Delete action exceeds maximum length".to_string());
                 }
+                let sent = send_backspaces(count);
+                if sent != (count * 2) as u32 {
+                    return Err(format!(
+                        "KEYBOARD_ACTION_FAILED: SendInput delivered {} of {} key events",
+                        sent,
+                        count * 2
+                    ));
+                }
+                Ok(())
             }
-            "select_all" => send_select_all(),
-            "submit" => send_enter(),
-            _ => {}
+            "select_all" => {
+                let sent = send_select_all();
+                if sent != 4 {
+                    return Err(format!(
+                        "KEYBOARD_ACTION_FAILED: SendInput delivered {} of 4 key events",
+                        sent
+                    ));
+                }
+                Ok(())
+            }
+            "submit" => {
+                let sent = send_enter();
+                if sent != 2 {
+                    return Err(format!(
+                        "KEYBOARD_ACTION_FAILED: SendInput delivered {} of 2 key events",
+                        sent
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(format!("Unknown keyboard action '{}'", other)),
         }
-        Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     Err("Keyboard actions not supported on this platform".to_string())
@@ -462,7 +570,10 @@ fn send_ctrl_c() {
 /// BUG-03: bounded polling (not 120ms fixed) to avoid truncating slow apps (Gemini/Electron)
 /// BUG-04: hardened modifier handling preserves user's clipboard and avoids stuck modifiers
 #[tauri::command]
-pub async fn grab_active_selection() -> Result<Option<String>, String> {
+pub async fn grab_active_selection(window: tauri::Window) -> Result<Option<String>, String> {
+    // Selection capture reads the foreground application's clipboard state
+    // for the next agent turn: overlay-only.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     #[cfg(target_os = "windows")]
     {
         let _transaction = CLIPBOARD_INJECTION_LOCK.lock().await;

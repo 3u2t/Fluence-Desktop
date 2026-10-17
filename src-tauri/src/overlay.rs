@@ -171,7 +171,9 @@ fn place_overlay_window_sized(
 
 /// Show the overlay at the configured screen position
 #[tauri::command]
-pub fn show_overlay(app: AppHandle, position: String) -> Result<(), String> {
+pub fn show_overlay(window: tauri::Window, app: AppHandle, position: String) -> Result<(), String> {
+    // Overlay window control lives with the overlay itself.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let win = get_overlay_window(&app).ok_or("Overlay window not found")?;
 
     // Get screen dimensions
@@ -213,7 +215,13 @@ pub fn show_overlay(app: AppHandle, position: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn set_overlay_style(app: AppHandle, style: String) -> Result<(), String> {
+pub fn set_overlay_style(
+    window: tauri::Window,
+    app: AppHandle,
+    style: String,
+) -> Result<(), String> {
+    // Overlay-only: the tier change follows an overlay summon.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let win = get_overlay_window(&app).ok_or("Overlay window not found")?;
     // Shrink/grow the HWND to the tier (plus re-glue to the stored corner)
     // so the transparent frame never extends past the visible card. Called
@@ -233,7 +241,9 @@ pub fn set_overlay_style(app: AppHandle, style: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
+pub fn hide_overlay(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // Overlay-only: the overlay is the session owner.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let win = get_overlay_window(&app).ok_or("Overlay window not found")?;
     let monitor = win
         .current_monitor()
@@ -257,7 +267,13 @@ pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn show_main_window(app: AppHandle) -> Result<(), String> {
+pub fn show_main_window(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // The wizard reveals the main window on completion; the main window can
+    // reveal itself. The overlay has no user path that needs this.
+    crate::acl::require_caller(
+        &window,
+        &[crate::acl::MAIN_WINDOW, crate::acl::WIZARD_WINDOW],
+    )?;
     let win = app
         .get_webview_window("main")
         .ok_or("Main window not found")?;
@@ -269,7 +285,10 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
+pub fn hide_main_window(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // Main-window-only surface control (settings page titlebar + tray sinks
+    // use the Rust-internal path, not IPC).
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let win = app
         .get_webview_window("main")
         .ok_or("Main window not found")?;
@@ -280,7 +299,9 @@ pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn minimize_main_window(app: AppHandle) -> Result<(), String> {
+pub fn minimize_main_window(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // Main window controls its own titlebar.
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let win = app
         .get_webview_window("main")
         .ok_or("Main window not found")?;
@@ -291,7 +312,9 @@ pub fn minimize_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn toggle_maximize_main_window(app: AppHandle) -> Result<bool, String> {
+pub fn toggle_maximize_main_window(window: tauri::Window, app: AppHandle) -> Result<bool, String> {
+    // Main window controls its own titlebar.
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     let win = app
         .get_webview_window("main")
         .ok_or("Main window not found")?;
@@ -306,7 +329,13 @@ pub fn toggle_maximize_main_window(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn show_wizard_window(app: AppHandle) -> Result<(), String> {
+pub fn show_wizard_window(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // The main window (settings/tray flows) can re-open the wizard; the
+    // wizard itself may need to show itself on a transient close.
+    crate::acl::require_caller(
+        &window,
+        &[crate::acl::MAIN_WINDOW, crate::acl::WIZARD_WINDOW],
+    )?;
     let win = app
         .get_webview_window("wizard")
         .ok_or("Wizard window not found")?;
@@ -318,7 +347,9 @@ pub fn show_wizard_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn minimize_wizard(app: AppHandle) -> Result<(), String> {
+pub fn minimize_wizard(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // Wizard owns its own titlebar.
+    crate::acl::require_caller(&window, &[crate::acl::WIZARD_WINDOW])?;
     let win = app
         .get_webview_window("wizard")
         .ok_or("Wizard window not found")?;
@@ -329,7 +360,9 @@ pub fn minimize_wizard(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn close_wizard(app: AppHandle) -> Result<(), String> {
+pub fn close_wizard(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    // Wizard owns its own close button.
+    crate::acl::require_caller(&window, &[crate::acl::WIZARD_WINDOW])?;
     let win = app
         .get_webview_window("wizard")
         .ok_or("Wizard window not found")?;

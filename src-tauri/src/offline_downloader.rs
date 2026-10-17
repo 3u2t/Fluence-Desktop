@@ -581,8 +581,9 @@ pub async fn download_offline_model(
 }
 
 #[tauri::command]
-pub fn get_offline_model_status() -> bool {
-    check_model_files_exist()
+pub fn get_offline_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_model_files_exist()
 }
 
 #[tauri::command]
@@ -829,8 +830,9 @@ pub async fn download_moonshine_v2_small_model(
 }
 
 #[tauri::command]
-pub fn get_moonshine_v2_small_model_status() -> bool {
-    check_moonshine_v2_small_files_exist()
+pub fn get_moonshine_v2_small_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_moonshine_v2_small_files_exist()
 }
 
 #[tauri::command]
@@ -851,8 +853,9 @@ pub async fn download_moonshine_v2_medium_model(
 }
 
 #[tauri::command]
-pub fn get_moonshine_v2_medium_model_status() -> bool {
-    check_moonshine_v2_medium_files_exist()
+pub fn get_moonshine_v2_medium_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_moonshine_v2_medium_files_exist()
 }
 
 #[tauri::command]
