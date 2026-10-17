@@ -65,8 +65,9 @@ pub fn init_db() -> Result<()> {
     let conn = Connection::open(&path)?;
     // Reader/writer overlap (suggestion rewrites, history saves while the
     // learning journal updates) must surface as a wait, not as SQLITE_BUSY
-    // error toasts in the UI.
-    conn.busy_timeout(std::time::Duration::from_millis(5000));
+    // error toasts in the UI. Failure would mean the connection is already
+    // closed, which the code below would surface anyway.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
     run_migration(&conn)?;
 
     let mut db = DB

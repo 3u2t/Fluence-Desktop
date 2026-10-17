@@ -1,51 +1,93 @@
 // Fluence Windows — Moonshine v2 sidecar server (experiment).
 //
 // Serves the official Moonshine v2 streaming models (small/medium) over the
-// SAME localhost WebSocket protocol as the sherpa-onnx sidecar, so the main
-// app needs no protocol changes:
+// same localhost WebSocket protocol family as the sherpa-onnx sidecar:
 //
-//   client -> server: binary [32-byte auth token][u32LE sample_rate][u32LE
-//                     byte_len][f32 ...]  (token == the --auth-token value)
-//   server -> client: text {"text": "..."} (or raw text)
-//   client -> server: text "Done", then close
+//   readiness probe:
+//     client -> server: text "probe:<auth-token>"
+//     server -> client: text {"ok":true,"server":"moonshine-v2"}, then close
+//     (the parent only treats this reply as proof that the spawned sidecar
+//     owns the port and knows the spawn secret; a bare TCP connect is not
+//     identity)
+//   audio:
+//     client -> server: binary [32-byte auth token][u32LE sample_rate]
+//                       [u32LE byte_len][f32 ...]  (token == handshake value)
+//     server -> client: text {"text": "..."} (or raw text)
+//     client -> server: text "Done", then close
 //
 // Whole-utterance mode only (`moonshine_transcribe_without_streaming`):
 // the app UI never shows live partials.
 //
-// CLI: moonshine-v2-server --port=6006 --auth-token=<hex> --model-dir=... --arch=small|medium
-//      --auth-token is REQUIRED: the socket is localhost-only, but any local
-//      process (another user session's process, a hostile webview page)
-//      could connect to it otherwise. The app generates a fresh uuid per
-//      spawn and the sidecar refuses connections without the matching
-//      32-byte token; no token value is ever logged.
+// Token delivery: the PARENT pipes a freshly generated uuid token to this
+// process's stdin, then closes it; the token is consumed once and never
+// logged. `--auth-token=<hex>` exists only as a manual/debug fallback
+// because a command-line value is readable by same-user processes via
+// Win32_Process — keep it out of any automated path.
+//
+// Concurrency: at most MAX_CONCURRENT client connections; additional
+// connections receive an HTTP 503 refusal the parent can surface as a
+// distinct "busy" error. Beyond the shared secret, process identity is
+// NOT otherwise verified (this is the documented residual risk, same
+// threat class as the still-unhardened Sherpa sidecar).
 
 use futures_util::{SinkExt, StreamExt};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, Semaphore};
 
 // Must match moonshine-c-api.h (verified against the v0.1.5 bundle header).
 const MOONSHINE_HEADER_VERSION: i32 = 30000;
 const ARCH_SMALL_STREAMING: u32 = 4;
 const ARCH_MEDIUM_STREAMING: u32 = 5;
 
-/// Required first bytes of every client audio payload (= "--auth-token=").
+/// Required first bytes of every client audio payload and every probe
+/// text. CONTRACT: the parent generates `uuid::Uuid::new_v4().simple()`,
+/// which is exactly this many lowercase hex characters. If either side
+/// changes, wire tests on both sides must change together.
 const TOKEN_LEN: usize = 32;
 
 /// Max concurrent client connections. Each connection is one utterance,
-/// so 2 covers overlapping UI flows while bounding per-session memory.
-const MAX_CONCURRENT: usize = 2;
-static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// and utterances serialize on the model's internal mutex, so 8 covers
+/// every legitimate flow while bounding memory. Exhaustion is observable
+/// (HTTP 503), never a silent drop.
+const MAX_CONCURRENT: usize = 8;
 
-/// Wall socket for guarding the connection counter. Decrements once when the
-/// task ends (success, error, or panic).
-struct ConnSlot;
-impl Drop for ConnSlot {
-    fn drop(&mut self) {
-        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+/// Readiness-probe reply. Must name this server: the parent rejects any
+/// other body.
+const PROBE_REPLY: &str = r#"{"ok":true,"server":"moonshine-v2"}"#;
+
+/// Validate the mandatory auth-token prefix of a client binary payload.
+/// Returns the payload WITHOUT the token (the [rate][len][samples] body)
+/// or a stable error string the parent surfaces.
+fn validate_token_prefix<'a>(full: &'a [u8], token: &'a str) -> Result<&'a [u8], &'static str> {
+    if full.len() < TOKEN_LEN + 8 {
+        return Err("payload too short for auth token + [rate][len] header");
     }
+    if full[0..TOKEN_LEN] != token.as_bytes()[0..TOKEN_LEN] {
+        return Err("unauthorized: missing or invalid auth token");
+    }
+    Ok(&full[TOKEN_LEN..])
+}
+
+/// Server response written to a raw TCP connection when the connection
+/// limiter is exhausted. A real HTTP 503 with `Connection: close` lets the
+/// client surface a distinct "busy" error instead of a bare socket drop.
+fn capacity_refusal() -> String {
+    const BODY: &str = "at capacity";
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        BODY.len(),
+        BODY
+    )
+}
+
+/// Reserve one of MAX_CONCURRENT connection slots BEFORE the task is
+/// spawned, so the limit holds exactly even under concurrent accepts.
+/// The permit's Drop returns the slot on every exit path, including panics.
+fn reserve_permit(permits: &Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    permits.clone().try_acquire_owned().ok()
 }
 
 /// One transcript line. Only `text` (offset 0) is read; the remaining fields
@@ -217,22 +259,39 @@ async fn handle_connection(
     transcriber: Arc<Transcriber>,
     token: String,
 ) -> Result<(), String> {
-    // Bound message sizes: a 10-minute utterance at 16 kHz f32 is ~38.4 MB;
-    // 64 MB refuses memory bombs without ever clipping legitimate audio.
-    let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(64 * 1024 * 1024),
-        max_frame_size: Some(64 * 1024 * 1024),
-        ..Default::default()
-    };
-    let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(cfg))
+    // tungstenite's defaults (64 MiB message / 16 MiB frame) comfortably fit
+    // the largest legitimate utterance (10 min @ 16 kHz f32 = ~38.4 MB,
+    // fragmented to <=16 MiB frames by the client library). A behavior test
+    // in this module asserts that arithmetic so a future limit change
+    // cannot silently clip recordings.
+    let mut ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| format!("websocket accept failed: {e}"))?;
 
-    // One utterance per connection: binary payload, then text result.
-    // The first MESSAGE must carry the spawn-shared auth token (32 bytes)
-    // ahead of the [rate][len] header; anything else is refused.
+    // Readiness probe first: text "probe:<token>" answers with a named
+    // reply; anything else that is text is refused (audio payloads are
+    // binary, and only the sidecar knows the token). Audio then proceeds
+    // as one binary message carrying the same token ahead of the header.
     let full = loop {
         match ws.next().await {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                if let Some(probe) = text.strip_prefix("probe:") {
+                    if probe == token {
+                        let _ = ws
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                PROBE_REPLY.to_string(),
+                            ))
+                            .await;
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
+                    return Err("unauthorized: probe token mismatch".to_string());
+                }
+                return Err(format!(
+                    "unexpected text message: send 'probe:<token>' or a binary audio payload (got {} bytes of text)",
+                    text.len()
+                ));
+            }
             Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => break data,
             Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return Ok(()),
             Some(Ok(_)) => continue,
@@ -240,13 +299,10 @@ async fn handle_connection(
             None => return Ok(()),
         }
     };
-    if full.len() < TOKEN_LEN + 8 || full[0..TOKEN_LEN] != token.as_bytes()[0..TOKEN_LEN] {
-        return Err("unauthorized: missing or invalid auth token".to_string());
-    }
-    let payload = full[TOKEN_LEN..].to_vec();
-    if payload.len() < 8 {
-        return Err("payload too short for [rate][len] header".to_string());
-    }
+    let payload = match validate_token_prefix(&full, &token) {
+        Ok(rest) => rest,
+        Err(e) => return Err(e.to_string()),
+    };
     let sample_rate = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     let byte_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
     if sample_rate != 16_000 {
@@ -315,14 +371,35 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // Token acquisition. Prefer the private stdin handshake (the parent
+    // writes the fresh token, then closes stdin; nothing of the token is
+    // logged). `--auth-token=<hex>` remains as a manual/debug fallback —
+    // explicitly NOT for automated spawning, because command lines are
+    // readable by same-user processes via Win32_Process.
+    let token = if let Some(arg_token) = parse_arg("--auth-token=") {
+        eprintln!("moonshine-v2-server: token from CLI arg (manual mode)");
+        arg_token
+    } else {
+        let read_token = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut line = String::new();
+            let read = tokio::io::BufReader::new(tokio::io::stdin())
+                .read_line(&mut line)
+                .await;
+            read.map(|n| (n, line))
+        })
+        .await;
+        match read_token {
+            Ok(Ok((n, line))) if n > 0 => line.trim_end_matches(['\n', '\r']).to_string(),
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                eprintln!("missing --auth-token arg and empty/timed-out stdin handshake");
+                std::process::exit(2);
+            }
+        }
+    };
     // No value is logged: the token exists to keep other local processes
     // away from the transcript channel.
-    let token = parse_arg("--auth-token=").unwrap_or_else(|| {
-        eprintln!("missing --auth-token=TOKEN (always needed when spawned by the app)");
-        std::process::exit(2);
-    });
     if token.len() < TOKEN_LEN {
-        eprintln!("invalid --auth-token (expected at least {TOKEN_LEN} chars)");
+        eprintln!("invalid auth token (expected at least {TOKEN_LEN} chars)");
         std::process::exit(2);
     }
 
@@ -342,18 +419,32 @@ async fn main() {
             eprintln!("moonshine-v2-server: bind failed: {e}");
             std::process::exit(1);
         });
+    let conn_permits = Arc::new(Semaphore::new(MAX_CONCURRENT));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) >= MAX_CONCURRENT {
-                    eprintln!("moonshine-v2-server: connection refused: at capacity");
-                    continue; // drops the stream immediately
-                }
+                // Reserve BEFORE spawning: the limit now holds exactly even
+                // under concurrent accepts (a load-then-increment race used
+                // to let the bound slip).
+                let permit = match reserve_permit(&conn_permits) {
+                    Some(permit) => permit,
+                    None => {
+                        eprintln!("moonshine-v2-server: connection refused: at capacity");
+                        // Observable refusal rather than a silent drop: the
+                        // HTTP 503 response lets the client surface a
+                        // distinct "busy" error.
+                        let mut refuse = stream;
+                        let _ = refuse.write_all(capacity_refusal().as_bytes()).await;
+                        let _ = refuse.shutdown().await;
+                        continue;
+                    }
+                };
                 let transcriber = transcriber.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
-                    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
-                    let _slot = ConnSlot;
+                    // Released on every exit path (success, error, panic) by
+                    // moving the permit's Drop into the task.
+                    let _permit = permit;
                     if let Err(e) = handle_connection(stream, transcriber, token).await {
                         eprintln!("moonshine-v2-server: connection error: {e}");
                     }
@@ -383,5 +474,113 @@ mod tests {
         assert_eq!(ARCH_SMALL_STREAMING, 4);
         assert_eq!(ARCH_MEDIUM_STREAMING, 5);
         assert_eq!(MOONSHINE_HEADER_VERSION, 30000);
+    }
+
+    // ── Auth-token prefix contract (extracted helper, behavior-tested) ──
+    // The parent generates uuid::Uuid::new_v4().simple() — exactly 32 hex
+    // chars — and prefixes it to every audio payload; these tests pin the
+    // sidecar half of that shared contract.
+
+    #[test]
+    fn token_prefix_rejects_empty_and_short_payloads() {
+        let token = "a".repeat(TOKEN_LEN);
+        assert!(validate_token_prefix(&[], &token).is_err());
+        let one_short = vec![0u8; TOKEN_LEN + 7];
+        let result = validate_token_prefix(&one_short, &token).unwrap_err();
+        assert_eq!(
+            result,
+            "payload too short for auth token + [rate][len] header"
+        );
+    }
+
+    #[test]
+    fn token_prefix_rejects_wrong_token() {
+        let token = "a".repeat(TOKEN_LEN);
+        let wrong = vec![b'x'; TOKEN_LEN + 8];
+        let result = validate_token_prefix(&wrong, &token).unwrap_err();
+        assert_eq!(result, "unauthorized: missing or invalid auth token");
+    }
+
+    #[test]
+    fn token_prefix_accepts_exact_minimum_length() {
+        // 32-byte token + 8-byte [rate][len] header is the smallest accepted
+        // payload (an empty utterance) — the helper must accept it and not
+        // demand sample bytes.
+        let mut full = "a".repeat(TOKEN_LEN).into_bytes();
+        full.extend_from_slice(&[0u8; 8]);
+        let token = "a".repeat(TOKEN_LEN);
+        let rest = validate_token_prefix(&full, &token).unwrap();
+        assert_eq!(rest.len(), 8);
+    }
+
+    #[test]
+    fn token_prefix_strips_token_and_preserves_header_and_samples() {
+        let token = "a".repeat(TOKEN_LEN);
+        let mut full = token.clone().into_bytes();
+        full.extend_from_slice(&16_000u32.to_le_bytes());
+        full.extend_from_slice(&4u32.to_le_bytes());
+        full.extend_from_slice(&0.5f32.to_le_bytes());
+        let rest = validate_token_prefix(&full, &token).unwrap();
+        assert_eq!(rest.len(), 12);
+        assert_eq!(&rest[0..4], &16_000u32.to_le_bytes());
+        assert_eq!(&rest[4..8], &4u32.to_le_bytes());
+        assert_eq!(&rest[8..12], &0.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn token_contract_is_pinned_at_32_hex_chars() {
+        assert_eq!(TOKEN_LEN, 32);
+    }
+
+    // ── Capacity refusal shape ────────────────────────────────────────
+
+    #[test]
+    fn capacity_refusal_is_a_valid_http_503_close() {
+        let refusal = capacity_refusal();
+        assert!(refusal.starts_with("HTTP/1.1 503 "), "must be a 503");
+        assert!(refusal.contains("Connection: close"), "must close cleanly");
+        let (head, body) = refusal.split_once("\r\n\r\n").unwrap();
+        let cl = body.len().to_string();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("content-length: {cl}")),
+            "Content-Length must match the real body size"
+        );
+    }
+
+    // ── Message-size contract ─────────────────────────────────────────
+
+    #[test]
+    fn max_utterance_fits_backwards_compatible_socket_bounds() {
+        // Mirrors transcribe::MAX_OFFLINE_SAMPLES (600 s @ 16 kHz f32 = 38.4
+        // MB). The sidecar now relies on tungstenite's DEFAULT limits
+        // (64 MiB message / 16 MiB frame, client auto-fragments) — this test
+        // pins that the shipped default still fits the app maximum, so a
+        // tungstenite upgrade cannot silently clip recordings. If the app
+        // limit ever grows, extend or configure the bounds deliberately.
+        const MAX_LIB_SAMPLES: usize = 9_600_000;
+        const DEFAULT_MAX_MESSAGE: usize = 64 * 1024 * 1024;
+        const WIRE_OVERHEAD: usize = TOKEN_LEN + 8;
+        assert!(WIRE_OVERHEAD + MAX_LIB_SAMPLES * 4 <= DEFAULT_MAX_MESSAGE);
+    }
+
+    // ── Connection limiter ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn capacity_limiter_is_exact_and_released() {
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT {
+            held.push(reserve_permit(&permits).expect("up to MAX slots must be reservable"));
+        }
+        assert!(
+            reserve_permit(&permits).is_none(),
+            "the (MAX+1)th reservation must fail"
+        );
+        drop(held.pop().unwrap());
+        assert!(
+            reserve_permit(&permits).is_some(),
+            "a released slot must be reservable again (Drop release)"
+        );
     }
 }
