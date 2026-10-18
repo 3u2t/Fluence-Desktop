@@ -254,17 +254,31 @@ fn generate_spawn_token() -> String {
 /// Note: the Sherpa sidecar keeps the bare-TCP readiness contract
 /// (documented residual risk until it receives a compatible fix).
 async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
-    let url = format!("ws://127.0.0.1:{}", port);
-    let connect = tokio_tungstenite::connect_async(&url);
-    let (mut ws, _) = match tokio::time::timeout(Duration::from_secs(5), connect).await {
+    let url = format!("ws://127.0.0.1:{port}");
+    let (mut ws, _) = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    {
         Ok(Ok(v)) => v,
-        _ => return false,
+        Ok(Err(e)) => {
+            // Almost always "nothing is listening yet": the sidecar reads its
+            // stdin token and loads the model BEFORE it binds the port.
+            log::debug!("readiness probe {port}: connect failed: {e}");
+            return false;
+        }
+        Err(_) => {
+            log::debug!("readiness probe {port}: connect timed out after 5s");
+            return false;
+        }
     };
     let probe = tokio_tungstenite::tungstenite::Message::Text(format!("probe:{token}"));
     if tokio::time::timeout(Duration::from_secs(2), ws.send(probe))
         .await
         .is_err()
     {
+        log::warn!("readiness probe {port}: sending probe timed out");
         let _ = ws.close(None).await;
         return false;
     }
@@ -273,11 +287,14 @@ async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
-                    text = Some(t);
+                    text = Some(t.to_string());
                     break;
                 }
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(e) => {
+                    log::warn!("readiness probe {port}: socket error waiting for reply: {e}");
+                    break;
+                }
             }
         }
         text
@@ -286,7 +303,21 @@ async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
     .ok()
     .flatten();
     let _ = ws.close(None).await;
-    matches!(reply, Some(t) if t.contains("moonshine-v2"))
+    match &reply {
+        Some(t) if t.contains("moonshine-v2") => true,
+        Some(t) => {
+            // Reached the server but it did not vouch for itself: a different
+            // (or stale) process owns this port.
+            log::warn!(
+                "readiness probe {port}: unexpected reply {t:?} - port is held by another process"
+            );
+            false
+        }
+        None => {
+            log::warn!("readiness probe {port}: no reply within 2s");
+            false
+        }
+    }
 }
 
 /// Client wire contract for the local ASR sidecars:
@@ -530,22 +561,42 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
     // bind. For the moonshine sidecar the readiness signal is therefore the
     // WebSocket handshake + `probe:<token>` reply naming this server.
     // Sherpa keeps the legacy bare-TCP contract (documented residual risk).
+    //
+    // The moonshine path must call the probe DIRECTLY. Gating it behind a
+    // bare `std::net::TcpStream::connect` connected and immediately dropped a
+    // socket on every poll: the sidecar accepted it, blocked on an HTTP
+    // upgrade request that never came, and logged a spurious
+    // "websocket accept failed: Handshake not finished" per attempt while
+    // each dead connection also burned one of its MAX_CONCURRENT slots.
+    // Budget readiness by deadline, not iteration count. The sidecar reads its
+    // stdin token (up to 10s) and loads the ONNX model BEFORE it binds the
+    // port, so a cold start takes far longer than the old fixed 30x100ms
+    // (~3s) loop allowed - which killed a sidecar that was still loading and
+    // surfaced as "nothing was pasted" with no error on the sidecar side.
+    const READY_DEADLINE: Duration = Duration::from_secs(60);
+    let give_up_at = Instant::now() + READY_DEADLINE;
     let mut ready = false;
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            match spawn_token.as_deref() {
-                None => {
-                    ready = true;
-                    break;
-                }
-                Some(token) => {
-                    if probe_moonshine_ready(port, token).await {
-                        ready = true;
-                        break;
-                    }
-                }
-            }
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ready_now = match spawn_token.as_deref() {
+            Some(token) => probe_moonshine_ready(port, token).await,
+            // Sherpa only: legacy bare-TCP readiness contract, unchanged.
+            None => tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok(),
+        };
+        if ready_now {
+            ready = true;
+            break;
+        }
+        if Instant::now() >= give_up_at {
+            log::error!(
+                "{} server was not ready within {:?} on port {}",
+                server_label,
+                READY_DEADLINE,
+                port
+            );
+            break;
         }
     }
 
@@ -686,6 +737,9 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// Shape-valid but meaningless token for negative-path tests.
+    const TEST_TOKEN: &str = "00000000000000000000000000000000";
 
     #[test]
     fn engine_display_parse_round_trip() {
@@ -835,6 +889,21 @@ mod tests {
         assert!(
             32 + 8 + crate::transcribe::MAX_OFFLINE_SAMPLES * 4 <= SIDE_MACHINE_DEFAULT_MAX_MESSAGE
         );
+    }
+
+    // The probe must fail closed - return false, not hang, panic, or treat an
+    // unanswered port as ready - when nothing is listening. Uses a port this
+    // test does not bind, so it needs no sidecar and no external process.
+    //
+    // The positive path (probe against a live sidecar) is deliberately NOT
+    // asserted here: it requires a spawned moonshine-v2-server with a matching
+    // token and is covered by the manual E2E pass, not by `cargo test`.
+    #[tokio::test]
+    async fn readiness_probe_fails_closed_when_nothing_is_listening() {
+        for port in [6399u16, 6398] {
+            let ok = probe_moonshine_ready(port, TEST_TOKEN).await;
+            assert!(!ok, "probe must report not-ready on dead port {port}");
+        }
     }
 
     #[tokio::test]
