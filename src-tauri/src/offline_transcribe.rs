@@ -244,16 +244,28 @@ fn generate_spawn_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ProbeOutcome {
+    /// The spawned sidecar answered the authenticated handshake.
+    Ready,
+    /// Nothing is listening yet - normal while the model loads.
+    NotYet,
+    /// Something answered the TCP/WebSocket connect but never produced the
+    /// named reply. A stale sidecar build (predating the token protocol)
+    /// behaves exactly like this, and retrying cannot help: it will never
+    /// answer. Fail fast so the user gets a real error instead of hanging.
+    Incompatible,
+}
+
 /// Authenticated readiness probe for the moonshine sidecar. A bare TCP
 /// connect does NOT prove that the spawned sidecar owns the port — any
 /// local process could hold it first and pass the health check while the
 /// real sidecar dies on its own bind. This completes the WebSocket
 /// handshake and sends `probe:<token>`; only the sidecar, which knows the
-/// fresh spawn secret, can answer with the named reply. Fail-closed:
-/// anything but that reply (or a timeout) returns false.
+/// fresh spawn secret, can answer with the named reply.
 /// Note: the Sherpa sidecar keeps the bare-TCP readiness contract
 /// (documented residual risk until it receives a compatible fix).
-async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
+async fn probe_moonshine_ready(port: u16, token: &str) -> ProbeOutcome {
     let url = format!("ws://127.0.0.1:{port}");
     let (mut ws, _) = match tokio::time::timeout(
         Duration::from_secs(5),
@@ -266,11 +278,11 @@ async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
             // Almost always "nothing is listening yet": the sidecar reads its
             // stdin token and loads the model BEFORE it binds the port.
             log::debug!("readiness probe {port}: connect failed: {e}");
-            return false;
+            return ProbeOutcome::NotYet;
         }
         Err(_) => {
             log::debug!("readiness probe {port}: connect timed out after 5s");
-            return false;
+            return ProbeOutcome::NotYet;
         }
     };
     let probe = tokio_tungstenite::tungstenite::Message::Text(format!("probe:{token}"));
@@ -280,7 +292,7 @@ async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
     {
         log::warn!("readiness probe {port}: sending probe timed out");
         let _ = ws.close(None).await;
-        return false;
+        return ProbeOutcome::Incompatible;
     }
     let reply = tokio::time::timeout(Duration::from_secs(2), async {
         let mut text: Option<String> = None;
@@ -304,18 +316,22 @@ async fn probe_moonshine_ready(port: u16, token: &str) -> bool {
     .flatten();
     let _ = ws.close(None).await;
     match &reply {
-        Some(t) if t.contains("moonshine-v2") => true,
+        Some(t) if t.contains("moonshine-v2") => ProbeOutcome::Ready,
         Some(t) => {
-            // Reached the server but it did not vouch for itself: a different
-            // (or stale) process owns this port.
+            // Reached the server but it did not vouch for itself: either a
+            // different process owns the port, or a stale sidecar build is
+            // running. Neither will ever answer correctly, so stop retrying.
             log::warn!(
                 "readiness probe {port}: unexpected reply {t:?} - port is held by another process"
             );
-            false
+            ProbeOutcome::Incompatible
         }
         None => {
-            log::warn!("readiness probe {port}: no reply within 2s");
-            false
+            log::warn!(
+                "readiness probe {port}: connected but no reply within 2s - the sidecar on this \
+                 port is stale (built before the auth-token protocol) or not a moonshine server"
+            );
+            ProbeOutcome::Incompatible
         }
     }
 }
@@ -576,10 +592,22 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
     const READY_DEADLINE: Duration = Duration::from_secs(60);
     let give_up_at = Instant::now() + READY_DEADLINE;
     let mut ready = false;
+    let mut incompatible = false;
     loop {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let ready_now = match spawn_token.as_deref() {
-            Some(token) => probe_moonshine_ready(port, token).await,
+            Some(token) => match probe_moonshine_ready(port, token).await {
+                ProbeOutcome::Ready => true,
+                // Nothing listening yet - normal while the model loads.
+                ProbeOutcome::NotYet => false,
+                // A stale sidecar build will never answer. Retrying for the
+                // full deadline only produced a minute of silent pulsing, so
+                // stop and say why.
+                ProbeOutcome::Incompatible => {
+                    incompatible = true;
+                    break;
+                }
+            },
             // Sherpa only: legacy bare-TCP readiness contract, unchanged.
             None => tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -604,6 +632,12 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
         let mut lock = SERVER_INSTANCE.lock().unwrap();
         if let Some(mut instance) = lock.take() {
             let _ = instance.child.kill();
+        }
+        if incompatible {
+            return Err(anyhow!(
+                "The local transcription sidecar is outdated and cannot be used. \
+                 Rebuild it with: cargo build --release -p moonshine-v2-server"
+            ));
         }
         return Err(anyhow!(
             "{} server failed to start on port {}",
@@ -901,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_probe_fails_closed_when_nothing_is_listening() {
         for port in [6399u16, 6398] {
-            let ok = probe_moonshine_ready(port, TEST_TOKEN).await;
+            let ok = probe_moonshine_ready(port, TEST_TOKEN).await == ProbeOutcome::Ready;
             assert!(!ok, "probe must report not-ready on dead port {port}");
         }
     }
@@ -973,7 +1007,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut ok = false;
         while Instant::now() < deadline {
-            if probe_moonshine_ready(port, &token).await {
+            if probe_moonshine_ready(port, &token).await == ProbeOutcome::Ready {
                 ok = true;
                 break;
             }

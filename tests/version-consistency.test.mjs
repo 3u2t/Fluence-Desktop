@@ -70,15 +70,21 @@ test('release notes have a single source of truth', () => {
     !workflow.includes("releaseBody: |"),
     'releaseBody must not carry an inline narrative block',
   );
-  const narrativeSentinel = 'public build of the sync reliability work';
-  const narrativeCount =
-    (workflow.split(narrativeSentinel).length - 1) +
-    (bodyFile.split(narrativeSentinel).length - 1);
-  assert.equal(
-    narrativeCount,
-    1,
-    'specific release narrative must appear exactly once across workflow + notes',
-  );
+  // Release-agnostic: the workflow must never carry the narrative itself.
+  // Previously this pinned one sentence from a specific release, so it broke
+  // on every legitimate notes rewrite - which is exactly when you least want
+  // a red test. Compare against the CURRENT file's own headings instead.
+  const headings = bodyFile
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('#'));
+  assert.ok(headings.length > 0, 'release notes must have at least one heading');
+  for (const h of headings) {
+    assert.ok(
+      !workflow.includes(h),
+      `workflow must not duplicate release-note heading: ${h}`,
+    );
+  }
   assert.ok(
     !workflow.includes('Keep in sync'),
     'no dual-copy contract: editors must only touch RELEASE_BODY.md',
