@@ -58,8 +58,6 @@ pub fn run() {
     // %LOCALAPPDATA%\Fluence\fluence.log so a packaged build (which has no
     // console to read) can still be diagnosed. Must run exactly once.
     applog::init();
-    // Clear sidecars left holding the fixed port range by a previous run.
-    offline_transcribe::reap_orphaned_sidecar();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {

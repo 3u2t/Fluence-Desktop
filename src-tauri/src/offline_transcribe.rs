@@ -114,6 +114,7 @@ fn start_idle_monitor() {
                 let mut lock = SERVER_INSTANCE.lock().unwrap();
                 if let Some(mut instance) = lock.take() {
                     let _ = instance.child.kill();
+                    forget_sidecar_pid();
                 }
                 IDLE_MONITOR_RUNNING.store(false, Ordering::SeqCst);
                 break;
@@ -486,6 +487,7 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
                     engine.display_name()
                 );
                 let _ = instance.child.kill();
+                forget_sidecar_pid();
                 *lock = None;
             }
         }
@@ -593,6 +595,15 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
             break;
         }
     }
+    // We have no live sidecar and are about to take a port in the fixed
+    // range, so any process recorded by a PREVIOUS run of the app is an
+    // orphan squatting it. Reaped here rather than at startup: at startup a
+    // double-launch (shortcut twice, autostart plus manual) would run the
+    // reaper before the single-instance plugin had handed off to the running
+    // instance, terminating that instance's live sidecar mid-transcription.
+    // Reaching this point proves we ARE the running instance.
+    reap_orphaned_sidecar();
+
     let server_label = match engine.v2_arch() {
         Some(_) => "moonshine-v2",
         None => "sherpa-onnx",
@@ -737,6 +748,7 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
         let mut lock = SERVER_INSTANCE.lock().unwrap();
         if let Some(mut instance) = lock.take() {
             let _ = instance.child.kill();
+            forget_sidecar_pid();
         }
         if incompatible {
             return Err(anyhow!(
