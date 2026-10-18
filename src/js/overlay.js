@@ -1370,7 +1370,14 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       try {
         await invoke('copy_text', { text: action.content || '' });
       } catch (err) {
+        // Never report success for a copy that did not happen.
         console.error('Failed to copy to clipboard:', err);
+        if (!isSessionActive(sessionId)) return;
+        setState('error');
+        setStatusMessage(describeInjectError(err));
+        agentRetryContext = null;
+        scheduleAutoDismiss(6000);
+        return;
       }
       if (!isSessionActive(sessionId)) return;
       setState('success');

@@ -43,6 +43,12 @@ const W = 'crate::acl::WIZARD_WINDOW';
 // Deliberately open (low risk, documented in src-tauri/src/acl.rs):
 //   get_app_version, get_hotkey_state, list_audio_devices,
 //   get_dictionary, get_settings
+// Commands whose OWN body carries no `require_caller`, as detected by the
+// brace-matching scan below. This is the BODY-LEVEL open set, not the
+// effective one: `import_dictionary` and `import_dictionary_report` delegate
+// to `import_dictionary_impl`, which does gate. They are listed because the
+// scan cannot see through a call, and a separate test below asserts that the
+// delegate keeps its gate - so the effective open surface is 11, not 13.
 const EXPECTED_OPEN = [
   'audio.rs:is_recording',
   'audio.rs:list_audio_devices',
@@ -57,6 +63,12 @@ const EXPECTED_OPEN = [
   'hotkey.rs:get_hotkey_state',
   'main.rs:get_app_version',
   'settings.rs:get_settings',
+];
+
+// Commands listed above only because they gate via a shared implementation.
+const DELEGATED_GATES = [
+  ['dictionary.rs', 'import_dictionary', 'import_dictionary_impl'],
+  ['dictionary.rs', 'import_dictionary_report', 'import_dictionary_impl'],
 ];
 
 function rustFiles(dir) {
@@ -111,6 +123,29 @@ test('every tauri command is gated, or is a pinned known-open command', () => {
       `  now gated (drop from EXPECTED_OPEN): ${EXPECTED_OPEN.filter((x) => !actual.includes(x)).join(', ') || '(none)'}\n` +
       '  see EXPECTED_OPEN in tests/command-gating.test.mjs',
   );
+});
+
+test('commands gated via a shared implementation keep that gate', () => {
+  // Guards the delegation gap the body scan cannot see: if someone drops the
+  // gate from the shared impl, these two commands silently become ungated.
+  for (const [file, caller, impl] of DELEGATED_GATES) {
+    const text = src(file);
+    const implAt = text.indexOf(`fn ${impl}(`);
+    assert.notEqual(implAt, -1, `${file}: ${impl} not found`);
+    const implSrc = text.slice(implAt, text.indexOf('\n}', implAt));
+    assert.match(
+      implSrc,
+      /require_caller\(/,
+      `${file}: ${impl} lost its gate, so ${caller} is now ungated`,
+    );
+    const callerAt = text.indexOf(`fn ${caller}(`);
+    assert.notEqual(callerAt, -1, `${file}: ${caller} not found`);
+    const callerSrc = text.slice(callerAt, text.indexOf('\n}', callerAt));
+    assert.ok(
+      callerSrc.includes(impl),
+      `${file}: ${caller} must delegate to ${impl} to inherit its gate`,
+    );
+  }
 });
 
 // Security-critical commands pinned to their exact allow-list. A gate widened

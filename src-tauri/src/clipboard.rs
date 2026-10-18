@@ -488,10 +488,15 @@ pub fn capture_target_window(window: tauri::Window) -> Option<u64> {
     }
 }
 
-/// True when the current foreground window equals `target`. HWNDs are
-/// compared as raw values only (never dereferenced), so destroyed or
-/// recycled targets fail closed with an error, never a crash or a wrong
-/// window paste.
+/// True when the current foreground window equals `target`.
+///
+/// HWNDs are compared as raw values and never dereferenced, so a stale or
+/// destroyed handle cannot crash this. It is NOT a proof of identity: Windows
+/// recycles HWND values, so a destroyed target whose handle is reused by a
+/// different window that later takes focus would compare equal. That window
+/// would have to open between capture and paste (a fraction of a second) and
+/// then be foregrounded - closing the target is not sufficient on its own.
+/// Closing this fully needs the target's PID captured alongside the handle.
 #[cfg(target_os = "windows")]
 fn foreground_window_matches(target: u64) -> bool {
     let foreground = unsafe { GetForegroundWindow() };
