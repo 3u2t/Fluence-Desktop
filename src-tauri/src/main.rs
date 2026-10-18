@@ -14,6 +14,7 @@ mod acl;
 mod agent;
 mod agents;
 mod app_icon;
+mod applog;
 mod audio;
 mod auto_learn;
 mod autostart;
@@ -305,5 +306,9 @@ pub fn run() {
 }
 
 fn main() {
+    // Install the logger FIRST: without it every log::warn!/error! in the
+    // codebase is discarded, including the diagnostics that explain why
+    // local ASR startup failed.
+    applog::init();
     run();
 }
