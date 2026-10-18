@@ -883,6 +883,27 @@ function hideCopy() {
   if (btn) btn.hidden = true;
 }
 
+// Map a backend injection failure to a short, specific status line. Without
+// this every failure showed the same generic "Insert failed", which made it
+// impossible to tell a wrong-window refusal from a blocked SendInput.
+function describeInjectError(err) {
+  const raw = String(err || '');
+  if (raw.includes('CLIPBOARD_WOULD_LOSE_DATA')) return 'Clipboard has an image/files';
+  if (raw.includes('TARGET_WINDOW_CHANGED')) return 'Return to target window';
+  if (raw.includes('PASTE_FAILED')) {
+    const m = raw.match(/delivered (\d+) of 4/);
+    return m ? `Keys blocked (${m[1]}/4)` : 'Keys blocked';
+  }
+  if (raw.includes('KEYBOARD_ACTION_FAILED')) {
+    const m = raw.match(/delivered (\d+) of (\d+)/);
+    return m ? `Keys blocked (${m[1]}/${m[2]})` : 'Keys blocked';
+  }
+  if (raw.includes('Not allowed from this window')) return 'Blocked by permissions';
+  const trimmed = raw.trim();
+  if (!trimmed) return 'Insert failed';
+  return trimmed.length > 42 ? `${trimmed.slice(0, 42)}...` : trimmed;
+}
+
 async function handlePasteFailure(pending, err, sessionId) {
   if (!isSessionActive(sessionId)) {
     // Session is over: the transcript was already saved to history before
@@ -891,17 +912,9 @@ async function handlePasteFailure(pending, err, sessionId) {
     return;
   }
   pendingInjection = pending;
-  const message = String(err || '');
-  const changedTarget = message.includes('TARGET_WINDOW_CHANGED');
-  const clipboardLoss = message.includes('CLIPBOARD_WOULD_LOSE_DATA');
+  console.error('[overlay] injection failed:', String(err || ''));
   setState('error');
-  if (clipboardLoss) {
-    // Nothing was damaged: injection refused before touching the clipboard.
-    // Retry is the explicit "replace it anyway" consent.
-    setStatusMessage('Clipboard has an image/files');
-  } else {
-    setStatusMessage(changedTarget ? 'Return to target window' : 'Insert failed');
-  }
+  setStatusMessage(describeInjectError(err));
   if (pending.kind === 'text') showCopy();
   showRetry();
   scheduleAutoDismiss(12000);
