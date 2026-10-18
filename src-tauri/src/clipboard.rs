@@ -129,44 +129,84 @@ fn get_clipboard_text() -> Option<String> {
 }
 
 /// Set clipboard to a UTF-16 string (Windows)
+///
+/// Allocation and fill happen BEFORE the clipboard is opened or emptied.
+/// `EmptyClipboard()` is irreversible, so every fallible step must precede
+/// it: previously a failed `GlobalAlloc`/`GlobalLock` left the user with an
+/// empty clipboard, and the text-only snapshot cannot restore content it
+/// never read.
 #[cfg(target_os = "windows")]
 fn set_clipboard_text(text: &str) -> Result<()> {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let byte_len = wide.len() * 2;
 
+    // 1. Prepare the memory while the clipboard is still untouched.
+    let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }
+        .map_err(|e| anyhow!("GlobalAlloc failed: {}", e))?;
+    let ptr = unsafe { GlobalLock(hmem) };
+    if ptr.is_null() {
+        let _ = unsafe { GlobalFree(hmem) };
+        return Err(anyhow!("GlobalLock failed"));
+    }
     unsafe {
-        open_clipboard_with_retry()?;
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, byte_len);
+        let _ = GlobalUnlock(hmem);
+    }
+
+    // 2. Only now is it safe to destroy what is there.
+    unsafe {
+        if let Err(e) = open_clipboard_with_retry() {
+            let _ = GlobalFree(hmem);
+            return Err(e);
+        }
         if let Err(e) = EmptyClipboard() {
             let _ = CloseClipboard();
+            let _ = GlobalFree(hmem);
             return Err(anyhow!("EmptyClipboard failed: {}", e));
         }
-
-        let hmem = match GlobalAlloc(GMEM_MOVEABLE, byte_len) {
-            Ok(hmem) => hmem,
-            Err(e) => {
-                let _ = CloseClipboard();
-                return Err(anyhow!("GlobalAlloc failed: {}", e));
-            }
-        };
-        let ptr = GlobalLock(hmem);
-        if ptr.is_null() {
-            let _ = CloseClipboard();
-            let _ = GlobalFree(hmem);
-            return Err(anyhow!("GlobalLock failed"));
-        }
-        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, byte_len);
-        GlobalUnlock(hmem).ok();
-
         if let Err(e) = SetClipboardData(CF_UNICODETEXT, windows::Win32::Foundation::HANDLE(hmem.0))
         {
             let _ = CloseClipboard();
             let _ = GlobalFree(hmem);
             return Err(anyhow!("SetClipboardData failed: {}", e));
         }
-
         let _ = CloseClipboard();
     }
     Ok(())
+}
+
+/// Clipboard formats that text-only snapshot/restore cannot bring back.
+/// Injection calls `EmptyClipboard()`, so anything here is destroyed with no
+/// recovery path. Text and text derivatives (HTML/RTF, which ride along
+/// whenever a browser or Word copies) are deliberately not listed - warning
+/// on those would fire constantly and train users to ignore the warning.
+#[cfg(target_os = "windows")]
+const UNPRESERVABLE_FORMATS: &[(&str, u32)] = &[
+    ("bitmap", 2),
+    ("DIB", 8),
+    ("enhanced metafile", 14),
+    ("file drop list", 15),
+    ("DIBV5", 17),
+];
+
+/// True when the clipboard holds at least one format that `inject_text`
+/// would silently destroy. Returns false if the clipboard cannot be read:
+/// the caller then proceeds as before rather than blocking injection on a
+/// failed probe.
+#[cfg(target_os = "windows")]
+fn clipboard_has_unpreservable_formats() -> bool {
+    if open_clipboard_with_retry().is_err() {
+        return false;
+    }
+    let found = UNPRESERVABLE_FORMATS
+        .iter()
+        .find(|(_, fmt)| unsafe { IsClipboardFormatAvailable(*fmt) }.is_ok())
+        .map(|(name, _)| *name);
+    let _ = unsafe { CloseClipboard() };
+    if let Some(name) = found {
+        log::warn!("clipboard holds {name} data that text injection would destroy");
+    }
+    found.is_some()
 }
 
 #[cfg(target_os = "windows")]
@@ -300,6 +340,7 @@ pub async fn inject_text(
     text: String,
     monitor_auto_learn: Option<bool>,
     target_window: Option<u64>,
+    allow_clipboard_loss: Option<bool>,
 ) -> Result<(), String> {
     // Text injection simulates paste into the user's applications: the
     // overlay is its only legitimate caller.
@@ -328,6 +369,20 @@ pub async fn inject_text(
 
         let _transaction = CLIPBOARD_INJECTION_LOCK.lock().await;
         let start_time = std::time::Instant::now();
+
+        // Fail closed BEFORE anything destructive when the clipboard holds
+        // content that a text-only snapshot cannot restore. Injection has to
+        // EmptyClipboard() to paste, so without this the user silently loses
+        // an image or a copied file. The caller re-issues with
+        // allow_clipboard_loss=true once the user has been told.
+        if !allow_clipboard_loss.unwrap_or(false) && clipboard_has_unpreservable_formats() {
+            return Err(
+                "CLIPBOARD_WOULD_LOSE_DATA: clipboard holds non-text content (image or \
+                 files) that pasting would erase"
+                    .to_string(),
+            );
+        }
+
         // Save current clipboard
         let saved = get_clipboard_text();
         let save_duration = start_time.elapsed();

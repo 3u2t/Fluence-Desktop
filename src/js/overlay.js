@@ -850,8 +850,15 @@ function injectionArgsWithTarget(args) {
   return merged;
 }
 
-async function attemptPaste(text, monitorAutoLearn) {
-  return invoke('inject_text', injectionArgsWithTarget({ text, monitorAutoLearn }));
+async function attemptPaste(text, monitorAutoLearn, allowClipboardLoss = false) {
+  return invoke(
+    'inject_text',
+    injectionArgsWithTarget({
+      text,
+      monitorAutoLearn,
+      allowClipboardLoss,
+    }),
+  );
 }
 
 async function attemptKeyboardAction(action, charCount) {
@@ -888,9 +895,17 @@ async function handlePasteFailure(pending, err, sessionId) {
     return;
   }
   pendingInjection = pending;
-  const changedTarget = String(err || '').includes('TARGET_WINDOW_CHANGED');
+  const message = String(err || '');
+  const changedTarget = message.includes('TARGET_WINDOW_CHANGED');
+  const clipboardLoss = message.includes('CLIPBOARD_WOULD_LOSE_DATA');
   setState('error');
-  setStatusMessage(changedTarget ? 'Return to target window' : 'Insert failed');
+  if (clipboardLoss) {
+    // Nothing was damaged: injection refused before touching the clipboard.
+    // Retry is the explicit "replace it anyway" consent.
+    setStatusMessage('Clipboard has an image/files');
+  } else {
+    setStatusMessage(changedTarget ? 'Return to target window' : 'Insert failed');
+  }
   if (pending.kind === 'text') showCopy();
   hideActionConfirm();
   showRetry();
@@ -905,7 +920,9 @@ async function retryPendingInjection(sessionId) {
   setStatusMessage('');
   try {
     if (pending.kind === 'text') {
-      await attemptPaste(pending.text, pending.monitorAutoLearn);
+      // Retry is a deliberate second click, so it also stands in for the
+      // user accepting that their image/file clipboard will be replaced.
+      await attemptPaste(pending.text, pending.monitorAutoLearn, true);
     } else {
       await attemptKeyboardAction(pending.action, pending.charCount);
     }

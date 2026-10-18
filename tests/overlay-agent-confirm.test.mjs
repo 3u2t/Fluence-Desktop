@@ -106,7 +106,9 @@ test('non-destructive actions are never members of the dangerous set', () => {
 
 test('retry re-runs the exact pending action against the validated target', () => {
   const retry = overlay.slice(overlay.indexOf('async function retryPendingInjection'));
-  assert.match(retry, /attemptPaste\(pending\.text, pending\.monitorAutoLearn\)/);
+  // Retry is a deliberate second click, so it carries allowClipboardLoss:
+  // it is the user's consent to replace an image/file clipboard.
+  assert.match(retry, /attemptPaste\(pending\.text, pending\.monitorAutoLearn, true\)/);
   assert.match(retry, /attemptKeyboardAction\(pending\.action, pending\.charCount\)/);
   assert.match(retry, /handlePasteFailure\(pending, err/, 'a failed retry re-enters recovery');
   const args = overlay.slice(overlay.indexOf('function injectionArgsWithTarget'));
