@@ -31,35 +31,20 @@ test('the overlay window cannot take OS focus (WS_EX_NOACTIVATE by config)', () 
   );
 });
 
-test('dangerous agent actions are pinned to delete/select-all/submit only', () => {
-  const setLine = overlay.match(
-    /AGENT_DANGEROUS_ACTIONS\s*=\s*new Set\(\[([^\]]*)\]\)/,
+
+test('agent actions execute immediately with no confirmation gate', () => {
+  // Product decision: agent mode does not prompt. insert/rewrite/delete/
+  // select-all/submit all dispatch on the first result.
+  for (const gone of ['AGENT_DANGEROUS_ACTIONS', 'requestActionConfirmation', 'action-confirm']) {
+    assert.ok(!overlay.includes(gone), 'agent flow must not reference ' + gone);
+  }
+  const branch = overlay.indexOf('let executed = false');
+  assert.notEqual(branch, -1, 'agent dispatch block must exist');
+  assert.notEqual(
+    overlay.indexOf('attemptPaste(action.content', branch),
+    -1,
+    'dispatch must reach the first action without waiting on anything',
   );
-  assert.notEqual(setLine, null, 'dangerous set must exist');
-  const members = setLine[1].split(',').map((s) => s.trim().replaceAll("'", ''));
-  assert.deepEqual(members.sort(), ['delete_chars', 'select_all', 'submit']);
-});
-
-test('destructive agent actions gate on an explicit confirmation resolution', () => {
-  const flow = overlay.slice(overlay.indexOf('function requestActionConfirmation'));
-  assert.match(flow, /resolve\(value\)/, 'confirmation must resolve with the user answer');
-  assert.match(flow, /actionConfirmTimer\s*=\s*setTimeout/, 'prompt must auto-timeout');
-  assert.match(flow, /resolve\(false\)/, 'timeout/cancel resolves to NOT confirmed');
-  const wire = overlay.slice(overlay.indexOf('AGENT_DANGEROUS_ACTIONS.has(action.action)'));
-  assert.match(wire, /await requestActionConfirmation\(action\)/);
-  assert.match(wire, /if \(!confirmed\)/, 'unconfirmed path must not fall through to execution');
-});
-
-test('cancel/timeout marks the session cancelled and returns before any keystroke', () => {
-  const gate = overlay.indexOf('AGENT_DANGEROUS_ACTIONS.has(action.action)');
-  assert.notEqual(gate, -1, 'confirm gate must exist in the agent flow');
-  const cancelledIdx = overlay.indexOf("'Cancelled'", gate);
-  assert.notEqual(cancelledIdx, -1, 'cancel must be user-visible');
-  const firstDispatch = overlay.indexOf('attemptKeyboardAction', gate);
-  assert.ok(firstDispatch > cancelledIdx, 'cancellation precedes execution');
-  const between = overlay.slice(cancelledIdx, firstDispatch);
-  assert.match(between, /return;/, 'cancel path must return before execution');
-  assert.match(between, /fadeAndHide/, 'cancel dismisses the overlay promptly');
 });
 
 test('confirmed dispatch window: all four actions, visible success, recoverable failure', () => {
@@ -97,12 +82,6 @@ test('copy agent action is one-click and never touches the confirm gate', () => 
   assert.ok(!copyWindow.includes('requestActionConfirmation'));
 });
 
-test('non-destructive actions are never members of the dangerous set', () => {
-  for (const action of ['insert', 'rewrite', 'copy']) {
-    const setLine = overlay.match(/AGENT_DANGEROUS_ACTIONS\s*=\s*new Set\(\[([^\]]*)\]\)/);
-    assert.ok(!setLine[1].includes(action), `${action} is not a destructive action`);
-  }
-});
 
 test('retry re-runs the exact pending action against the validated target', () => {
   const retry = overlay.slice(overlay.indexOf('async function retryPendingInjection'));

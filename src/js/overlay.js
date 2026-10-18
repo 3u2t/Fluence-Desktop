@@ -92,7 +92,6 @@ function resetTransientUi() {
   clearAutoDismiss();
   hideRetry();
   hideCopy();
-  hideActionConfirm();
   hideRecHint();
   setStatusMessage('');
   hideAppPill();
@@ -162,7 +161,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   setupDiscardButton();
   setupRetryButton();
   setupPasteRecovery();
-  setupActionConfirmation();
   setupHotkeyBusyFeedback();
   // Reset synchronously before any awaits so a hotkey that fires while the
   // settings fetch is in flight never observes a stale state (which would
@@ -827,8 +825,6 @@ function setupRetryButton() {
 // transcript is already in history). P2: dangerous agent actions require an
 // explicit confirm click before any destructive keystroke is sent.
 
-let actionConfirmResolve = null;
-let actionConfirmTimer = null;
 
 function captureTargetForSession(sessionId) {
   invoke('capture_target_window')
@@ -907,7 +903,6 @@ async function handlePasteFailure(pending, err, sessionId) {
     setStatusMessage(changedTarget ? 'Return to target window' : 'Insert failed');
   }
   if (pending.kind === 'text') showCopy();
-  hideActionConfirm();
   showRetry();
   scheduleAutoDismiss(12000);
 }
@@ -964,69 +959,6 @@ function setupPasteRecovery() {
   }
 }
 
-const AGENT_DANGEROUS_ACTIONS = new Set(['delete_chars', 'select_all', 'submit']);
-
-function describeAgentAction(action) {
-  if (action.action === 'submit') return 'Press Enter (submit)?';
-  if (action.action === 'select_all') return 'Select all text (Ctrl+A)?';
-  if (action.action === 'delete_chars') {
-    const n = Number(action.char_count || 0);
-    return n > 0 ? `Delete ${n} characters?` : 'Delete text?';
-  }
-  return `${action.action}?`;
-}
-
-// Dangerous agent actions (submit/select-all/delete) rewrite or press keys
-// in the user's document: they require an explicit Confirm click. Cancel,
-// timeout (20s), and any session UI reset resolve false and the queued
-// keystroke is never executed.
-function requestActionConfirmation(action) {
-  const panel = document.getElementById('action-confirm');
-  const textEl = document.getElementById('action-confirm-text');
-  const yes = document.getElementById('action-confirm-yes');
-  const no = document.getElementById('action-confirm-no');
-  if (!panel || !textEl || !yes || !no) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    if (actionConfirmResolve) {
-      // A previous prompt was somehow left open; it is superseded.
-      clearTimeout(actionConfirmTimer);
-      actionConfirmResolve(false);
-    }
-    actionConfirmResolve = (value) => {
-      clearTimeout(actionConfirmTimer);
-      actionConfirmResolve = null;
-      panel.hidden = true;
-      resolve(value);
-    };
-    textEl.textContent = describeAgentAction(action);
-    panel.hidden = false;
-    clearAutoDismiss();
-    actionConfirmTimer = setTimeout(() => {
-      if (actionConfirmResolve) actionConfirmResolve(false);
-    }, 20000);
-  });
-}
-
-function hideActionConfirm() {
-  if (actionConfirmResolve) actionConfirmResolve(false);
-  const panel = document.getElementById('action-confirm');
-  if (panel) panel.hidden = true;
-}
-
-function setupActionConfirmation() {
-  const yes = document.getElementById('action-confirm-yes');
-  const no = document.getElementById('action-confirm-no');
-  if (yes) {
-    yes.addEventListener('click', () => {
-      if (actionConfirmResolve) actionConfirmResolve(true);
-    });
-  }
-  if (no) {
-    no.addEventListener('click', () => {
-      if (actionConfirmResolve) actionConfirmResolve(false);
-    });
-  }
-}
 
 // ── Hold-to-Record Hint ──────────────────────────────────────────
 
@@ -1148,7 +1080,6 @@ async function fadeAndHide(sessionId = activeSessionId) {
   clearAutoDismiss();
   hideRetry();
   hideCopy();
-  hideActionConfirm();
   setStatusMessage('');
   hideAppPill();
   if (overlayRoot) {
@@ -1419,19 +1350,10 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       await new Promise(r => setTimeout(r, 900));
       await fadeAndHide(sessionId);
     } else {
-      // Dangerous agent actions (submit/select-all/delete) rewrite or press
-      // keys in the user's document: they require an explicit user Confirm
-      // first. insert/rewrite/copy stay one-click as before.
-      if (AGENT_DANGEROUS_ACTIONS.has(action.action)) {
-        const confirmed = await requestActionConfirmation(action);
-        if (!isSessionActive(sessionId)) return;
-        if (!confirmed) {
-          setStatusMessage('Cancelled');
-          await new Promise(r => setTimeout(r, 600));
-          await fadeAndHide(sessionId);
-          return;
-        }
-      }
+      // Agent actions execute immediately, as they did before the
+      // confirmation flow was introduced: insert/rewrite/delete/select-all/
+      // submit all run without a prompt. The paste recovery affordances
+      // (Retry / Copy) still cover a failed injection.
 
       let executed = false;
       try {

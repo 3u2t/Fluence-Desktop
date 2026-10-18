@@ -90,11 +90,12 @@ test('overlay keeps transcripts of superseded sessions unless the user discarded
   );
 });
 
-test('destructive agent actions require confirmation before execution', () => {
-  assert.ok(
-    overlay.includes("AGENT_DANGEROUS_ACTIONS = new Set(['delete_chars', 'select_all', 'submit'])"),
-  );
-  assert.ok(overlay.includes('requestActionConfirmation'));
+test('agent actions run without a confirmation prompt', () => {
+  // Agent mode executes insert/rewrite/delete/select-all/submit directly.
+  assert.ok(!overlay.includes('AGENT_DANGEROUS_ACTIONS'));
+  assert.ok(!overlay.includes('requestActionConfirmation'));
+  // Paste recovery (Retry / Copy) is independent of any prompt and remains.
+  assert.ok(overlay.includes('handlePasteFailure'));
 });
 
 // The overlay window is created with "focus": false and "focusable": false
