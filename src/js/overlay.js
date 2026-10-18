@@ -18,6 +18,11 @@ const { listen } = window.__TAURI__.event;
 // pending injection for the paste-retry/copy UI.
 const supersededSessions = new Set();
 const discardedSessions = new Set();
+// HWND of the window that was foreground when the CURRENT session started,
+// tagged with the session that captured it. Capture is fire-and-forget and
+// its result is dropped when the session is no longer active, so an untagged
+// value would let one session's window be validated against the next
+// session's focus - refusing every paste with TARGET_WINDOW_CHANGED.
 let sessionTargetWindow = null;
 let pendingInjection = null;
 
@@ -58,6 +63,8 @@ const AGENT_LLM_WATCHDOG_MS = 25000;
 
 function beginSession(explicitId) {
   const supersededId = activeSessionId;
+  // A new take must never inherit the previous take's paste target.
+  sessionTargetWindow = null;
   if (typeof explicitId === 'number' && explicitId > 0) {
     activeSessionId = explicitId;
     if (explicitId > nextSessionId) {
@@ -830,7 +837,8 @@ function captureTargetForSession(sessionId) {
   invoke('capture_target_window')
     .then((hwnd) => {
       if (isSessionActive(sessionId)) {
-        sessionTargetWindow = typeof hwnd === 'number' && hwnd > 0 ? hwnd : null;
+        sessionTargetWindow =
+          typeof hwnd === 'number' && hwnd > 0 ? { sessionId, hwnd } : null;
       }
     })
     .catch(() => {
@@ -840,19 +848,23 @@ function captureTargetForSession(sessionId) {
     });
 }
 
-function injectionArgsWithTarget(args) {
+function injectionArgsWithTarget(args, sessionId = activeSessionId) {
   const merged = { ...args };
-  if (sessionTargetWindow) merged.targetWindow = sessionTargetWindow;
+  // Only validate against a window captured by THIS session. If the capture
+  // was dropped or never ran, omit targetWindow entirely so injection falls
+  // back to the pre-hardening behaviour instead of refusing on stale data.
+  if (sessionTargetWindow && sessionTargetWindow.sessionId === sessionId) {
+    merged.targetWindow = sessionTargetWindow.hwnd;
+  }
   return merged;
 }
 
-async function attemptPaste(text, monitorAutoLearn, allowClipboardLoss = false) {
+async function attemptPaste(text, monitorAutoLearn) {
   return invoke(
     'inject_text',
     injectionArgsWithTarget({
       text,
       monitorAutoLearn,
-      allowClipboardLoss,
     }),
   );
 }
@@ -888,7 +900,6 @@ function hideCopy() {
 // impossible to tell a wrong-window refusal from a blocked SendInput.
 function describeInjectError(err) {
   const raw = String(err || '');
-  if (raw.includes('CLIPBOARD_WOULD_LOSE_DATA')) return 'Clipboard has an image/files';
   if (raw.includes('TARGET_WINDOW_CHANGED')) return 'Return to target window';
   if (raw.includes('PASTE_FAILED')) {
     const m = raw.match(/delivered (\d+) of 4/);
@@ -928,9 +939,7 @@ async function retryPendingInjection(sessionId) {
   setStatusMessage('');
   try {
     if (pending.kind === 'text') {
-      // Retry is a deliberate second click, so it also stands in for the
-      // user accepting that their image/file clipboard will be replaced.
-      await attemptPaste(pending.text, pending.monitorAutoLearn, true);
+      await attemptPaste(pending.text, pending.monitorAutoLearn);
     } else {
       await attemptKeyboardAction(pending.action, pending.charCount);
     }
@@ -1218,10 +1227,18 @@ async function runSttFlow(sessionId, retry = false) {
     }).catch(err => console.error('Failed to save history entry:', err));
 
     try {
-      await attemptPaste(result.text, true);
+      // inject_text returns true when it replaced non-text clipboard content
+      // (an image or copied files). It is reported, not blocked: refusing
+      // broke screenshot-and-dictate, where replacing the clipboard is the
+      // whole point.
+      const replacedClipboard = await attemptPaste(result.text, true);
       if (!isSessionActive(sessionId)) return;
       setState('success');
-      setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
+      if (replacedClipboard) {
+        setStatusMessage('Inserted (clipboard replaced)');
+      } else {
+        setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
+      }
       playCompletionChime();
       await new Promise(r => setTimeout(r, 1000));
       await fadeAndHide(sessionId);

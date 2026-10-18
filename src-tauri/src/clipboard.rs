@@ -341,7 +341,7 @@ pub async fn inject_text(
     monitor_auto_learn: Option<bool>,
     target_window: Option<u64>,
     allow_clipboard_loss: Option<bool>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Text injection simulates paste into the user's applications: the
     // overlay is its only legitimate caller.
     crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
@@ -370,18 +370,13 @@ pub async fn inject_text(
         let _transaction = CLIPBOARD_INJECTION_LOCK.lock().await;
         let start_time = std::time::Instant::now();
 
-        // Fail closed BEFORE anything destructive when the clipboard holds
-        // content that a text-only snapshot cannot restore. Injection has to
-        // EmptyClipboard() to paste, so without this the user silently loses
-        // an image or a copied file. The caller re-issues with
-        // allow_clipboard_loss=true once the user has been told.
-        if !allow_clipboard_loss.unwrap_or(false) && clipboard_has_unpreservable_formats() {
-            return Err(
-                "CLIPBOARD_WOULD_LOSE_DATA: clipboard holds non-text content (image or \
-                 files) that pasting would erase"
-                    .to_string(),
-            );
-        }
+        // NOTE: injection has to EmptyClipboard(), so non-text clipboard
+        // content (image, copied files) is replaced and cannot be restored.
+        // It is detected and REPORTED, never blocked: refusing here broke
+        // the exact screenshot-and-dictate workflow that needs it most (the
+        // user pastes by replacing the clipboard constantly). The caller
+        // learns it happened via the returned flag and can surface a notice.
+        let replaced_clipboard_content = clipboard_has_unpreservable_formats();
 
         // Save current clipboard
         let saved = get_clipboard_text();
@@ -443,7 +438,7 @@ pub async fn inject_text(
         }
 
         if paste_ok {
-            Ok(())
+            Ok(replaced_clipboard_content)
         } else {
             log::warn!(
                 "inject_text: SendInput delivered {} of 4 key events; reporting paste failure",
