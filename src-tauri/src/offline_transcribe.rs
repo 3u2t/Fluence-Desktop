@@ -906,6 +906,89 @@ mod tests {
         }
     }
 
+    // End-to-end probe against a REAL spawned sidecar: spawn, deliver the
+    // token over stdin, wait for the model to load, then require the
+    // authenticated probe to succeed.
+    //
+    // `#[ignore]`d on purpose. It needs a downloaded model (~GBs) and spends
+    // ~10-60s loading ONNX weights, so it cannot run in `cargo test` or in
+    // CI. Run it by hand when the sidecar protocol changes:
+    //
+    //     cargo test -p fluence-windows --lib -- --ignored --nocapture
+    //
+    // It self-skips (passes) when the sidecar or model is absent, so it is
+    // safe to run on a machine without them.
+    #[tokio::test]
+    #[ignore = "requires a downloaded moonshine_v2 model; run manually"]
+    async fn live_sidecar_completes_the_stdin_token_and_probe_handshake() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = manifest.join("target");
+        let Some(exe) = v2_sidecar_candidates(None, &manifest, &target)
+            .into_iter()
+            .find(|p| p.is_file())
+        else {
+            eprintln!("SKIP: no staged moonshine-v2-server.exe");
+            return;
+        };
+        let model_dir = crate::offline_downloader::get_moonshine_v2_small_dir();
+        if !model_dir.join("encoder.ort").is_file() {
+            eprintln!(
+                "SKIP: no moonshine_v2_small model at {}",
+                model_dir.display()
+            );
+            return;
+        }
+
+        // Pick a port nothing is using.
+        let mut port = 6231u16;
+        while port < 6400 && !is_port_available(port) {
+            port += 1;
+        }
+        assert!(port < 6400, "no free port for the live sidecar test");
+
+        let token = generate_spawn_token();
+        let mut child = Command::new(&exe)
+            .arg(format!("--port={port}"))
+            .arg(format!("--model-dir={}", model_dir.display()))
+            .arg("--arch=small")
+            .current_dir(&model_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sidecar");
+
+        // Private handshake: one newline-terminated line, then close stdin.
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            use std::io::Write as _;
+            stdin
+                .write_all(format!("{token}\n").as_bytes())
+                .and_then(|_| stdin.flush())
+                .expect("write token to sidecar stdin");
+        }
+
+        // The sidecar binds only AFTER loading the model, so allow a long
+        // wait here even though the app's own budget is 60s.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut ok = false;
+        while Instant::now() < deadline {
+            if probe_moonshine_ready(port, &token).await {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            ok,
+            "live sidecar never answered the authenticated probe on port {port} \
+             (check the sidecar actually rebuilt and supports probe:/stdin tokens)"
+        );
+    }
+
     #[tokio::test]
     async fn oversized_recording_fails_fast_with_a_clear_recoverable_error() {
         let samples = vec![0.0f32; crate::transcribe::MAX_OFFLINE_SAMPLES + 1];
