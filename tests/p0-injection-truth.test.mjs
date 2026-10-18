@@ -18,14 +18,22 @@ function bodyOf(src, signature) {
   return src.slice(start);
 }
 
-test('inject_text validates the captured foreground target BEFORE touching the clipboard', () => {
+test('inject_text targets the current focus window, with no target validation', () => {
+  // Product decision: paste goes wherever the cursor is when transcription
+  // finishes. Reading in one app while dictating and pasting into another is a
+  // primary workflow, so no foreground capture/compare exists any more.
   const body = bodyOf(clip, 'pub async fn inject_text(');
-  const validate = body.indexOf('foreground_window_matches(target)');
-  const lock = body.indexOf('CLIPBOARD_INJECTION_LOCK.lock()');
-  assert.notEqual(validate, -1, 'inject_text must consult foreground_window_matches');
-  assert.notEqual(lock, -1);
-  assert.ok(validate < lock, 'target validation must happen before the clipboard lock');
-  assert.ok(body.includes('TARGET_WINDOW_CHANGED:'), 'target-mismatch sentinel required');
+  assert.ok(!body.includes('foreground_window_matches'), 'no foreground compare');
+  assert.ok(!body.includes('TARGET_WINDOW_CHANGED'), 'no target-mismatch refusal');
+  assert.ok(!body.includes('target_window'), 'no target window parameter');
+  assert.ok(
+    !clip.includes('capture_target_window'),
+    'the capture command is gone entirely',
+  );
+  assert.ok(
+    !clip.includes('foreground_window_matches'),
+    'the match helper is gone entirely',
+  );
 });
 
 test('inject_text reports partial paste delivery truthfully', () => {
@@ -42,44 +50,20 @@ test('execute_keyboard_action reports partial delivery and rejects unknown actio
   assert.ok(body.includes('KEYBOARD_ACTION_FAILED:'));
   assert.ok(body.includes('Unknown keyboard action'));
   assert.ok(body.includes('delete_chars requires a charCount'));
-  const validate = body.indexOf('foreground_window_matches(target)');
-  const sleeps = body.indexOf('sleep(Duration::from_millis(80))');
-  assert.notEqual(validate, -1);
-  assert.ok(validate < sleeps, 'target validation must precede the first keystroke delay');
-});
-
-test('capture_target_window returns the raw HWND and never dereferences it', () => {
-  const body = bodyOf(clip, 'pub fn capture_target_window(');
-  assert.ok(body.includes('Some(foreground.0 as usize as u64)'));
   assert.ok(
-    !body.includes('GetWindowText') && !body.includes('GetWindowTextLength'),
-    'HWND must not be dereferenced to text: raw compare only',
+    !body.includes('foreground_window_matches'),
+    'no target validation gates the first keystroke',
   );
+  assert.ok(body.includes('sleep(Duration::from_millis(80))'));
 });
 
-test('overlay captures a paste target for every recording session', () => {
-  assert.ok(overlay.includes("invoke('capture_target_window')"));
-  // Both hotkey-start paths record the target alongside the app-icon fetch.
-  assert.ok(
-    overlay.includes('captureTargetForSession(sessionId)'),
-    'hotkey-start listeners must capture the target',
-  );
-  // Superseded takes are intentionally never injected (foreground belongs to
-  // the new session), so their finished transcripts are saved but no paste
-  // target is recorded for them. The orphan branch must never inject.
-  const orphan = overlay.indexOf('Superseded take:');
-  assert.notEqual(orphan, -1);
-  const widget = overlay.slice(orphan, overlay.indexOf('}', overlay.indexOf('return;', orphan)));
-  assert.ok(!widget.includes('attemptPaste'), 'superseded takes must not inject');
-});
-
-test('overlay treats TARGET_WINDOW_CHANGED as recoverable, not fatal', () => {
-  assert.ok(overlay.includes('TARGET_WINDOW_CHANGED'));
-  assert.ok(overlay.includes('Return to target window'));
-  assert.ok(overlay.includes('Insert failed'));
+test('a failed injection stays recoverable, whatever the cause', () => {
+  // Paste failure is reported specifically and remains retryable/copyable.
+  assert.ok(overlay.includes('describeInjectError'), 'failures name their cause');
   assert.ok(overlay.includes('pendingInjection'), 'failed injections must be retained for retry');
   assert.ok(overlay.includes('retryPendingInjection'));
   assert.ok(overlay.includes('Copied - paste with Ctrl+V'));
+  assert.ok(!overlay.includes('TARGET_WINDOW_CHANGED'), 'no target-mismatch refusal remains');
 });
 
 test('overlay keeps transcripts of superseded sessions unless the user discarded them', () => {

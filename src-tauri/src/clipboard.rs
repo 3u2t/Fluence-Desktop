@@ -42,7 +42,6 @@ use windows::Win32::{
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
         VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
     },
-    UI::WindowsAndMessaging::GetForegroundWindow,
 };
 
 #[cfg(target_os = "windows")]
@@ -339,8 +338,6 @@ pub async fn inject_text(
     window: tauri::Window,
     text: String,
     monitor_auto_learn: Option<bool>,
-    target_window: Option<u64>,
-    allow_clipboard_loss: Option<bool>,
 ) -> Result<bool, String> {
     // Text injection simulates paste into the user's applications: the
     // overlay is its only legitimate caller.
@@ -348,25 +345,9 @@ pub async fn inject_text(
     check_inject_text_len(&text)?;
     #[cfg(target_os = "windows")]
     {
-        // Fail closed BEFORE any clipboard mutation when the caller captured
-        // the intended target window at recording start: if the foreground
-        // owner changed while the user recorded/edited, pasting now would
-        // inject the transcript into the wrong application. No check is
-        // performed when the caller did not capture a target (None), which
-        // keeps older flows and tests working unchanged.
-        if let Some(target) = target_window {
-            if !foreground_window_matches(target) {
-                log::warn!(
-                    "inject_text: foreground window no longer matches captured target {}; refusing to paste",
-                    target
-                );
-                return Err(
-                    "TARGET_WINDOW_CHANGED: recording target window is no longer focused"
-                        .to_string(),
-                );
-            }
-        }
-
+        // Paste goes wherever the user's cursor is when transcription finishes.
+        // No target-window check: a common flow is to read in one app while
+        // dictating and then paste into another, which that check refused.
         let _transaction = CLIPBOARD_INJECTION_LOCK.lock().await;
         let start_time = std::time::Instant::now();
 
@@ -459,50 +440,6 @@ fn clipboard_sequence_number() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
-/// Capture the foreground window so text injection can later verify that the
-/// same window is still focused immediately before pasting. Returns `None`
-/// when there is no foreground window (secure desktop, screensaver) or on
-/// non-Windows platforms, in which case the frontend simply skips validation
-/// and injection behaves exactly as it did before this command existed.
-/// Only the raw HWND value is compared back; it is never dereferenced, so a
-/// window that was closed between capture and validation is handled safely
-/// as an ordinary mismatch.
-#[tauri::command]
-pub fn capture_target_window(window: tauri::Window) -> Option<u64> {
-    // Only the overlay captures paste targets for its recording sessions.
-    if crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW]).is_err() {
-        return None;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let foreground = unsafe { GetForegroundWindow() };
-        if foreground.0.is_null() {
-            None
-        } else {
-            Some(foreground.0 as usize as u64)
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
-}
-
-/// True when the current foreground window equals `target`.
-///
-/// HWNDs are compared as raw values and never dereferenced, so a stale or
-/// destroyed handle cannot crash this. It is NOT a proof of identity: Windows
-/// recycles HWND values, so a destroyed target whose handle is reused by a
-/// different window that later takes focus would compare equal. That window
-/// would have to open between capture and paste (a fraction of a second) and
-/// then be foregrounded - closing the target is not sufficient on its own.
-/// Closing this fully needs the target's PID captured alongside the handle.
-#[cfg(target_os = "windows")]
-fn foreground_window_matches(target: u64) -> bool {
-    let foreground = unsafe { GetForegroundWindow() };
-    (foreground.0 as usize as u64) == target
-}
-
 /// Copy text while participating in the same clipboard transaction lock as
 /// text injection and active-selection capture.
 #[tauri::command]
@@ -531,29 +468,14 @@ pub async fn execute_keyboard_action(
     window: tauri::Window,
     action: String,
     char_count: Option<usize>,
-    target_window: Option<u64>,
 ) -> Result<(), String> {
     // Keyboard simulation acts on the user's focused application: the
     // overlay is its only legitimate caller.
     crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     #[cfg(target_os = "windows")]
     {
-        // Same foreground guarantee as inject_text: the caller may verify
-        // that the recording target still owns focus before any keystroke
-        // (select-all/delete/submit are destructive) is sent.
-        if let Some(target) = target_window {
-            if !foreground_window_matches(target) {
-                log::warn!(
-                    "execute_keyboard_action: foreground window no longer matches captured target {}; refusing to send '{}'",
-                    target,
-                    action
-                );
-                return Err(
-                    "TARGET_WINDOW_CHANGED: recording target window is no longer focused"
-                        .to_string(),
-                );
-            }
-        }
+        // Like inject_text: keystrokes go to whatever holds focus now.
+        #[cfg_attr(not(target_os = "windows"), allow(unused))]
         sleep(Duration::from_millis(80)).await;
         match action.as_str() {
             "delete_chars" => {

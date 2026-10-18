@@ -74,6 +74,24 @@ jobs:
             throw "Vendor extract missing onnxruntime.dll"
           }
 
+      # tauri.conf.json declares the sidecar as an externalBin, so the file
+      # must exist before ANY cargo invocation that runs the app build script -
+      # which fails the build outright with "resource path ... doesn't exist"
+      # when it is missing. release.yml already stages it; CI must too.
+      - name: build and stage moonshine v2 sidecar
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml -p moonshine-v2-server
+          $triple = (rustc --print host-tuple).Trim()
+          New-Item -ItemType Directory -Force -Path "src-tauri/binaries" | Out-Null
+          Copy-Item "src-tauri/target/release/moonshine-v2-server.exe" `
+            "src-tauri/binaries/moonshine-v2-server-$triple.exe" -Force
+          Copy-Item "src-tauri/target/release/onnxruntime.dll" `
+            "src-tauri/binaries/onnxruntime.dll" -Force
+          if (-not (Test-Path "src-tauri/binaries/moonshine-v2-server-$triple.exe")) {
+            throw "Sidecar staging failed"
+          }
+
       - name: run backend test suite
         working-directory: src-tauri
         run: cargo test --workspace

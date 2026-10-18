@@ -18,12 +18,6 @@ const { listen } = window.__TAURI__.event;
 // pending injection for the paste-retry/copy UI.
 const supersededSessions = new Set();
 const discardedSessions = new Set();
-// HWND of the window that was foreground when the CURRENT session started,
-// tagged with the session that captured it. Capture is fire-and-forget and
-// its result is dropped when the session is no longer active, so an untagged
-// value would let one session's window be validated against the next
-// session's focus - refusing every paste with TARGET_WINDOW_CHANGED.
-let sessionTargetWindow = null;
 let pendingInjection = null;
 
 // DOM refs
@@ -63,8 +57,6 @@ const AGENT_LLM_WATCHDOG_MS = 25000;
 
 function beginSession(explicitId) {
   const supersededId = activeSessionId;
-  // A new take must never inherit the previous take's paste target.
-  sessionTargetWindow = null;
   if (typeof explicitId === 'number' && explicitId > 0) {
     activeSessionId = explicitId;
     if (explicitId > nextSessionId) {
@@ -206,7 +198,6 @@ async function setupEventListeners() {
     const appIcon = loadAppIcon(sessionId);
     // Capture the target HWND for paste validation (same timing window:
     // the target app must own the foreground here).
-    captureTargetForSession(sessionId);
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -297,7 +288,6 @@ async function setupEventListeners() {
     const appIcon = loadAppIcon(sessionId);
     // Capture the target HWND for paste validation (same timing window:
     // the target app must own the foreground here).
-    captureTargetForSession(sessionId);
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -833,57 +823,21 @@ function setupRetryButton() {
 // explicit confirm click before any destructive keystroke is sent.
 
 
-function captureTargetForSession(sessionId) {
-  invoke('capture_target_window')
-    .then((hwnd) => {
-      if (isSessionActive(sessionId)) {
-        sessionTargetWindow =
-          typeof hwnd === 'number' && hwnd > 0 ? { sessionId, hwnd } : null;
-      }
-    })
-    .catch(() => {
-      // No captured target: injection runs without foreground validation,
-      // exactly like sessions before this hardening existed.
-      if (isSessionActive(sessionId)) sessionTargetWindow = null;
-    });
-}
-
-function injectionArgsWithTarget(args, sessionId = activeSessionId) {
-  const merged = { ...args };
-  // Only validate against a window captured by THIS session. If the capture
-  // was dropped or never ran, omit targetWindow entirely so injection falls
-  // back to the pre-hardening behaviour instead of refusing on stale data.
-  if (sessionTargetWindow && sessionTargetWindow.sessionId === sessionId) {
-    merged.targetWindow = sessionTargetWindow.hwnd;
-  }
-  return merged;
-}
-
 async function attemptPaste(text, monitorAutoLearn) {
-  return invoke(
-    'inject_text',
-    injectionArgsWithTarget({
-      text,
-      monitorAutoLearn,
-    }),
-  );
+  return invoke('inject_text', { text, monitorAutoLearn });
 }
 
 async function attemptKeyboardAction(action, charCount) {
-  return invoke(
-    'execute_keyboard_action',
-    injectionArgsWithTarget({ action, charCount }),
-  );
+  return invoke('execute_keyboard_action', { action, charCount });
 }
 
-// Clicking Confirm/Retry/copy does NOT move the foreground window: the
-// overlay window is configured with "focus": false (WS_EX_NOACTIVATE,
-// tauri.conf.json), so the recording target keeps OS focus and SendInput
-// reaches it directly. Hiding the overlay first — the approach used for
-// focusable windows — would only add latency and a window of lost UI, so
-// injection runs while the overlay stays visible: failures stay recoverable
-// (Copy/Retry below) and success states remain readable. Target validation
-// (fail-closed on a changed foreground) lives inside the inject_* commands.
+// Clicking Retry/Copy does NOT move the foreground window: the overlay window
+// is configured with "focusable": false (WS_EX_NOACTIVATE, tauri.conf.json).
+// Injection targets whatever window holds OS focus when transcription finishes
+// - there is no target-window validation, so reading in one app while
+// dictating and pasting into another works. Hiding the overlay first would
+// only add latency and hide the recovery UI, so injection runs while the
+// overlay stays visible.
 
 function showCopy() {
   const btn = document.getElementById('status-copy');
@@ -900,7 +854,7 @@ function hideCopy() {
 // impossible to tell a wrong-window refusal from a blocked SendInput.
 function describeInjectError(err) {
   const raw = String(err || '');
-  if (raw.includes('TARGET_WINDOW_CHANGED')) return 'Return to target window';
+
   if (raw.includes('PASTE_FAILED')) {
     const m = raw.match(/delivered (\d+) of 4/);
     return m ? `Keys blocked (${m[1]}/4)` : 'Keys blocked';

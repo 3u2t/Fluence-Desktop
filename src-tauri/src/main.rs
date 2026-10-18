@@ -227,7 +227,6 @@ pub fn run() {
             clipboard::copy_text,
             clipboard::execute_keyboard_action,
             clipboard::grab_active_selection,
-            clipboard::capture_target_window,
             // History
             history::get_history,
             history::save_history_entry,

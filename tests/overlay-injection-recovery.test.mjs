@@ -83,11 +83,12 @@ test('copy agent action is one-click and never touches the confirm gate', () => 
 });
 
 
-test('retry re-runs the exact pending action against the validated target', () => {
+test('retry re-runs the exact pending action', () => {
   const retry = overlay.slice(overlay.indexOf('async function retryPendingInjection'));
   assert.match(retry, /attemptPaste\(pending\.text, pending\.monitorAutoLearn\)/);
   assert.match(retry, /attemptKeyboardAction\(pending\.action, pending\.charCount\)/);
   assert.match(retry, /handlePasteFailure\(pending, err/, 'a failed retry re-enters recovery');
-  const args = overlay.slice(overlay.indexOf('function injectionArgsWithTarget'));
-  assert.match(args, /targetWindow/, 'injection args must carry the captured target');
+  // No target-window argument is sent: injection targets whatever holds
+  // focus, so reading in one app while dictating into another works.
+  assert.ok(!overlay.includes('targetWindow'), 'no targetWindow argument is threaded');
 });

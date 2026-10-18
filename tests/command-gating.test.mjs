@@ -155,7 +155,6 @@ const labels = [
   ['clipboard.rs', 'copy_text', [O, M]],
   ['clipboard.rs', 'execute_keyboard_action', [O]],
   ['clipboard.rs', 'grab_active_selection', [O]],
-  ['clipboard.rs', 'capture_target_window', [O]],
   ['workflow.rs', 'stop_and_transcribe_recording', [O]],
   ['workflow.rs', 'finish_transcription_flow', [O]],
   ['workflow.rs', 'retry_transcription_flow', [O]],
