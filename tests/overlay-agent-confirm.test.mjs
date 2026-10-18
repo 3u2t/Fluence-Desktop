@@ -24,6 +24,11 @@ test('the overlay window cannot take OS focus (WS_EX_NOACTIVATE by config)', () 
   assert.notEqual(from, -1, 'overlay window definition must exist');
   const windowJson = tauriConf.slice(from, tauriConf.indexOf('}', from));
   assert.match(windowJson, /"focus"\s*:\s*false/, 'overlay must be focus:false');
+  assert.match(
+    windowJson,
+    /"focusable"\s*:\s*false/,
+    'overlay must be focusable:false (this is what applies WS_EX_NOACTIVATE)',
+  );
 });
 
 test('dangerous agent actions are pinned to delete/select-all/submit only', () => {

@@ -41,7 +41,8 @@
         "skipTaskbar": true,
         "visible": false,
         "url": "overlay.html",
-        "focus": false
+        "focus": false,
+        "focusable": false
       },
       {
         "label": "wizard",

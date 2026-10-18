@@ -97,8 +97,9 @@ test('destructive agent actions require confirmation before execution', () => {
   assert.ok(overlay.includes('requestActionConfirmation'));
 });
 
-// The overlay window is created with "focus": false (WS_EX_NOACTIVATE,
-// tauri.conf.json): clicks on it never move the OS foreground window, so
+// The overlay window is created with "focus": false and "focusable": false
+// (WS_EX_NOACTIVATE comes from focusable:false, tauri.conf.json): clicks on
+// it never move the OS foreground window, so
 // there is nothing to "restore" before injecting, and hiding the overlay
 // first would only hide the recovery UI. Injections run against the
 // still-foreground target, whose identity Inject already fail-closed-validates.
