@@ -356,6 +356,110 @@ fn build_audio_payload(samples: &[f32], auth_token: Option<&str>, sample_rate: u
     payload
 }
 
+/// Path we record our sidecar child's PID in, so a later run can reap it.
+fn sidecar_pid_file() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_local_dir()?.join("Fluence");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("sidecar.pid"))
+}
+
+/// Remember the PID of a sidecar we just spawned.
+fn record_sidecar_pid(child: &Child) {
+    let Some(path) = sidecar_pid_file() else {
+        return;
+    };
+    let _ = std::fs::write(path, child.id().to_string());
+}
+
+pub fn forget_sidecar_pid() {
+    if let Some(path) = sidecar_pid_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Kill a sidecar left behind by a previous run of the app.
+///
+/// The app is single-instance, so a PID we recorded earlier and that is still
+/// alive belongs to an orphan. Windows does not run destructors when the app
+/// is terminated, so these otherwise accumulate and squat the fixed port range
+/// (6006..=6029). A squatter answers the readiness probe's TCP connect but
+/// ignores the `probe:<token>` frame, which is indistinguishable from an
+/// out-of-date sidecar and previously surfaced as a misleading "sidecar is
+/// outdated" error.
+///
+/// Only the exact PID we recorded is ever signalled, so an unrelated process
+/// that happens to reuse the ID after ours exited is not touched (we verify
+/// the executable name before terminating).
+pub fn reap_orphaned_sidecar() {
+    let Some(path) = sidecar_pid_file() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    if kill_pid_if_sidecar(pid) {
+        log::warn!("reaped orphaned local-ASR sidecar (pid {pid}) from a previous run");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(target_os = "windows")]
+fn kill_pid_if_sidecar(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    const SIDECAR_NAMES: [&str; 2] = [
+        "moonshine-v2-server",
+        "sherpa-onnx-offline-websocket-server",
+    ];
+
+    // SAFETY: every handle is closed on every path; pid comes from our own file.
+    unsafe {
+        let Ok(handle) = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            pid,
+        ) else {
+            return false;
+        };
+
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let matched = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok()
+            && {
+                let path = String::from_utf16_lossy(&buf[..len as usize]);
+                let file = path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".exe")
+                    .to_ascii_lowercase();
+                SIDECAR_NAMES.contains(&file.as_str())
+            };
+
+        let killed = matched && TerminateProcess(handle, 1).is_ok();
+        let _ = CloseHandle(handle);
+        killed
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_pid_if_sidecar(_pid: u32) -> bool {
+    false
+}
+
 pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
     let _start_lock = SERVER_START_LOCK.lock().await;
     // Check if an existing server is running with the same engine
@@ -560,6 +664,7 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
                 return Err(anyhow!("Failed to deliver auth token to the ASR sidecar"));
             }
         }
+        record_sidecar_pid(&child);
         *lock = Some(ServerInstance {
             child,
             port,
@@ -635,8 +740,10 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
         }
         if incompatible {
             return Err(anyhow!(
-                "The local transcription sidecar is outdated and cannot be used. \
-                 Rebuild it with: cargo build --release -p moonshine-v2-server"
+                "The local transcription sidecar on port {port} answered a connection but not \
+                 the start-up handshake. Either an orphaned sidecar from a previous run still \
+                 holds the port, or the sidecar binary predates the auth-token protocol and \
+                 needs rebuilding: cargo build --release -p moonshine-v2-server"
             ));
         }
         return Err(anyhow!(

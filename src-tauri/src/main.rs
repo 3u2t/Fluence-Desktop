@@ -54,7 +54,12 @@ fn get_app_version(app: tauri::AppHandle) -> String {
 }
 
 pub fn run() {
-    env_logger::init();
+    // env_logger writes to stderr; this tees the same records into
+    // %LOCALAPPDATA%\Fluence\fluence.log so a packaged build (which has no
+    // console to read) can still be diagnosed. Must run exactly once.
+    applog::init();
+    // Clear sidecars left holding the fixed port range by a previous run.
+    offline_transcribe::reap_orphaned_sidecar();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -306,9 +311,5 @@ pub fn run() {
 }
 
 fn main() {
-    // Install the logger FIRST: without it every log::warn!/error! in the
-    // codebase is discarded, including the diagnostics that explain why
-    // local ASR startup failed.
-    applog::init();
     run();
 }
