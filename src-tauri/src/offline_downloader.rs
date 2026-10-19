@@ -657,7 +657,7 @@ pub const MOONSHINE_V2_SERVER_EXE: &str = "moonshine-v2-server";
 #[cfg(target_os = "windows")]
 pub const MOONSHINE_V2_ORT_DLL: &str = "onnxruntime.dll";
 #[cfg(not(target_os = "windows"))]
-pub const MOONSHINE_V2_ORT_DLL: &str = "libonnxruntime.so";
+pub const MOONSHINE_V2_ORT_DLL: &str = "libonnxruntime.so.1";
 
 pub fn get_moonshine_v2_small_dir() -> PathBuf {
     let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
