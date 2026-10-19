@@ -192,7 +192,12 @@ async fn stop_and_transcribe() -> Result<TranscriptionFlowResult, String> {
 }
 
 #[tauri::command]
-pub async fn stop_and_transcribe_recording() -> Result<TranscriptionFlowResult, String> {
+pub async fn stop_and_transcribe_recording(
+    window: tauri::Window,
+) -> Result<TranscriptionFlowResult, String> {
+    // The end-to-end transcription workflow drives the overlay session and
+    // the pending-audio pipeline: overlay-only.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let result = stop_and_transcribe().await?;
 
     if !result.text.is_empty() {
@@ -418,8 +423,11 @@ async fn polish_with_selection(
 
 #[tauri::command]
 pub async fn finish_transcription_flow(
+    window: tauri::Window,
     _app: tauri::AppHandle,
 ) -> Result<TranscriptionFlowResult, String> {
+    // Overlay-only: same workflow surface as stop_and_transcribe_recording.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let start_time = std::time::Instant::now();
     let mut result = stop_and_transcribe().await?;
 
@@ -497,8 +505,11 @@ pub async fn finish_transcription_flow(
 /// Retry the last failed transcription using the retained captured audio.
 #[tauri::command]
 pub async fn retry_transcription_flow(
+    window: tauri::Window,
     _app: tauri::AppHandle,
 ) -> Result<TranscriptionFlowResult, String> {
+    // Overlay-only: the Retry button lives in the overlay card.
+    crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW])?;
     let start_time = std::time::Instant::now();
     let settings = crate::settings::load_settings().map_err(|e| e.to_string())?;
     // Retry always re-transcribes retained audio via the standard batch

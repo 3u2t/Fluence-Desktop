@@ -335,7 +335,7 @@ async fn validate_archive_members(archive_path: &Path) -> Result<()> {
         name.split(['/', '\\']).any(|seg| seg == "..")
     }
 
-    let output = tokio::process::Command::new("tar")
+    let output = tokio::process::Command::new(system_tar_path())
         .arg("-tjf")
         .arg(archive_path)
         .output()
@@ -415,7 +415,7 @@ async fn ensure_server_runtime(
         },
     );
 
-    let output = tokio::process::Command::new("tar")
+    let output = tokio::process::Command::new(system_tar_path())
         .arg("-xjf")
         .arg(&archive_path)
         .arg("-C")
@@ -456,6 +456,18 @@ async fn ensure_server_runtime(
     Ok(())
 }
 
+/// Absolute path to the system `tar.exe`. Resolving via SystemRoot instead
+/// of PATH prevents a planted repo-local `tar.exe` from hijacking archive
+/// extraction during model download.
+fn system_tar_path() -> PathBuf {
+    let mut path = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+    path.push("System32");
+    path.push("tar.exe");
+    path
+}
+
 async fn download_file_to_path(
     client: &reqwest::Client,
     url: &str,
@@ -488,6 +500,16 @@ async fn download_file_to_path(
 
     let mut file = tokio::fs::File::create(&tmp_path).await?;
 
+    // Hard ceiling: reject a malformed or tampered endpoint that streams far
+    // more than the asset it advertises. Uses Content-Length with 10%
+    // headroom; a missing header falls back to a 4 GiB bound, so even a
+    // lie-by-omission cannot fill the disk unbounded.
+    let expected_len = response.content_length().map(|len| len as u64);
+    let cap = expected_len
+        .map(|len| len.saturating_add(len / 10))
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+    let mut file_bytes: u64 = 0;
+
     while let Some(chunk) = response.chunk().await? {
         if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
             let _ = file.shutdown().await;
@@ -498,6 +520,16 @@ async fn download_file_to_path(
 
         file.write_all(&chunk).await?;
         *bytes_downloaded += chunk.len() as u64;
+        file_bytes += chunk.len() as u64;
+        if file_bytes > cap {
+            let _ = file.shutdown().await;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            anyhow::bail!(
+                "Download aborted: {} exceeded its expected size ({} bytes streamed)",
+                file_label,
+                file_bytes
+            );
+        }
 
         let progress = (*bytes_downloaded as f64 / total_bytes as f64 * 100.0).min(99.0);
         emit_progress(
@@ -578,16 +610,19 @@ pub async fn download_offline_model(
 ) -> Result<(), String> {
     crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     if cfg!(not(target_os = "windows")) {
-        return Err("The SenseVoice offline engine is Windows-only in this build. \
+        return Err(
+            "The SenseVoice offline engine is Windows-only in this build. \
             On Linux, use Moonshine v2 Small/Medium (Settings → Offline) or online STT."
-            .to_string());
+                .to_string(),
+        );
     }
     start_download_task(app).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_offline_model_status() -> bool {
-    check_model_files_exist()
+pub fn get_offline_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_model_files_exist()
 }
 
 #[tauri::command]
@@ -840,8 +875,9 @@ pub async fn download_moonshine_v2_small_model(
 }
 
 #[tauri::command]
-pub fn get_moonshine_v2_small_model_status() -> bool {
-    check_moonshine_v2_small_files_exist()
+pub fn get_moonshine_v2_small_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_moonshine_v2_small_files_exist()
 }
 
 #[tauri::command]
@@ -862,8 +898,9 @@ pub async fn download_moonshine_v2_medium_model(
 }
 
 #[tauri::command]
-pub fn get_moonshine_v2_medium_model_status() -> bool {
-    check_moonshine_v2_medium_files_exist()
+pub fn get_moonshine_v2_medium_model_status(window: tauri::Window) -> bool {
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW]).is_ok()
+        && check_moonshine_v2_medium_files_exist()
 }
 
 #[tauri::command]

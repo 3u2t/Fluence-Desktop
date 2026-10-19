@@ -8,7 +8,9 @@
 // transparent to the frontend (Tauri injects it; `invoke()` args unchanged).
 //
 // Caller inventory (verified against src-tauri/src/*.rs + src/js/*.js +
-// src/*.html, app version 1.25.1 from src-tauri/Cargo.toml):
+// src/*.html, app version 1.27.1 from src-tauri/Cargo.toml; table refreshed
+// when the last open IPC surface outside the deliberately-open set was
+// gated):
 //
 // | Command                              | Callers              | Gate                     |
 // |--------------------------------------|----------------------|--------------------------|
@@ -26,7 +28,7 @@
 // | download_*_model (3)                 | main                 | main only                |
 // | cancel_offline_download (1)          | main                 | main only                |
 // | delete_*_model (3)                   | main                 | main only                |
-// | get_*_model_status (3)               | main                 | open (read-only)         |
+// | get_*_model_status (3)               | main                 | main only                |
 // | list_audio_devices                   | main                 | open (device picker)     |
 // | cleanup_debug_recordings             | main                 | main only                |
 // | transcribe_audio                     | main,wizard          | main+wizard (raw-key)    |
@@ -65,11 +67,20 @@
 // | get_history_stats                    | main                 | main only (Package B)    |
 // | get_weekly_activity                  | main                 | main only (Package B)    |
 // | start/stop/is_recording              | all                  | open                     |
-// | stop_and_transcribe/finish/retry     | overlay              | open (workflow owns key) |
-// | inject/copy/keyboard/grab_selection  | main,overlay         | open (core function)     |
-// | get_foreground_app_icon              | main,overlay         | open (read-only)         |
+// | stop_and_transcribe/finish/retry     | overlay              | overlay only             |
+// | inject_text                          | overlay              | overlay only (+target    |
+// |                                      |                      |  HWND validation, P0)    |
+// | capture_target_window                | overlay              | overlay only             |
+// | copy_text                            | overlay,main         | overlay+main             |
+// | execute_keyboard_action              | overlay              | overlay only             |
+// | grab_active_selection                | overlay              | overlay only             |
+// | get_foreground_app_icon              | overlay              | overlay only             |
+// | show/hide_overlay, set_overlay_style | overlay              | overlay only             |
+// | show_main_window                     | main,wizard          | main+wizard              |
+// | hide/minimize/toggle_max_main_window | main                 | main only                |
+// | show_wizard_window                   | main,wizard          | main+wizard              |
+// | minimize/close_wizard                | wizard               | wizard only              |
 // | list_installed_apps                  | main                 | main only                |
-// | overlay/window/hotkey-state/icon     | caller window        | open                     |
 // | get_hotkey_state                     | all                  | open (read-only)         |
 // | get_app_version                      | all                  | open (read-only)         |
 //
@@ -84,16 +95,17 @@
 // is likewise an internal helper, reached only through the gated
 // `get_suggestions` command.
 //
-// "NOT FIXED, not my file" — still ungated `#[tauri::command]`s outside this
-// module's ownership, awaiting their own packages: `settings::get_settings`,
-// `audio::{list_audio_devices, start_recording, stop_recording, is_recording}`,
-// `clipboard::{inject_text, copy_text, execute_keyboard_action,
-// grab_active_selection}`, `dictionary::{get_dictionary, export_dictionary}`,
-// `history::{get_history, save_history_entry}`, `hotkey::get_hotkey_state`,
-// `app_icon::get_foreground_app_icon`, `offline_downloader::{
-// get_offline_model_status, get_moonshine_v2_small_model_status,
-// get_moonshine_v2_medium_model_status}`, all ten `overlay::*` window-control
-// commands, all three `workflow::*` commands, and `get_app_version`.
+// "Deliberately open" — the remaining ungated `#[tauri::command]`s
+// (read-only, cross-window needs, or needed by several callers):
+// `settings::get_settings` (main/overlay/wizard needs differ),
+// `audio::{list_audio_devices, start_recording, stop_recording,
+// is_recording}` (device picker lives in main; recording control is the
+// global-hotkey router and overlay flows; update-manager polls
+// is_recording), `dictionary::{get_dictionary, export_dictionary}`
+// (read-only/export dialog), `history::{get_history, save_history_entry}`
+// (overlay saves entries; main lists them), `hotkey::get_hotkey_state`
+// (read-only polling from main and wizard), and `get_app_version`
+// (read-only banner in both windows).
 //
 // Model-command counts (verified against main.rs `invoke_handler`, main.rs:
 // 262-272): 3 downloads (offline, moonshine v2 small, moonshine v2 medium),

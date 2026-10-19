@@ -408,6 +408,7 @@ export function HistoryPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmAcceptMark, setConfirmAcceptMark] = useState<{ id: string; detail: string } | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   // P2 filters/sort: all derived locally from loaded rows (category B —
   // no new commands, no schema). Non-default controls trigger a full paging
@@ -776,8 +777,18 @@ export function HistoryPage() {
     });
   }, [fullActive, allEntries, entries, selectedIds]);
 
-  const acceptMark = useCallback(async (id: string | undefined) => {
+  const acceptMark = useCallback((id: string | undefined, spoken?: string, corrected?: string) => {
     if (!id) return;
+    setConfirmAcceptMark({
+      id,
+      detail:
+        spoken && corrected
+          ? `Add "${spoken}" → "${corrected}" to the dictionary? This will automatically rewrite future dictations.`
+          : 'Add this suggestion to the dictionary? This will automatically rewrite future dictations.',
+    });
+  }, []);
+
+  const doAcceptMark = useCallback(async (id: string) => {
     // Vanilla resolves the global accept (toast + dictionary refresh live
     // on the Dictionary route) then refreshes markers and this list.
     try {
@@ -984,8 +995,10 @@ export function HistoryPage() {
     const mark = target?.closest('.candidate-word');
     if (!mark) return;
     e.stopPropagation();
-    void acceptMark(mark.getAttribute('data-suggestion-id') ?? undefined);
-  }, [acceptMark]);
+    const spokenWord = mark.textContent ?? '';
+    const correctedWord = markers.get(spokenWord.toLowerCase())?.corrected;
+    void acceptMark(mark.getAttribute('data-suggestion-id') ?? undefined, spokenWord, correctedWord);
+  }, [acceptMark, markers]);
 
   const onListKeyDown = (e: React.KeyboardEvent) => {
     const target = e.target instanceof Element ? e.target : null;
@@ -1090,7 +1103,9 @@ export function HistoryPage() {
     if (!(mark instanceof HTMLElement)) return;
     e.preventDefault();
     e.stopPropagation();
-    void acceptMark(mark.dataset.suggestionId);
+    const spokenWord = mark.textContent ?? '';
+    const correctedWord = markers.get(spokenWord.toLowerCase())?.corrected;
+    void acceptMark(mark.dataset.suggestionId, spokenWord, correctedWord);
   };
 
   return (
@@ -1377,6 +1392,18 @@ export function HistoryPage() {
         confirmLabel="Delete"
         danger
         onConfirm={() => void doConfirmDelete()}
+      />
+      <ConfirmDialog
+        open={confirmAcceptMark !== null}
+        onOpenChange={(open) => { if (!open) setConfirmAcceptMark(null); }}
+        title="Add to dictionary"
+        body={confirmAcceptMark?.detail ?? ''}
+        confirmLabel="Add"
+        onConfirm={() => {
+          const id = confirmAcceptMark?.id;
+          setConfirmAcceptMark(null);
+          if (id) void doAcceptMark(id);
+        }}
       />
     </section>
   );

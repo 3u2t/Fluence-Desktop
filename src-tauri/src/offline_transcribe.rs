@@ -5,9 +5,10 @@ use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -84,6 +85,9 @@ struct ServerInstance {
     child: Child,
     port: u16,
     engine: OfflineEngine,
+    // Loopback shared secret handed to our moonshine sidecar at spawn.
+    // None for the sherpa sidecar (which predates the token protocol).
+    auth_token: Option<String>,
 }
 static SERVER_INSTANCE: Lazy<Mutex<Option<ServerInstance>>> = Lazy::new(|| Mutex::new(None));
 static LAST_USED: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
@@ -114,6 +118,7 @@ fn start_idle_monitor() {
                 let mut lock = SERVER_INSTANCE.lock().unwrap();
                 if let Some(mut instance) = lock.take() {
                     let _ = instance.child.kill();
+                    forget_sidecar_pid();
                 }
                 IDLE_MONITOR_RUNNING.store(false, Ordering::SeqCst);
                 break;
@@ -243,6 +248,230 @@ fn resolve_v2_sidecar() -> Result<std::path::PathBuf> {
     ))
 }
 
+/// Fresh loopback secret shared with the moonshine sidecar at spawn.
+/// CONTRACT: exactly 32 lowercase hex characters — the sidecar requires
+/// this length (moonshine-v2-server::TOKEN_LEN, pinned by its wire test);
+/// a change here must land together with the sidecar half.
+fn generate_spawn_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ProbeOutcome {
+    /// The spawned sidecar answered the authenticated handshake.
+    Ready,
+    /// Nothing is listening yet - normal while the model loads.
+    NotYet,
+    /// Something answered the TCP/WebSocket connect but never produced the
+    /// named reply. A stale sidecar build (predating the token protocol)
+    /// behaves exactly like this, and retrying cannot help: it will never
+    /// answer. Fail fast so the user gets a real error instead of hanging.
+    Incompatible,
+}
+
+/// Authenticated readiness probe for the moonshine sidecar. A bare TCP
+/// connect does NOT prove that the spawned sidecar owns the port — any
+/// local process could hold it first and pass the health check while the
+/// real sidecar dies on its own bind. This completes the WebSocket
+/// handshake and sends `probe:<token>`; only the sidecar, which knows the
+/// fresh spawn secret, can answer with the named reply.
+/// Note: the Sherpa sidecar keeps the bare-TCP readiness contract
+/// (documented residual risk until it receives a compatible fix).
+async fn probe_moonshine_ready(port: u16, token: &str) -> ProbeOutcome {
+    let url = format!("ws://127.0.0.1:{port}");
+    let (mut ws, _) = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            // Almost always "nothing is listening yet": the sidecar reads its
+            // stdin token and loads the model BEFORE it binds the port.
+            log::debug!("readiness probe {port}: connect failed: {e}");
+            return ProbeOutcome::NotYet;
+        }
+        Err(_) => {
+            log::debug!("readiness probe {port}: connect timed out after 5s");
+            return ProbeOutcome::NotYet;
+        }
+    };
+    let probe = tokio_tungstenite::tungstenite::Message::Text(format!("probe:{token}"));
+    if tokio::time::timeout(Duration::from_secs(2), ws.send(probe))
+        .await
+        .is_err()
+    {
+        log::warn!("readiness probe {port}: sending probe timed out");
+        let _ = ws.close(None).await;
+        return ProbeOutcome::Incompatible;
+    }
+    let reply = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut text: Option<String> = None;
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
+                    text = Some(t.to_string());
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    log::warn!("readiness probe {port}: socket error waiting for reply: {e}");
+                    break;
+                }
+            }
+        }
+        text
+    })
+    .await
+    .ok()
+    .flatten();
+    let _ = ws.close(None).await;
+    match &reply {
+        Some(t) if t.contains("moonshine-v2") => ProbeOutcome::Ready,
+        Some(t) => {
+            // Reached the server but it did not vouch for itself: either a
+            // different process owns the port, or a stale sidecar build is
+            // running. Neither will ever answer correctly, so stop retrying.
+            log::warn!(
+                "readiness probe {port}: unexpected reply {t:?} - port is held by another process"
+            );
+            ProbeOutcome::Incompatible
+        }
+        None => {
+            log::warn!(
+                "readiness probe {port}: connected but no reply within 2s - the sidecar on this \
+                 port is stale (built before the auth-token protocol) or not a moonshine server"
+            );
+            ProbeOutcome::Incompatible
+        }
+    }
+}
+
+/// Client wire contract for the local ASR sidecars:
+/// [optional 32-hex auth token (moonshine sidecar only; must match
+/// moonshine-v2-server::TOKEN_LEN)][u32LE sample_rate][u32LE byte_len]
+/// [f32 LE samples...]. Frame-building only — sample bytes pass through
+/// untouched (audio/DSP freeze respected).
+fn build_audio_payload(samples: &[f32], auth_token: Option<&str>, sample_rate: u32) -> Vec<u8> {
+    let token_len = auth_token.map(str::len).unwrap_or(0);
+    let byte_len = (samples.len() * 4) as u32;
+    let mut payload = Vec::with_capacity(token_len + 8 + samples.len() * 4);
+    if let Some(token) = auth_token {
+        payload.extend_from_slice(token.as_bytes());
+    }
+    payload.extend_from_slice(&sample_rate.to_le_bytes());
+    payload.extend_from_slice(&byte_len.to_le_bytes());
+    for &sample in samples {
+        payload.extend_from_slice(&sample.to_le_bytes());
+    }
+    payload
+}
+
+/// Path we record our sidecar child's PID in, so a later run can reap it.
+fn sidecar_pid_file() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_local_dir()?.join("Fluence");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("sidecar.pid"))
+}
+
+/// Remember the PID of a sidecar we just spawned.
+fn record_sidecar_pid(child: &Child) {
+    let Some(path) = sidecar_pid_file() else {
+        return;
+    };
+    let _ = std::fs::write(path, child.id().to_string());
+}
+
+pub fn forget_sidecar_pid() {
+    if let Some(path) = sidecar_pid_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Kill a sidecar left behind by a previous run of the app.
+///
+/// The app is single-instance, so a PID we recorded earlier and that is still
+/// alive belongs to an orphan. Windows does not run destructors when the app
+/// is terminated, so these otherwise accumulate and squat the fixed port range
+/// (6006..=6029). A squatter answers the readiness probe's TCP connect but
+/// ignores the `probe:<token>` frame, which is indistinguishable from an
+/// out-of-date sidecar and previously surfaced as a misleading "sidecar is
+/// outdated" error.
+///
+/// Only the exact PID we recorded is ever signalled, so an unrelated process
+/// that happens to reuse the ID after ours exited is not touched (we verify
+/// the executable name before terminating).
+pub fn reap_orphaned_sidecar() {
+    let Some(path) = sidecar_pid_file() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    if kill_pid_if_sidecar(pid) {
+        log::warn!("reaped orphaned local-ASR sidecar (pid {pid}) from a previous run");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(target_os = "windows")]
+fn kill_pid_if_sidecar(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    const SIDECAR_NAMES: [&str; 2] = [
+        "moonshine-v2-server",
+        "sherpa-onnx-offline-websocket-server",
+    ];
+
+    // SAFETY: every handle is closed on every path; pid comes from our own file.
+    unsafe {
+        let Ok(handle) = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            pid,
+        ) else {
+            return false;
+        };
+
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let matched = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok()
+            && {
+                let path = String::from_utf16_lossy(&buf[..len as usize]);
+                let file = path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".exe")
+                    .to_ascii_lowercase();
+                SIDECAR_NAMES.contains(&file.as_str())
+            };
+
+        let killed = matched && TerminateProcess(handle, 1).is_ok();
+        let _ = CloseHandle(handle);
+        killed
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_pid_if_sidecar(_pid: u32) -> bool {
+    false
+}
+
 pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
     let _start_lock = SERVER_START_LOCK.lock().await;
     // Check if an existing server is running with the same engine
@@ -269,6 +498,7 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
                     engine.display_name()
                 );
                 let _ = instance.child.kill();
+                forget_sidecar_pid();
                 *lock = None;
             }
         }
@@ -380,6 +610,15 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
             break;
         }
     }
+    // We have no live sidecar and are about to take a port in the fixed
+    // range, so any process recorded by a PREVIOUS run of the app is an
+    // orphan squatting it. Reaped here rather than at startup: at startup a
+    // double-launch (shortcut twice, autostart plus manual) would run the
+    // reaper before the single-instance plugin had handed off to the running
+    // instance, terminating that instance's live sidecar mid-transcription.
+    // Reaching this point proves we ARE the running instance.
+    reap_orphaned_sidecar();
+
     let server_label = match engine.v2_arch() {
         Some(_) => "moonshine-v2",
         None => "sherpa-onnx",
@@ -393,6 +632,8 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
 
     let port_arg = format!("--port={}", port);
     let threads_arg = "--num-threads=3".to_string();
+    // Populated by the moonshine branch below; None for the sherpa sidecar.
+    let mut spawn_token: Option<String> = None;
 
     let mut cmd = Command::new(&exe_path);
     cmd.current_dir(&offline_dir);
@@ -408,37 +649,113 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
             cmd.args([&tokens_arg, &model_arg, &port_arg, &threads_arg]);
         }
         OfflineEngine::MoonshineV2Small | OfflineEngine::MoonshineV2Medium => {
-            // Served by our own sidecar: same WS protocol as the sherpa
-            // server, model dir + streaming arch as CLI args. The Moonshine
-            // core manages its own threading, so no --num-threads is passed.
+            // Served by our own sidecar: same WS protocol family as the
+            // sherpa server, model dir + streaming arch as CLI args. The
+            // Moonshine core manages its own threading, so no
+            // --num-threads is passed.
             let arch = engine.v2_arch().unwrap_or("small");
             let model_dir_arg = format!("--model-dir={}", offline_dir.display());
             let arch_arg = format!("--arch={arch}");
+            // Fresh shared secret per spawn, delivered over stdin below —
+            // NEVER on the command line, which same-user processes can read
+            // via Win32_Process. Keeps other local processes from consuming
+            // transcripts. No token value is ever logged.
+            spawn_token = Some(generate_spawn_token());
             cmd.args([&model_dir_arg, &arch_arg, &port_arg]);
         }
+    }
+    // Stdin is only piped when a token needs to be delivered; the Sherpa
+    // sidecar keeps its default (never reads stdin).
+    if spawn_token.is_some() {
+        cmd.stdin(Stdio::piped());
     }
 
     {
         let mut lock = SERVER_INSTANCE.lock().unwrap();
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn ASR server: {}", e))?;
+        // Private handshake: pipe the fresh token as ONE newline-terminated
+        // line, then close stdin. The sidecar reads it with `read_line` and
+        // trims CR/LF, so the terminator is the actual protocol — do not rely
+        // on the pipe reaching EOF to complete the line. If the pipe fails,
+        // kill the sidecar and fail the start instead of entering a
+        // half-secret state.
+        if let (Some(token), Some(mut stdin)) = (spawn_token.as_deref(), child.stdin.take()) {
+            if let Err(e) = stdin
+                .write_all(format!("{token}\n").as_bytes())
+                .and_then(|_| stdin.flush())
+            {
+                log::error!("Failed to pipe auth token to ASR sidecar: {}", e);
+                let _ = child.kill();
+                return Err(anyhow!("Failed to deliver auth token to the ASR sidecar"));
+            }
+        }
+        record_sidecar_pid(&child);
         *lock = Some(ServerInstance {
             child,
             port,
             engine,
+            auth_token: spawn_token.clone(),
         });
         *LAST_USED.lock().unwrap() = Instant::now();
     }
 
     start_idle_monitor();
 
-    // Perform health checks
+    // Readiness: a bare TCP connect alone is NOT proof that the spawned
+    // sidecar owns the port; a squatter (or racing process) could hold the
+    // port first and pass a naive check while the real sidecar dies on
+    // bind. For the moonshine sidecar the readiness signal is therefore the
+    // WebSocket handshake + `probe:<token>` reply naming this server.
+    // Sherpa keeps the legacy bare-TCP contract (documented residual risk).
+    //
+    // The moonshine path must call the probe DIRECTLY. Gating it behind a
+    // bare `std::net::TcpStream::connect` connected and immediately dropped a
+    // socket on every poll: the sidecar accepted it, blocked on an HTTP
+    // upgrade request that never came, and logged a spurious
+    // "websocket accept failed: Handshake not finished" per attempt while
+    // each dead connection also burned one of its MAX_CONCURRENT slots.
+    // Budget readiness by deadline, not iteration count. The sidecar reads its
+    // stdin token (up to 10s) and loads the ONNX model BEFORE it binds the
+    // port, so a cold start takes far longer than the old fixed 30x100ms
+    // (~3s) loop allowed - which killed a sidecar that was still loading and
+    // surfaced as "nothing was pasted" with no error on the sidecar side.
+    const READY_DEADLINE: Duration = Duration::from_secs(60);
+    let give_up_at = Instant::now() + READY_DEADLINE;
     let mut ready = false;
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+    let mut incompatible = false;
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ready_now = match spawn_token.as_deref() {
+            Some(token) => match probe_moonshine_ready(port, token).await {
+                ProbeOutcome::Ready => true,
+                // Nothing listening yet - normal while the model loads.
+                ProbeOutcome::NotYet => false,
+                // A stale sidecar build will never answer. Retrying for the
+                // full deadline only produced a minute of silent pulsing, so
+                // stop and say why.
+                ProbeOutcome::Incompatible => {
+                    incompatible = true;
+                    break;
+                }
+            },
+            // Sherpa only: legacy bare-TCP readiness contract, unchanged.
+            None => tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok(),
+        };
+        if ready_now {
             ready = true;
+            break;
+        }
+        if Instant::now() >= give_up_at {
+            log::error!(
+                "{} server was not ready within {:?} on port {}",
+                server_label,
+                READY_DEADLINE,
+                port
+            );
             break;
         }
     }
@@ -447,6 +764,15 @@ pub async fn ensure_server_running(engine: OfflineEngine) -> Result<u16> {
         let mut lock = SERVER_INSTANCE.lock().unwrap();
         if let Some(mut instance) = lock.take() {
             let _ = instance.child.kill();
+            forget_sidecar_pid();
+        }
+        if incompatible {
+            return Err(anyhow!(
+                "The local transcription sidecar on port {port} answered a connection but not \
+                 the start-up handshake. Either an orphaned sidecar from a previous run still \
+                 holds the port, or the sidecar binary predates the auth-token protocol and \
+                 needs rebuilding: cargo build --release -p moonshine-v2-server"
+            ));
         }
         return Err(anyhow!(
             "{} server failed to start on port {}",
@@ -475,6 +801,15 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
     let port = ensure_server_running(engine).await?;
     *LAST_USED.lock().unwrap() = Instant::now();
 
+    // Copy the spawn-shared auth token for this engine instance (None for
+    // sherpa). Guarded by the same engine check the server lookup implies.
+    let auth_token = {
+        let lock = SERVER_INSTANCE.lock().unwrap();
+        lock.as_ref()
+            .filter(|i| i.engine == engine)
+            .and_then(|i| i.auth_token.clone())
+    };
+
     let url = format!("ws://127.0.0.1:{}", port);
     let (mut ws_stream, _) = tokio::time::timeout(
         Duration::from_secs(10),
@@ -482,18 +817,23 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
     )
     .await
     .map_err(|_| anyhow!("Timed out connecting to local ASR server"))?
-    .map_err(|e| anyhow!("Failed to connect to local ASR server: {}", e))?;
+    .map_err(|e| {
+        // The sidecar answers overloaded connects with a real HTTP 503
+        // ("at capacity"). Surface that as a distinct, recoverable error
+        // instead of a generic transport failure.
+        if e.to_string().contains("503") {
+            anyhow!(
+                "Local ASR server is busy (connection refused at the sidecar's capacity limit); short wait and try again"
+            )
+        } else {
+            anyhow!("Failed to connect to local ASR server: {}", e)
+        }
+    })?;
 
-    // Build the custom sherpa-onnx binary payload
-    // Format: [int32LE sample_rate][int32LE num_audio_bytes][float32 samples...]
+    // Build the sidecar binary payload:
+    // [optional 32-hex auth token][int32LE sample_rate][int32LE num_audio_bytes][f32 samples...]
     let sample_rate = 16000u32;
-    let byte_len = (samples.len() * 4) as u32;
-    let mut payload = Vec::with_capacity(8 + samples.len() * 4);
-    payload.extend_from_slice(&sample_rate.to_le_bytes());
-    payload.extend_from_slice(&byte_len.to_le_bytes());
-    for &sample in samples {
-        payload.extend_from_slice(&sample.to_le_bytes());
-    }
+    let payload = build_audio_payload(samples, auth_token.as_deref(), sample_rate);
 
     // Send audio payload
     tokio::time::timeout(
@@ -566,6 +906,9 @@ pub async fn transcribe_samples(samples: &[f32], engine: OfflineEngine) -> Resul
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// Shape-valid but meaningless token for negative-path tests.
+    const TEST_TOKEN: &str = "00000000000000000000000000000000";
 
     #[test]
     fn engine_display_parse_round_trip() {
@@ -673,6 +1016,169 @@ mod tests {
                 format!("C:/install/{dll}"),
                 format!("C:/install/binaries/{dll}"),
             ]
+        );
+    }
+
+    // ── Sidecar wire contracts ─────────────────────────────────────────
+    // NOTE: these pin the parent half of the shared protocol with
+    // moonshine-v2-server (auth token, payload framing, size limits).
+    // The sidecar's own behavioral tests live in that crate; passing the
+    // unrelated suites here is NOT a claim of end-to-end sidecar coverage.
+
+    #[test]
+    fn spawn_token_contract_is_32_hex_chars() {
+        let token = generate_spawn_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn audio_payload_with_token_matches_sidecar_contract() {
+        let token = generate_spawn_token();
+        let samples = [0.5f32, -0.25];
+        let payload = build_audio_payload(&samples, Some(&token), 16000);
+        assert_eq!(payload.len(), 32 + 8 + 8);
+        assert_eq!(&payload[0..32], token.as_bytes());
+        let head = &payload[32..40];
+        assert_eq!(&head[0..4], &16000u32.to_le_bytes());
+        assert_eq!(&head[4..8], &8u32.to_le_bytes());
+        assert_eq!(&payload[40..44], &0.5f32.to_le_bytes());
+        assert_eq!(&payload[44..48], &(-0.25f32).to_le_bytes());
+    }
+
+    #[test]
+    fn audio_payload_without_token_keeps_the_bare_sherpa_header() {
+        let payload = build_audio_payload(&[1.0f32], None, 16000);
+        assert_eq!(payload.len(), 12);
+        assert_eq!(&payload[0..4], &16000u32.to_le_bytes());
+        assert_eq!(&payload[4..8], &4u32.to_le_bytes());
+        assert_eq!(&payload[8..12], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn max_recording_message_fits_the_sidecar_socket_bound() {
+        // 32-byte token + 8-byte header + the app's maximum utterance
+        // (10 min @ 16 kHz f32 = 38.4 MB) must stay within tungstenite's
+        // 64 MiB default message limit — the sidecar ships with those
+        // defaults, so this pin prevents a silent recording-limit cut.
+        const SIDE_MACHINE_DEFAULT_MAX_MESSAGE: usize = 64 * 1024 * 1024;
+        assert!(
+            32 + 8 + crate::transcribe::MAX_OFFLINE_SAMPLES * 4 <= SIDE_MACHINE_DEFAULT_MAX_MESSAGE
+        );
+    }
+
+    // The probe must fail closed - return false, not hang, panic, or treat an
+    // unanswered port as ready - when nothing is listening. Uses a port this
+    // test does not bind, so it needs no sidecar and no external process.
+    //
+    // The positive path (probe against a live sidecar) is deliberately NOT
+    // asserted here: it requires a spawned moonshine-v2-server with a matching
+    // token and is covered by the manual E2E pass, not by `cargo test`.
+    #[tokio::test]
+    async fn readiness_probe_fails_closed_when_nothing_is_listening() {
+        for port in [6399u16, 6398] {
+            let ok = probe_moonshine_ready(port, TEST_TOKEN).await == ProbeOutcome::Ready;
+            assert!(!ok, "probe must report not-ready on dead port {port}");
+        }
+    }
+
+    // End-to-end probe against a REAL spawned sidecar: spawn, deliver the
+    // token over stdin, wait for the model to load, then require the
+    // authenticated probe to succeed.
+    //
+    // `#[ignore]`d on purpose. It needs a downloaded model (~GBs) and spends
+    // ~10-60s loading ONNX weights, so it cannot run in `cargo test` or in
+    // CI. Run it by hand when the sidecar protocol changes:
+    //
+    //     cargo test -p fluence-windows --lib -- --ignored --nocapture
+    //
+    // It self-skips (passes) when the sidecar or model is absent, so it is
+    // safe to run on a machine without them.
+    #[tokio::test]
+    #[ignore = "requires a downloaded moonshine_v2 model; run manually"]
+    async fn live_sidecar_completes_the_stdin_token_and_probe_handshake() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = manifest.join("target");
+        let Some(exe) = v2_sidecar_candidates(None, &manifest, &target)
+            .into_iter()
+            .find(|p| p.is_file())
+        else {
+            eprintln!("SKIP: no staged moonshine-v2-server.exe");
+            return;
+        };
+        let model_dir = crate::offline_downloader::get_moonshine_v2_small_dir();
+        if !model_dir.join("encoder.ort").is_file() {
+            eprintln!(
+                "SKIP: no moonshine_v2_small model at {}",
+                model_dir.display()
+            );
+            return;
+        }
+
+        // Pick a port nothing is using.
+        let mut port = 6231u16;
+        while port < 6400 && !is_port_available(port) {
+            port += 1;
+        }
+        assert!(port < 6400, "no free port for the live sidecar test");
+
+        let token = generate_spawn_token();
+        let mut child = Command::new(&exe)
+            .arg(format!("--port={port}"))
+            .arg(format!("--model-dir={}", model_dir.display()))
+            .arg("--arch=small")
+            .current_dir(&model_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sidecar");
+
+        // Private handshake: one newline-terminated line, then close stdin.
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            use std::io::Write as _;
+            stdin
+                .write_all(format!("{token}\n").as_bytes())
+                .and_then(|_| stdin.flush())
+                .expect("write token to sidecar stdin");
+        }
+
+        // The sidecar binds only AFTER loading the model, so allow a long
+        // wait here even though the app's own budget is 60s.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut ok = false;
+        while Instant::now() < deadline {
+            if probe_moonshine_ready(port, &token).await == ProbeOutcome::Ready {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            ok,
+            "live sidecar never answered the authenticated probe on port {port} \
+             (check the sidecar actually rebuilt and supports probe:/stdin tokens)"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_recording_fails_fast_with_a_clear_recoverable_error() {
+        let samples = vec![0.0f32; crate::transcribe::MAX_OFFLINE_SAMPLES + 1];
+        let err = transcribe_samples(&samples, OfflineEngine::MoonshineV2Small)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Recording too long"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Maximum is 10 minutes"),
+            "duration limit must be reported in user units: {msg}"
         );
     }
 }

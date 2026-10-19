@@ -1424,10 +1424,7 @@ pub(crate) enum IdentityGate {
     RefuseDivergent { persisted: String },
 }
 
-pub(crate) fn identity_gate(
-    persisted_email: Option<&str>,
-    verified_email: &str,
-) -> IdentityGate {
+pub(crate) fn identity_gate(persisted_email: Option<&str>, verified_email: &str) -> IdentityGate {
     match persisted_email {
         // F10: full-Unicode fold via the shared helper — NOT
         // `eq_ignore_ascii_case`, which called `ÜSER@…` and `üser@…` two
@@ -1460,6 +1457,16 @@ fn windows_browser_command(url: &str) -> Vec<String> {
     vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()]
 }
 
+/// Absolute path to `rundll32.exe` in the system directory. Resolving it
+/// explicitly (instead of relying on PATH) prevents a planted `rundll32`
+/// from intercepting the OAuth browser handoff and stealing the auth URL.
+#[cfg(windows)]
+fn windows_rundll32_path() -> String {
+    std::env::var("SystemRoot")
+        .map(|root| format!("{}\\System32\\rundll32.exe", root.trim_end_matches('\\')))
+        .unwrap_or_else(|_| "C:\\Windows\\System32\\rundll32.exe".to_string())
+}
+
 /// Open the authorization URL in the system browser. Windows: route the URL
 /// to `ShellExecuteEx` via `rundll32 url.dll,FileProtocolHandler` - no cmd
 /// involved, so the `&` query separators in the auth URL are passed through
@@ -1467,7 +1474,7 @@ fn windows_browser_command(url: &str) -> Vec<String> {
 fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        std::process::Command::new("rundll32.exe")
+        std::process::Command::new(windows_rundll32_path())
             .args(windows_browser_command(url))
             .spawn()
             .map(|_| ())

@@ -14,6 +14,7 @@ mod acl;
 mod agent;
 mod agents;
 mod app_icon;
+mod applog;
 mod audio;
 mod auto_learn;
 mod autostart;
@@ -53,7 +54,10 @@ fn get_app_version(app: tauri::AppHandle) -> String {
 }
 
 pub fn run() {
-    env_logger::init();
+    // env_logger writes to stderr; this tees the same records into
+    // %LOCALAPPDATA%\Fluence\fluence.log so a packaged build (which has no
+    // console to read) can still be diagnosed. Must run exactly once.
+    applog::init();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {

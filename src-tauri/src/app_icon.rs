@@ -54,9 +54,14 @@ pub struct ForegroundAppInfo {
 /// Returns `None` whenever the foreground app cannot be identified (including
 /// when it is Fluence itself, or an elevated / protected process).
 #[tauri::command]
-pub fn get_foreground_app_icon() -> Option<ForegroundAppInfo> {
+pub fn get_foreground_app_icon(window: tauri::Window) -> Option<ForegroundAppInfo> {
     #[cfg(target_os = "windows")]
     {
+        // Read the foreground exclusively for the overlay app pill; the main
+        // window has no legitimate use for this surface.
+        if crate::acl::require_caller(&window, &[crate::acl::OVERLAY_WINDOW]).is_err() {
+            return None;
+        }
         match resolve_foreground_app() {
             Ok(info) => Some(info),
             Err(reason) => {
@@ -67,6 +72,7 @@ pub fn get_foreground_app_icon() -> Option<ForegroundAppInfo> {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = window;
         None
     }
 }

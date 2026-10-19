@@ -11,6 +11,15 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// Session-level tracking: superseded sessions whose in-flight transcription
+// result should be preserved in history, sessions the user explicitly
+// discarded (their late results are dropped), the foreground HWND captured
+// at recording start so paste can validate the target, and one recoverable
+// pending injection for the paste-retry/copy UI.
+const supersededSessions = new Set();
+const discardedSessions = new Set();
+let pendingInjection = null;
+
 // DOM refs
 const overlayRoot = document.getElementById('overlay-root');
 const recLabel    = document.getElementById('rec-label');
@@ -47,6 +56,7 @@ let agentPickerPlacement = 'above'; // 'above' | 'below'
 const AGENT_LLM_WATCHDOG_MS = 25000;
 
 function beginSession(explicitId) {
+  const supersededId = activeSessionId;
   if (typeof explicitId === 'number' && explicitId > 0) {
     activeSessionId = explicitId;
     if (explicitId > nextSessionId) {
@@ -54,6 +64,17 @@ function beginSession(explicitId) {
     }
   } else {
     activeSessionId = ++nextSessionId;
+  }
+  // A transcription still in flight for the previous session can outlive
+  // this one; remember the superseded session so its late result can be
+  // preserved in history (unless the user explicitly discarded that take).
+  if (supersededId > 0 && supersededId !== activeSessionId) {
+    supersededSessions.add(supersededId);
+    discardedSessions.delete(supersededId);
+    // Bounded tracking: keep only the most recent 20 ids.
+    if (supersededSessions.size > 20) {
+      supersededSessions.delete(supersededSessions.values().next().value);
+    }
   }
   return activeSessionId;
 }
@@ -69,10 +90,12 @@ function completeSession(sessionId) {
 function resetTransientUi() {
   clearAutoDismiss();
   hideRetry();
+  hideCopy();
   hideRecHint();
   setStatusMessage('');
   hideAppPill();
   activeAgentId = null;
+  pendingInjection = null;
   // A new recording invalidates any cached agent retry (A2).
   agentRetryContext = null;
 }
@@ -136,6 +159,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   await setupEventListeners();
   setupDiscardButton();
   setupRetryButton();
+  setupPasteRecovery();
   setupHotkeyBusyFeedback();
   // Reset synchronously before any awaits so a hotkey that fires while the
   // settings fetch is in flight never observes a stale state (which would
@@ -172,6 +196,8 @@ async function setupEventListeners() {
     // Capture the foreground app while the overlay is still hidden so the
     // target app owns focus (timing-sensitive).
     const appIcon = loadAppIcon(sessionId);
+    // Capture the target HWND for paste validation (same timing window:
+    // the target app must own the foreground here).
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -260,6 +286,8 @@ async function setupEventListeners() {
     // Capture the foreground app while the overlay is still hidden so the
     // target app owns focus (timing-sensitive).
     const appIcon = loadAppIcon(sessionId);
+    // Capture the target HWND for paste validation (same timing window:
+    // the target app must own the foreground here).
     let recordingStarted = false;
     try {
       const prefs = await getRecordingPreferences();
@@ -766,6 +794,12 @@ function setupRetryButton() {
       setStatusMessage('');
       const sessionId = activeSessionId;
       if (!isSessionActive(sessionId)) return;
+      // P0-B: a recoverable paste failure replays just the injection (with
+      // fresh foreground validation) instead of re-transcribing audio.
+      if (pendingInjection && pendingInjection.sessionId === sessionId) {
+        await retryPendingInjection(sessionId);
+        return;
+      }
       // Agent retry (A2): re-send the cached LLM request on the still-active
       // session instead of forcing a re-record. STT path below is unchanged.
       if (agentRetryContext && agentRetryContext.sessionId === sessionId) {
@@ -782,6 +816,125 @@ function setupRetryButton() {
     });
   }
 }
+
+// ── Paste Recovery + Agent Action Confirmation ──────────────────
+// P0-B: a failed paste is reported truthfully and stays recoverable (the
+// transcript is already in history). P2: dangerous agent actions require an
+// explicit confirm click before any destructive keystroke is sent.
+
+
+async function attemptPaste(text, monitorAutoLearn) {
+  return invoke('inject_text', { text, monitorAutoLearn });
+}
+
+async function attemptKeyboardAction(action, charCount) {
+  return invoke('execute_keyboard_action', { action, charCount });
+}
+
+// Clicking Retry/Copy does NOT move the foreground window: the overlay window
+// is configured with "focusable": false (WS_EX_NOACTIVATE, tauri.conf.json).
+// Injection targets whatever window holds OS focus when transcription finishes
+// - there is no target-window validation, so reading in one app while
+// dictating and pasting into another works. Hiding the overlay first would
+// only add latency and hide the recovery UI, so injection runs while the
+// overlay stays visible.
+
+function showCopy() {
+  const btn = document.getElementById('status-copy');
+  if (btn) btn.hidden = false;
+}
+
+function hideCopy() {
+  const btn = document.getElementById('status-copy');
+  if (btn) btn.hidden = true;
+}
+
+// Map a backend injection failure to a short, specific status line. Without
+// this every failure showed the same generic "Insert failed", which made it
+// impossible to tell a wrong-window refusal from a blocked SendInput.
+function describeInjectError(err) {
+  const raw = String(err || '');
+
+  if (raw.includes('PASTE_FAILED')) {
+    const m = raw.match(/delivered (\d+) of 4/);
+    return m ? `Keys blocked (${m[1]}/4)` : 'Keys blocked';
+  }
+  if (raw.includes('KEYBOARD_ACTION_FAILED')) {
+    const m = raw.match(/delivered (\d+) of (\d+)/);
+    return m ? `Keys blocked (${m[1]}/${m[2]})` : 'Keys blocked';
+  }
+  if (raw.includes('Not allowed from this window')) return 'Blocked by permissions';
+  const trimmed = raw.trim();
+  if (!trimmed) return 'Insert failed';
+  return trimmed.length > 42 ? `${trimmed.slice(0, 42)}...` : trimmed;
+}
+
+async function handlePasteFailure(pending, err, sessionId) {
+  if (!isSessionActive(sessionId)) {
+    // Session is over: the transcript was already saved to history before
+    // injection was attempted, so nothing is lost.
+    pendingInjection = null;
+    return;
+  }
+  pendingInjection = pending;
+  console.error('[overlay] injection failed:', String(err || ''));
+  setState('error');
+  setStatusMessage(describeInjectError(err));
+  if (pending.kind === 'text') showCopy();
+  showRetry();
+  scheduleAutoDismiss(12000);
+}
+
+async function retryPendingInjection(sessionId) {
+  const pending = pendingInjection;
+  pendingInjection = null;
+  hideRetry();
+  hideCopy();
+  setStatusMessage('');
+  try {
+    if (pending.kind === 'text') {
+      await attemptPaste(pending.text, pending.monitorAutoLearn);
+    } else {
+      await attemptKeyboardAction(pending.action, pending.charCount);
+    }
+    if (!isSessionActive(sessionId)) return;
+    setState('success');
+    setStatusMessage(pending.kind === 'text' ? 'Inserted' : 'Executed');
+    playCompletionChime();
+    agentRetryContext = null;
+    await new Promise(r => setTimeout(r, 800));
+    await fadeAndHide(sessionId);
+  } catch (err) {
+    console.error('Paste retry failed:', err);
+    await handlePasteFailure(pending, err, sessionId);
+  }
+}
+
+function setupPasteRecovery() {
+  const copyBtn = document.getElementById('status-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const pending = pendingInjection;
+      if (!pending || pending.kind !== 'text') return;
+      clearAutoDismiss();
+      copyBtn.disabled = true;
+      try {
+        await invoke('copy_text', { text: pending.text });
+        pendingInjection = null;
+        hideCopy();
+        setStatusMessage('Copied - paste with Ctrl+V');
+        scheduleAutoDismiss(5000);
+      } catch (err) {
+        console.error('Copy failed:', err);
+        setStatusMessage('Copy failed');
+        scheduleAutoDismiss(6000);
+      } finally {
+        copyBtn.disabled = false;
+      }
+    });
+  }
+}
+
 
 // ── Hold-to-Record Hint ──────────────────────────────────────────
 
@@ -846,7 +999,14 @@ function setupDiscardButton() {
     // orphaned backend LLM request (if any) still runs to completion but can
     // no longer touch UI, clipboard, or history. Accepted behavior - true
     // backend cancellation is Class B (needs explicit approval).
+    const supersededId = activeSessionId;
     const sessionId = beginSession();
+    // Explicit user discard: the superseded take must NOT be preserved by
+    // the orphan-save path in runSttFlow.
+    if (supersededId > 0 && supersededId !== sessionId) {
+      supersededSessions.delete(supersededId);
+      discardedSessions.add(supersededId);
+    }
     resetTransientUi();
     try {
       await invoke('stop_recording');
@@ -895,6 +1055,7 @@ async function fadeAndHide(sessionId = activeSessionId) {
   stopTimer();
   clearAutoDismiss();
   hideRetry();
+  hideCopy();
   setStatusMessage('');
   hideAppPill();
   if (overlayRoot) {
@@ -995,7 +1156,22 @@ async function runSttFlow(sessionId, retry = false) {
       return;
     }
 
-    if (!isSessionActive(sessionId)) return;
+    if (!isSessionActive(sessionId)) {
+      // Superseded take: a newer hotkey started the next session while this
+      // transcription was still running. Preserve the finished transcript in
+      // history (injection is skipped - the foreground belongs to whatever
+      // the new session is now recording). A take the user explicitly
+      // discarded is intentionally dropped.
+      if (!discardedSessions.has(sessionId) && (result.text || '').trim()) {
+        invoke('save_history_entry', {
+          text: result.text,
+          mode: 'transcription',
+          durationMs: result.durationMs || (Date.now() - startTs),
+          provider: result.provider,
+        }).catch(err => console.error('Failed to save history entry:', err));
+      }
+      return;
+    }
 
     invoke('save_history_entry', {
       text: result.text,
@@ -1005,19 +1181,24 @@ async function runSttFlow(sessionId, retry = false) {
     }).catch(err => console.error('Failed to save history entry:', err));
 
     try {
-      await invoke('inject_text', { text: result.text, monitorAutoLearn: true });
+      // inject_text returns true when it replaced non-text clipboard content
+      // (an image or copied files). It is reported, not blocked: refusing
+      // broke screenshot-and-dictate, where replacing the clipboard is the
+      // whole point.
+      const replacedClipboard = await attemptPaste(result.text, true);
       if (!isSessionActive(sessionId)) return;
       setState('success');
-      setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
+      if (replacedClipboard) {
+        setStatusMessage('Inserted (clipboard replaced)');
+      } else {
+        setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
+      }
       playCompletionChime();
       await new Promise(r => setTimeout(r, 1000));
       await fadeAndHide(sessionId);
     } catch (err) {
       console.error('Inject failed:', err);
-      if (!isSessionActive(sessionId)) return;
-      setState('error');
-      setStatusMessage('Insert failed');
-      scheduleAutoDismiss(8000);
+      await handlePasteFailure({ sessionId, kind: 'text', text: result.text, monitorAutoLearn: true }, err, sessionId);
     }
   } catch (err) {
     console.error('Transcription error:', err);
@@ -1090,7 +1271,6 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       if (preGrabbedSelection && preGrabbedSelection.trim()) {
         clipboardCtx = preGrabbedSelection;
         grabbed = true;
-        console.log('Successfully grabbed text selection as context:', preGrabbedSelection);
       }
     }
 
@@ -1144,7 +1324,14 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       try {
         await invoke('copy_text', { text: action.content || '' });
       } catch (err) {
+        // Never report success for a copy that did not happen.
         console.error('Failed to copy to clipboard:', err);
+        if (!isSessionActive(sessionId)) return;
+        setState('error');
+        setStatusMessage(describeInjectError(err));
+        agentRetryContext = null;
+        scheduleAutoDismiss(6000);
+        return;
       }
       if (!isSessionActive(sessionId)) return;
       setState('success');
@@ -1154,23 +1341,36 @@ async function handleAgentMode(voiceCommand, settings, durationMs, preGrabbedSel
       await new Promise(r => setTimeout(r, 900));
       await fadeAndHide(sessionId);
     } else {
+      // Agent actions execute immediately, as they did before the
+      // confirmation flow was introduced: insert/rewrite/delete/select-all/
+      // submit all run without a prompt. The paste recovery affordances
+      // (Retry / Copy) still cover a failed injection.
+
       let executed = false;
-      if (action.action === 'insert' || action.action === 'rewrite') {
-        const textToInsert = action.content || '';
-        await invoke('inject_text', { text: textToInsert, monitorAutoLearn: false });
-        executed = true;
-      } else if (action.action === 'delete_chars') {
-        await invoke('execute_keyboard_action', {
-          action: 'delete_chars',
-          charCount: action.char_count || 0,
-        });
-        executed = true;
-      } else if (action.action === 'select_all') {
-        await invoke('execute_keyboard_action', { action: 'select_all', charCount: null });
-        executed = true;
-      } else if (action.action === 'submit') {
-        await invoke('execute_keyboard_action', { action: 'submit', charCount: null });
-        executed = true;
+      try {
+        // The overlay cannot take OS focus (WS_EX_NOACTIVATE), so the
+        // confirmed keystroke goes straight to the still-foreground target;
+        // validation lives in the inject_* backend commands.
+        if (action.action === 'insert' || action.action === 'rewrite') {
+          await attemptPaste(action.content || '', false);
+          executed = true;
+        } else if (action.action === 'delete_chars') {
+          await attemptKeyboardAction('delete_chars', action.char_count || 0);
+          executed = true;
+        } else if (action.action === 'select_all') {
+          await attemptKeyboardAction('select_all', null);
+          executed = true;
+        } else if (action.action === 'submit') {
+          await attemptKeyboardAction('submit', null);
+          executed = true;
+        }
+      } catch (err) {
+        console.error('Agent action failed:', err);
+        const pending = (action.action === 'insert' || action.action === 'rewrite')
+          ? { sessionId, kind: 'text', text: action.content || '', monitorAutoLearn: false }
+          : { sessionId, kind: 'keyboard', action: action.action, charCount: action.action === 'delete_chars' ? (action.char_count || 0) : null };
+        await handlePasteFailure(pending, err, sessionId);
+        return;
       }
 
       if (!isSessionActive(sessionId)) return;
