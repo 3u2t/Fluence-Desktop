@@ -467,7 +467,33 @@ fn kill_pid_if_sidecar(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn kill_pid_if_sidecar(pid: u32) -> bool {
+    const SIDECAR_NAMES: [&str; 2] = [
+        "moonshine-v2-server",
+        "sherpa-onnx-offline-websocket-server",
+    ];
+
+    // PIDs are recycled: only signal when the executable behind the
+    // recorded PID is still one of our sidecars.
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let name = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !SIDECAR_NAMES.contains(&name.as_str()) {
+        return false;
+    }
+    // SAFETY: `pid` comes from our own pid file and the executable behind
+    // it was verified above. SIGTERM: the sidecars have no handler, so the
+    // default disposition terminates them.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn kill_pid_if_sidecar(_pid: u32) -> bool {
     false
 }

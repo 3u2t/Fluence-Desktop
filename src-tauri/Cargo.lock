@@ -1453,6 +1453,7 @@ dependencies = [
  "hex",
  "image",
  "keyring",
+ "libc",
  "log",
  "md-5",
  "once_cell",
