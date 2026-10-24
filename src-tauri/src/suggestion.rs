@@ -325,6 +325,13 @@ fn is_ready_to_surface(entry: &SuggestionEntry) -> bool {
     entry.status == SuggestionStatus::Pending && entry.frequency >= MIN_OBSERVATIONS_TO_SURFACE
 }
 
+/// Learning-bucket row: pending but below the surface gate. Exactly the
+/// complement of is_ready_to_surface among pending rows; accepted and
+/// dismissed rows belong to neither bucket.
+fn is_learning_row(entry: &SuggestionEntry) -> bool {
+    entry.status == SuggestionStatus::Pending && !is_ready_to_surface(entry)
+}
+
 /// Get all pending suggestions, ranked by frequency (desc) then recency (desc).
 /// Only rows observed at least MIN_OBSERVATIONS_TO_SURFACE times are
 /// returned; first sightings stay in the database and keep counting.
@@ -851,7 +858,7 @@ pub fn get_learning_suggestions(window: tauri::Window) -> Result<Vec<SuggestionE
     let mut learning: Vec<SuggestionEntry> = database
         .suggestions
         .into_iter()
-        .filter(|s| s.status == SuggestionStatus::Pending && !is_ready_to_surface(s))
+        .filter(|s| is_learning_row(s))
         .collect();
     learning.sort_by(|a, b| {
         b.frequency
@@ -1092,6 +1099,43 @@ mod tests {
             purge_invalid_pending_suggestions(&mut db, &std::collections::BTreeSet::new()),
             0
         );
+    }
+
+    // ── Audit rec: learning/"ready" threshold partition ──────────────
+
+    #[test]
+    fn test_pending_partition_splits_at_the_threshold_boundary() {
+        let fresh = pending_entry("ruhi", "ravi", 1);
+        let ready = pending_entry("shunade", "Sinead", 2);
+        assert!(!is_ready_to_surface(&fresh));
+        assert!(is_learning_row(&fresh));
+        assert!(is_ready_to_surface(&ready));
+        assert!(!is_learning_row(&ready));
+    }
+
+    #[test]
+    fn test_terminal_statuses_belong_to_neither_bucket() {
+        let mut accepted = pending_entry("ruhi", "ravi", 5);
+        accepted.status = SuggestionStatus::Accepted;
+        let mut dismissed = pending_entry("do", "add", 5);
+        dismissed.status = SuggestionStatus::Dismissed;
+        for row in [&accepted, &dismissed] {
+            assert!(!is_ready_to_surface(row));
+            assert!(!is_learning_row(row));
+        }
+    }
+
+    #[test]
+    fn test_learning_ready_split_covers_every_pending_row_once() {
+        let rows = [
+            pending_entry("ruhi", "ravi", 1),
+            pending_entry("shunade", "Sinead", 2),
+            pending_entry("stuck", "agent", 8),
+        ];
+        let learning = rows.iter().filter(|r| is_learning_row(r)).count();
+        let ready = rows.iter().filter(|r| is_ready_to_surface(r)).count();
+        assert_eq!((learning, ready), (1, 2));
+        assert_eq!(learning + ready, rows.len());
     }
 
     #[test]
