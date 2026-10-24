@@ -765,7 +765,14 @@ mod tests {
         updated_at: i64,
         device_id: &str,
     ) -> DictionaryItem {
-        let mut item = dict(spoken, corrected, "correction", deleted, updated_at, device_id);
+        let mut item = dict(
+            spoken,
+            corrected,
+            "correction",
+            deleted,
+            updated_at,
+            device_id,
+        );
         item.sync_id = sync_id.to_string();
         item
     }
@@ -776,18 +783,57 @@ mod tests {
         // live(S', t=200) under "hallo". Device B still holds live(S, t=100)
         // under "hello". Both merge orders must converge to: dead old key,
         // live new key — never a resurrection, never a duplicate.
-        let old_live = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 100, "b");
-        let old_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
-        let new_live = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
+        let old_live = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            false,
+            100,
+            "b",
+        );
+        let old_dead = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            true,
+            200,
+            "a",
+        );
+        let new_live = dict_with_id(
+            "22222222-2222-4222-8222-222222222222",
+            "hallo",
+            "Hello",
+            false,
+            200,
+            "a",
+        );
         for (local, remote) in [
-            (vec![old_dead.clone(), new_live.clone()], vec![old_live.clone()]),
-            (vec![old_live.clone()], vec![old_dead.clone(), new_live.clone()]),
+            (
+                vec![old_dead.clone(), new_live.clone()],
+                vec![old_live.clone()],
+            ),
+            (
+                vec![old_live.clone()],
+                vec![old_dead.clone(), new_live.clone()],
+            ),
         ] {
             let out = merge_dictionary(&local, &remote);
-            assert_eq!(out.merged.len(), 2, "tombstone(old) + live(new), nothing else");
-            let old = out.merged.iter().find(|i| i.business_key() == "hello").unwrap();
+            assert_eq!(
+                out.merged.len(),
+                2,
+                "tombstone(old) + live(new), nothing else"
+            );
+            let old = out
+                .merged
+                .iter()
+                .find(|i| i.business_key() == "hello")
+                .unwrap();
             assert!(old.deleted_at.is_some(), "the old entry stays dead");
-            let new = out.merged.iter().find(|i| i.business_key() == "hallo").unwrap();
+            let new = out
+                .merged
+                .iter()
+                .find(|i| i.business_key() == "hallo")
+                .unwrap();
             assert!(new.deleted_at.is_none());
             assert_eq!(new.corrected, "Hello");
         }
@@ -795,15 +841,48 @@ mod tests {
 
     #[test]
     fn rename_repeated_merge_is_stable_and_stale_copies_do_not_resurrect() {
-        let old_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
-        let new_live = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
+        let old_dead = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            true,
+            200,
+            "a",
+        );
+        let new_live = dict_with_id(
+            "22222222-2222-4222-8222-222222222222",
+            "hallo",
+            "Hello",
+            false,
+            200,
+            "a",
+        );
         let converged = merge_dictionary(&[old_dead.clone(), new_live.clone()], &[]).merged;
         // A stale pre-rename copy arriving late must not resurrect anything.
-        let stale = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 50, "c");
+        let stale = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            false,
+            50,
+            "c",
+        );
         let second = merge_dictionary(&converged, &[stale]);
         assert_eq!(second.merged.len(), 2);
-        assert!(second.merged.iter().find(|i| i.business_key() == "hello").unwrap().deleted_at.is_some());
-        assert!(second.merged.iter().find(|i| i.business_key() == "hallo").unwrap().deleted_at.is_none());
+        assert!(second
+            .merged
+            .iter()
+            .find(|i| i.business_key() == "hello")
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert!(second
+            .merged
+            .iter()
+            .find(|i| i.business_key() == "hallo")
+            .unwrap()
+            .deleted_at
+            .is_none());
         let third = merge_dictionary(&second.merged, &[]);
         assert!(!third.changed, "a converged set re-merges clean");
     }
@@ -813,14 +892,34 @@ mod tests {
         // Two devices rename hello→hallo concurrently with different fresh
         // sync_ids. Both sides must pick the SAME winner: per-key LWW falls
         // through (updated_at, device_id) to the sync_id tiebreak.
-        let a_new = dict_with_id("11111111-1111-4111-8111-111111111111", "hallo", "A", false, 200, "a");
-        let b_new = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "B", false, 200, "a");
+        let a_new = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hallo",
+            "A",
+            false,
+            200,
+            "a",
+        );
+        let b_new = dict_with_id(
+            "22222222-2222-4222-8222-222222222222",
+            "hallo",
+            "B",
+            false,
+            200,
+            "a",
+        );
         let ab = merge_dictionary(&[a_new.clone()], &[b_new.clone()]);
         let ba = merge_dictionary(&[b_new], &[a_new]);
         assert_eq!(ab.merged.len(), 1);
         assert_eq!(ba.merged.len(), 1);
-        assert_eq!(ab.merged[0].corrected, ba.merged[0].corrected, "both orders agree");
-        assert_eq!(ab.merged[0].corrected, "B", "larger sync_id wins the full tie");
+        assert_eq!(
+            ab.merged[0].corrected, ba.merged[0].corrected,
+            "both orders agree"
+        );
+        assert_eq!(
+            ab.merged[0].corrected, "B",
+            "larger sync_id wins the full tie"
+        );
     }
 
     #[test]
@@ -830,20 +929,62 @@ mod tests {
         // newer tombstone holds the old key dead, the new entry lives. The
         // delete does NOT kill the renamed entry (different key), and the
         // rename does NOT resurrect the old key — deterministic, documented.
-        let old_live = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", false, 100, "b");
-        let rename_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 200, "a");
-        let rename_new = dict_with_id("22222222-2222-4222-8222-222222222222", "hallo", "Hello", false, 200, "a");
-        let delete_dead = dict_with_id("11111111-1111-4111-8111-111111111111", "hello", "Hello", true, 300, "c");
+        let old_live = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            false,
+            100,
+            "b",
+        );
+        let rename_dead = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            true,
+            200,
+            "a",
+        );
+        let rename_new = dict_with_id(
+            "22222222-2222-4222-8222-222222222222",
+            "hallo",
+            "Hello",
+            false,
+            200,
+            "a",
+        );
+        let delete_dead = dict_with_id(
+            "11111111-1111-4111-8111-111111111111",
+            "hello",
+            "Hello",
+            true,
+            300,
+            "c",
+        );
         for (local, remote) in [
-            (vec![rename_dead.clone(), rename_new.clone()], vec![old_live.clone(), delete_dead.clone()]),
+            (
+                vec![rename_dead.clone(), rename_new.clone()],
+                vec![old_live.clone(), delete_dead.clone()],
+            ),
             (vec![old_live, delete_dead], vec![rename_dead, rename_new]),
         ] {
             let out = merge_dictionary(&local, &remote);
-            let old = out.merged.iter().find(|i| i.business_key() == "hello").unwrap();
+            let old = out
+                .merged
+                .iter()
+                .find(|i| i.business_key() == "hello")
+                .unwrap();
             assert!(old.deleted_at.is_some());
             assert_eq!(old.updated_at, 300, "the newest tombstone wins the old key");
-            let new = out.merged.iter().find(|i| i.business_key() == "hallo").unwrap();
-            assert!(new.deleted_at.is_none(), "the renamed entry survives the delete");
+            let new = out
+                .merged
+                .iter()
+                .find(|i| i.business_key() == "hallo")
+                .unwrap();
+            assert!(
+                new.deleted_at.is_none(),
+                "the renamed entry survives the delete"
+            );
         }
     }
 
@@ -859,12 +1000,7 @@ mod tests {
         }
     }
 
-    fn setting_tomb(
-        key: &str,
-        value: &str,
-        updated_at: i64,
-        device_id: &str,
-    ) -> SettingsItem {
+    fn setting_tomb(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsItem {
         SettingsItem {
             key: key.to_string(),
             value: value.to_string(),
@@ -1146,7 +1282,14 @@ mod tests {
     /// A record pinned to a fixed identity so every field of Rule A levels 1–3
     /// ties and only the CONTENT level can decide.
     fn full_tie_dict(sync_id: &str, spoken: &str, corrected: &str) -> DictionaryItem {
-        let mut item = dict(spoken, corrected, "correction", false, 1_713_471_000_123, "dev");
+        let mut item = dict(
+            spoken,
+            corrected,
+            "correction",
+            false,
+            1_713_471_000_123,
+            "dev",
+        );
         item.sync_id = sync_id.to_string();
         item
     }
@@ -1246,11 +1389,8 @@ mod tests {
     /// before. This is the anti-regression for the frozen LWW law.
     #[test]
     fn content_level_never_overrides_recency_device_or_sync_id() {
-        let mut older_but_bigger_content = full_tie_dict(
-            "99999999-9999-4999-8999-999999999999",
-            "tie",
-            "ZZZZZZZZ",
-        );
+        let mut older_but_bigger_content =
+            full_tie_dict("99999999-9999-4999-8999-999999999999", "tie", "ZZZZZZZZ");
         older_but_bigger_content.updated_at = 100;
         let newer = full_tie_dict("00000000-0000-4000-8000-000000000001", "tie", "AAA");
         let out = merge_dictionary(&[newer], &[older_but_bigger_content]);
@@ -1330,17 +1470,31 @@ mod tests {
             folds += 1;
 
             let want = &raw["expected"]["dictionary"][0];
-            assert_eq!(dict_acc.len(), 1, "fold {folds}: one winner per business key");
+            assert_eq!(
+                dict_acc.len(),
+                1,
+                "fold {folds}: one winner per business key"
+            );
             assert_eq!(dict_acc[0].sync_id, want["syncId"].as_str().unwrap());
-            assert_eq!(dict_acc[0].business_key(), want["businessKey"].as_str().unwrap());
+            assert_eq!(
+                dict_acc[0].business_key(),
+                want["businessKey"].as_str().unwrap()
+            );
             assert_eq!(dict_acc[0].corrected, want["corrected"].as_str().unwrap());
             assert_eq!(dict_acc[0].updated_at, want["updatedAt"].as_i64().unwrap());
             assert_eq!(dict_acc[0].device_id, want["deviceId"].as_str().unwrap());
 
             let want = &raw["expected"]["snippets"][0];
-            assert_eq!(snip_acc.len(), 1, "fold {folds}: one winner per business key");
+            assert_eq!(
+                snip_acc.len(),
+                1,
+                "fold {folds}: one winner per business key"
+            );
             assert_eq!(snip_acc[0].sync_id, want["syncId"].as_str().unwrap());
-            assert_eq!(snip_acc[0].business_key(), want["businessKey"].as_str().unwrap());
+            assert_eq!(
+                snip_acc[0].business_key(),
+                want["businessKey"].as_str().unwrap()
+            );
             assert_eq!(snip_acc[0].expansion, want["expansion"].as_str().unwrap());
             assert_eq!(snip_acc[0].updated_at, want["updatedAt"].as_i64().unwrap());
             assert_eq!(snip_acc[0].device_id, want["deviceId"].as_str().unwrap());
@@ -1356,7 +1510,12 @@ mod tests {
     /// makes the retraction propagate back instead of being resurrected.
     #[test]
     fn android_settings_tombstone_applies_on_windows() {
-        let local = vec![setting("ai_polish_style", "formal", 1_713_471_000_123, "windows")];
+        let local = vec![setting(
+            "ai_polish_style",
+            "formal",
+            1_713_471_000_123,
+            "windows",
+        )];
         let remote = vec![setting_tomb(
             "ai_polish_style",
             "default",
@@ -1425,9 +1584,9 @@ mod tests {
     }
 
     /// A remote retraction must reach local state AND be reported as a state
-/// change, or the device keeps the retracted key forever and re-adopts it on
-/// the next pass. (The `changed` flip here is carried by `updatedAt`, not by
-/// `deleted_at` — see the note on `merge_settings`'s dirty check.)
+    /// change, or the device keeps the retracted key forever and re-adopts it on
+    /// the next pass. (The `changed` flip here is carried by `updatedAt`, not by
+    /// `deleted_at` — see the note on `merge_settings`'s dirty check.)
     #[test]
     fn a_tombstone_only_change_is_reported_as_changed() {
         let live = vec![setting("language", "en", 100, "d")];

@@ -253,10 +253,7 @@ mod sys {
                     // maps to `FlushFileBuffers`, which needs `GENERIC_WRITE`, so
                     // the read-only form is a guaranteed no-op. Best-effort and
                     // non-fatal, so a flush failure can never fail the save.
-                    if let Ok(f) = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&tmp)
-                    {
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
                         let _ = f.sync_all();
                     }
                     if std::fs::rename(&tmp, &path).is_err() {

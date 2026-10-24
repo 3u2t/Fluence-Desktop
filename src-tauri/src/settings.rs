@@ -626,8 +626,7 @@ mod tests {
         // Destination must survive the race: present, valid JSON, and holding one
         // of the written values — never a truncated, empty, or torn file.
         let path = settings_path();
-        let raw = fs::read_to_string(&path)
-            .expect("settings.json must exist after racing saves");
+        let raw = fs::read_to_string(&path).expect("settings.json must exist after racing saves");
         let parsed: AppSettings =
             serde_json::from_str(&raw).expect("settings.json must parse after racing saves");
         let valid: Vec<String> = (0..threads).map(|i| format!("lang-{i}")).collect();

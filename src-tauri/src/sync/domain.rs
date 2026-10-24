@@ -356,11 +356,7 @@ pub struct SettingsItem {
     /// Like every other domain, a tombstone is an ordinary LWW state: it wins
     /// on `updatedAt` and loses to any newer write. It is never compared as a
     /// tiebreak — see `merge::merge_settings`.
-    #[serde(
-        rename = "deletedAt",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "deletedAt", default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<i64>,
 }
 
@@ -413,11 +409,7 @@ impl SettingsEnvelope {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Some(Self {
             v: ENVELOPE_V1,
-            entries: decode_entries(
-                bytes,
-                SETTINGS_KEYS.len() * 4,
-                SettingsItem::validate,
-            )?,
+            entries: decode_entries(bytes, SETTINGS_KEYS.len() * 4, SettingsItem::validate)?,
         })
     }
 }
@@ -1219,7 +1211,10 @@ mod tests {
     fn envelope_level_problems_still_reject_the_whole_file() {
         assert!(DictionaryEnvelope::from_bytes(b"{ not json").is_none());
         assert!(DictionaryEnvelope::from_bytes(br#"{"v":2,"entries":[]}"#).is_none());
-        assert!(DictionaryEnvelope::from_bytes(br#"{"v":1}"#).is_some(), "absent entries default empty");
+        assert!(
+            DictionaryEnvelope::from_bytes(br#"{"v":1}"#).is_some(),
+            "absent entries default empty"
+        );
         // `entries` must be an array; anything else is an envelope problem.
         assert!(DictionaryEnvelope::from_bytes(br#"{"v":1,"entries":{}}"#).is_none());
         assert!(DictionaryEnvelope::from_bytes(br#"{"v":1,"entries":null}"#).is_none());

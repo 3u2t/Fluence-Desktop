@@ -108,8 +108,7 @@ impl SyncMetadata {
             // per-account `max_seen` monotonic floor that LWW ordering depends on,
             // so truncating it silently rewinds the tie-break clock.
             let tmp = {
-                static TMP_SEQ: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
+                static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut name = path.as_os_str().to_os_string();
                 name.push(format!(".tmp.{}.{}", std::process::id(), seq));

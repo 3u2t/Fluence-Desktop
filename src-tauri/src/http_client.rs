@@ -238,7 +238,10 @@ mod tests {
             &url_of("http://www.googleapis.com/drive/v3/files")
         ));
         assert!(!redirect_is_allowed(
-            &[url_of("https://api.groq.com/a"), url_of("https://api.groq.com/b")],
+            &[
+                url_of("https://api.groq.com/a"),
+                url_of("https://api.groq.com/b")
+            ],
             &url_of("http://api.groq.com/c"),
         ));
         // A cross-host hop off an https chain is refused as well.

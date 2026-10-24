@@ -202,9 +202,15 @@ mod tests {
         let more_words = (100, "dev", "2026-01-01", 1000, 11, 50, 5000);
         let w = |r: (i64, &str, &str, i64, i64, i64, i64),
                  o: (i64, &str, &str, i64, i64, i64, i64)| {
-            cmp_stats_winner(r.0, r.1, r.2, r.3, r.4, r.5, r.6, o.0, o.1, o.2, o.3, o.4, o.5, o.6)
+            cmp_stats_winner(
+                r.0, r.1, r.2, r.3, r.4, r.5, r.6, o.0, o.1, o.2, o.3, o.4, o.5, o.6,
+            )
         };
-        assert_eq!(w(base, later_day), Ordering::Less, "later day wins the full tie");
+        assert_eq!(
+            w(base, later_day),
+            Ordering::Less,
+            "later day wins the full tie"
+        );
         assert_eq!(
             w(base, more_words),
             Ordering::Less,

@@ -250,9 +250,8 @@ impl DictionaryDirtyStore {
     /// cannot return an error, so the raw read lives here and the infallible
     /// wrapper below degrades *loudly* instead of `unwrap_or_default()`.
     fn load_strict(&self, account_hash: &str) -> Result<Vec<DictionaryItem>, SyncError> {
-        let all = load_dictionary_internal().map_err(|e| {
-            SyncError::Fatal(format!("dictionary store unreadable: {e}"))
-        })?;
+        let all = load_dictionary_internal()
+            .map_err(|e| SyncError::Fatal(format!("dictionary store unreadable: {e}")))?;
         Ok(all
             .iter()
             .filter(|e| e.sync_account.as_deref() == Some(account_hash))
@@ -270,9 +269,8 @@ impl DictionaryDirtyStore {
     /// successful, completely silent state with no local data in it. Unknown
     /// state is reported as dirty so the pass never concludes "nothing to do".
     fn has_dirty_strict(&self, account_hash: &str) -> Result<bool, SyncError> {
-        let all = load_dictionary_internal().map_err(|e| {
-            SyncError::Fatal(format!("dictionary store unreadable: {e}"))
-        })?;
+        let all = load_dictionary_internal()
+            .map_err(|e| SyncError::Fatal(format!("dictionary store unreadable: {e}")))?;
         Ok(all
             .iter()
             .any(|e| e.sync_account.as_deref() == Some(account_hash) && e.dirty))
@@ -373,8 +371,7 @@ impl DirtyStore for DictionaryDirtyStore {
                         // (`None => true`) and resurrects the loser dirty
                         // forever. The key derivation is exactly the merge's
                         // grouping key, so this agrees with merge_keyed.
-                        m.sync_id == e.id
-                            || m.business_key() == dict_sync_business_key(&e.spoken)
+                        m.sync_id == e.id || m.business_key() == dict_sync_business_key(&e.spoken)
                     }) {
                         // H4: port of the agents/styles `already_uploaded`
                         // guard. A dirty row whose content already equals its
@@ -433,9 +430,7 @@ impl DirtyStore for DictionaryDirtyStore {
             .map(|e| dict_sync_business_key(&e.spoken))
             .collect();
         for item in merged {
-            if rescued_ids.contains(&item.sync_id)
-                || rescued_keys.contains(&item.business_key())
-            {
+            if rescued_ids.contains(&item.sync_id) || rescued_keys.contains(&item.business_key()) {
                 continue;
             }
             let mut entry = Self::from_domain_item(item, account_hash);
@@ -658,9 +653,7 @@ impl DirtyStore for SnippetDirtyStore {
             .map(|s| snippet_sync_business_key(&s.trigger))
             .collect();
         for item in merged {
-            if rescued_ids.contains(&item.sync_id)
-                || rescued_keys.contains(&item.business_key())
-            {
+            if rescued_ids.contains(&item.sync_id) || rescued_keys.contains(&item.business_key()) {
                 continue;
             }
             store
@@ -854,9 +847,7 @@ impl SettingsDirtyStore {
     /// that the user turned snippets off. This is the fallible core; every
     /// caller that stamps or uploads must use it.
     fn live_values_strict(settings: &AppSettings) -> Result<Vec<(String, String)>, String> {
-        let snippets_enabled = load_snippets_internal()
-            .map_err(|e| e.to_string())?
-            .enabled;
+        let snippets_enabled = load_snippets_internal().map_err(|e| e.to_string())?.enabled;
         Ok(vec![
             ("language".to_string(), settings.language.clone()),
             ("snippets_enabled".to_string(), snippets_enabled.to_string()),
@@ -967,8 +958,8 @@ impl SettingsDirtyStore {
         let _lock = crate::sync::io_lock::io_lock_guard();
         let mut meta = Self::load_meta_from(io.meta_path);
         let activation_pending = meta.activation_baseline.is_some();
-        let mut settings =
-            (io.load_settings)().map_err(|e| SyncError::Fatal(format!("settings unreadable: {e}")))?;
+        let mut settings = (io.load_settings)()
+            .map_err(|e| SyncError::Fatal(format!("settings unreadable: {e}")))?;
         // Live values observed NOW, read BEFORE this loop mutates `settings`.
         // Compared against the pre-pass snapshot so an edit the user made during
         // the GET→PUT window is not overwritten by a winner computed without it.
@@ -1237,8 +1228,9 @@ impl DirtyStore for SettingsDirtyStore {
         let _io = crate::sync::io_lock::io_lock_guard();
         let meta_path = Self::meta_path(account_hash);
         let load_settings = || load_settings().map_err(|e| e.to_string());
-        let save_settings =
-            |settings: &AppSettings| crate::settings::save_settings(settings).map_err(|e| e.to_string());
+        let save_settings = |settings: &AppSettings| {
+            crate::settings::save_settings(settings).map_err(|e| e.to_string())
+        };
         let still_active = || Self::active_account_matches(account_hash);
         let io = SettingsIo {
             meta_path: &meta_path,
@@ -1399,7 +1391,9 @@ impl StatsDirtyStore {
         // corrupt bytes are preserved aside; skipping one event is the safe
         // trade (Phase E).
         let mut rows = Self::load_rows_strict().map_err(|e| {
-            SyncError::Fatal(format!("stats ledger unreadable; event {history_id} skipped: {e:?}"))
+            SyncError::Fatal(format!(
+                "stats ledger unreadable; event {history_id} skipped: {e:?}"
+            ))
         })?;
         if rows.iter().any(|r| r.item.event_id == item.event_id) {
             return Ok(false); // idempotent by construction
@@ -1444,68 +1438,68 @@ impl StatsDirtyStore {
     }
 
     fn backfill_done(metadata: &SyncMetadata, account_hash: &str) -> bool {
-    metadata
-      .for_account(account_hash)
-      .map(|s| s.backfill_done)
-      .unwrap_or(false)
-  }
-
-  /// Seed the local stats ledger from `history.db` when the signed-in account
-  /// has no ledger events yet.
-  ///
-  /// WHY: the dashboard derives its activity buckets from this ledger, but the
-  /// ledger is only seeded by a sync pass (`DirtyStore::load`). An installation
-  /// upgraded from a build older than the ledger existed therefore had years of
-  /// history and an empty ledger, so the dashboard reported "No baseline yet" ΓÇö
-  /// behaving like a brand-new user. Reusing the SAME `backfill_from_history`
-  /// (deterministic UUIDv5 event ids, union dedup) keeps this idempotent and
-  /// keeps both seeding paths converging on identical state.
-  ///
-  /// Deliberately does NOT set `backfill_done`: that flag belongs to the sync
-  /// pass, and flipping it here would change sync behaviour. Leaving it unset
-  /// just means the sync pass runs its own backfill later and finds every event
-  /// id already present, so it writes nothing.
-  ///
-  /// Account-scoped: rows are stamped with THIS account hash and read back
-  /// through `account_event_rows`, so no other account can observe them.
-  /// Signed-out (`None`) is a no-op, so the all-rows local view is unchanged and
-  /// no unattributed rows are ever created. Empty/unreadable `history.db`
-  /// yields no synthetic rows, so a new user keeps the genuine empty state.
-  fn ensure_account_backfilled(account_hash: &str) {
-    if !crate::account_scope::valid_account_hash(account_hash) {
-      return;
+        metadata
+            .for_account(account_hash)
+            .map(|s| s.backfill_done)
+            .unwrap_or(false)
     }
-    let _io = crate::sync::io_lock::io_lock_guard();
-    let mut rows = match Self::load_rows_strict() {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("Skipping account backfill; stats ledger unreadable: {e:?}");
+
+    /// Seed the local stats ledger from `history.db` when the signed-in account
+    /// has no ledger events yet.
+    ///
+    /// WHY: the dashboard derives its activity buckets from this ledger, but the
+    /// ledger is only seeded by a sync pass (`DirtyStore::load`). An installation
+    /// upgraded from a build older than the ledger existed therefore had years of
+    /// history and an empty ledger, so the dashboard reported "No baseline yet" ΓÇö
+    /// behaving like a brand-new user. Reusing the SAME `backfill_from_history`
+    /// (deterministic UUIDv5 event ids, union dedup) keeps this idempotent and
+    /// keeps both seeding paths converging on identical state.
+    ///
+    /// Deliberately does NOT set `backfill_done`: that flag belongs to the sync
+    /// pass, and flipping it here would change sync behaviour. Leaving it unset
+    /// just means the sync pass runs its own backfill later and finds every event
+    /// id already present, so it writes nothing.
+    ///
+    /// Account-scoped: rows are stamped with THIS account hash and read back
+    /// through `account_event_rows`, so no other account can observe them.
+    /// Signed-out (`None`) is a no-op, so the all-rows local view is unchanged and
+    /// no unattributed rows are ever created. Empty/unreadable `history.db`
+    /// yields no synthetic rows, so a new user keeps the genuine empty state.
+    fn ensure_account_backfilled(account_hash: &str) {
+        if !crate::account_scope::valid_account_hash(account_hash) {
             return;
         }
-    };
-    // Only when this account has nothing yet: a populated ledger must be left
-    // exactly as it is.
-    if rows
-      .iter()
-      .any(|r| r.account.as_deref() == Some(account_hash))
-    {
-      return;
+        let _io = crate::sync::io_lock::io_lock_guard();
+        let mut rows = match Self::load_rows_strict() {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("Skipping account backfill; stats ledger unreadable: {e:?}");
+                return;
+            }
+        };
+        // Only when this account has nothing yet: a populated ledger must be left
+        // exactly as it is.
+        if rows
+            .iter()
+            .any(|r| r.account.as_deref() == Some(account_hash))
+        {
+            return;
+        }
+        let synthetic = Self::backfill_from_history(account_hash);
+        if synthetic.is_empty() {
+            return;
+        }
+        let before = rows.len();
+        for row in synthetic {
+            if !rows.iter().any(|r| r.item.event_id == row.item.event_id) {
+                rows.push(row);
+            }
+        }
+        if rows.len() > before && Self::save_rows(&rows).is_ok() {
+            // A previous read in this session may have cached the empty result.
+            Self::invalidate_activity_cache();
+        }
     }
-    let synthetic = Self::backfill_from_history(account_hash);
-    if synthetic.is_empty() {
-      return;
-    }
-    let before = rows.len();
-    for row in synthetic {
-      if !rows.iter().any(|r| r.item.event_id == row.item.event_id) {
-        rows.push(row);
-      }
-    }
-    if rows.len() > before && Self::save_rows(&rows).is_ok() {
-      // A previous read in this session may have cached the empty result.
-      Self::invalidate_activity_cache();
-    }
-  }
 
     /// Test seam: raw ledger rows.
     #[cfg(test)]
@@ -1715,37 +1709,39 @@ static ACTIVITY_CACHE: std::sync::Mutex<Option<(Option<String>, ActivityRows)>> 
 /// to the real user profile and could sign the user out. Never call
 /// `save_settings`/`restore` from tests; pass the hash here instead.
 fn account_activity_for(
-  account_hash: Option<&str>,
-  since_ms: Option<i64>,
+    account_hash: Option<&str>,
+    since_ms: Option<i64>,
 ) -> Result<Vec<DailyBucket>, String> {
-  // Seed-on-read for the upgrade path: an account with pre-existing history but
-  // no ledger events yet must not look like a new user. No-op for a signed-out
-  // session and for an already-populated ledger.
-  if let Some(hash) = account_hash {
-    StatsDirtyStore::ensure_account_backfilled(hash);
-  }
-  let rows = StatsDirtyStore::cached_event_rows(account_hash.map(str::to_string), || {
-    match account_hash {
-      Some(hash) => StatsDirtyStore::account_event_rows(hash),
-      None => StatsDirtyStore::local_normalized_rows(),
+    // Seed-on-read for the upgrade path: an account with pre-existing history but
+    // no ledger events yet must not look like a new user. No-op for a signed-out
+    // session and for an already-populated ledger.
+    if let Some(hash) = account_hash {
+        StatsDirtyStore::ensure_account_backfilled(hash);
     }
-  });
-  Ok(StatsDirtyStore::bucket_events(rows, since_ms))
+    let rows =
+        StatsDirtyStore::cached_event_rows(
+            account_hash.map(str::to_string),
+            || match account_hash {
+                Some(hash) => StatsDirtyStore::account_event_rows(hash),
+                None => StatsDirtyStore::local_normalized_rows(),
+            },
+        );
+    Ok(StatsDirtyStore::bucket_events(rows, since_ms))
 }
 
 #[tauri::command]
 pub fn get_account_activity(
-  window: tauri::Window,
-  since_ms: Option<i64>,
+    window: tauri::Window,
+    since_ms: Option<i64>,
 ) -> Result<Vec<DailyBucket>, String> {
-  // Dashboard activity buckets are main-window-only data; the overlay and the
-  // setup wizard never render them.
-  crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
-  let account_hash = crate::settings::load_settings()
-    .ok()
-    .and_then(|s| s.sync_account_key)
-    .map(|email| crate::sync::metadata::account_hash_from_email(&email));
-  account_activity_for(account_hash.as_deref(), since_ms)
+    // Dashboard activity buckets are main-window-only data; the overlay and the
+    // setup wizard never render them.
+    crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
+    let account_hash = crate::settings::load_settings()
+        .ok()
+        .and_then(|s| s.sync_account_key)
+        .map(|email| crate::sync::metadata::account_hash_from_email(&email));
+    account_activity_for(account_hash.as_deref(), since_ms)
 }
 
 impl DirtyStore for StatsDirtyStore {
@@ -1989,7 +1985,7 @@ impl AgentDirtyStore {
             hint: item.hint,
             sync_id: Some(item.sync_id),
             updated_at: Some(item.updated_at),
-device_id: Some(item.device_id),
+            device_id: Some(item.device_id),
             deleted_at: item.deleted_at,
             // A row that came back from a completed merge is by definition
             // already in the sync state, so it starts clean. Without this the
@@ -2218,7 +2214,7 @@ impl StyleDirtyStore {
             hint: item.hint,
             sync_id: Some(item.sync_id),
             updated_at: Some(item.updated_at),
-device_id: Some(item.device_id),
+            device_id: Some(item.device_id),
             deleted_at: item.deleted_at,
             // Merged back in: already in the sync state, so clean.
             dirty: false,
@@ -3532,7 +3528,8 @@ mod tests {
     }
 
     #[test]
-    fn save_merged_keeps_shard_unroutable_rows_dirty() {        let _guard = store_test_guard();
+    fn save_merged_keeps_shard_unroutable_rows_dirty() {
+        let _guard = store_test_guard();
         let tmp = std::env::temp_dir().join(format!(
             "fluence-test-ledger-unroutable-{}-{}.json",
             std::process::id(),
@@ -4743,7 +4740,12 @@ mod dirty_lifecycle {
         const V2_ID: &str = "agent:conformance-0002";
         const V3_ID: &str = "agent:conformance-0003";
 
-        fn row(id: &str, name: &str, sync_id: Option<&str>, dirty: bool) -> crate::account_scope::AccountAgent {
+        fn row(
+            id: &str,
+            name: &str,
+            sync_id: Option<&str>,
+            dirty: bool,
+        ) -> crate::account_scope::AccountAgent {
             crate::account_scope::AccountAgent {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -4771,7 +4773,9 @@ mod dirty_lifecycle {
         fn seed(hash: &str, rows: Vec<crate::account_scope::AccountAgent>) {
             crate::account_scope::save_account_agents(
                 hash,
-                &crate::account_scope::AccountAgentsStore { custom_agents: rows },
+                &crate::account_scope::AccountAgentsStore {
+                    custom_agents: rows,
+                },
             )
             .expect("conformance seed must write");
         }
@@ -4819,7 +4823,10 @@ mod dirty_lifecycle {
                 .find(|a| a.id == V2_ID)
                 .expect("vector 2: differing dirty row must survive");
             assert_eq!(survived.name, "Local Name");
-            assert!(survived.dirty, "vector 2: and it stays dirty for the next upload");
+            assert!(
+                survived.dirty,
+                "vector 2: and it stays dirty for the next upload"
+            );
         }
 
         /// Vector 3: a dirty row whose content already equals its winner is
@@ -4899,7 +4906,6 @@ mod audit_regressions {
         assert!(SettingsDirtyStore::decide_settings_apply(None, None));
     }
 
-
     fn unique(tag: &str, ext: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "fluence-audit-{}-{}-{}.{ext}",
@@ -4963,7 +4969,7 @@ mod audit_regressions {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stats_events.json");
         // Big enough that a torn write is unmistakable.
-let payloads: Vec<String> = (0..8)
+        let payloads: Vec<String> = (0..8)
             .map(|i| format!("[{i:04}]").to_string() + &"x".repeat(256 * 1024))
             .collect();
         let dest = &path;
@@ -5104,7 +5110,7 @@ let payloads: Vec<String> = (0..8)
     fn an_unreadable_snippets_store_emits_no_settings_items() {
         let _guard = super::store_test_guard();
         let hash = format!("audit-settings-{}", uuid::Uuid::new_v4());
-let snippets = super::data_dir().join("snippets.json");
+        let snippets = super::data_dir().join("snippets.json");
         std::fs::create_dir_all(super::data_dir()).expect("test data dir");
         let meta_path = SettingsDirtyStore::meta_path(&hash);
         let _ = std::fs::remove_file(&meta_path);
@@ -5208,7 +5214,7 @@ let snippets = super::data_dir().join("snippets.json");
             }
         }
 
-/// Build a [`SettingsIo`] over this fake and run `f` with it. The closures
+        /// Build a [`SettingsIo`] over this fake and run `f` with it. The closures
         /// must live in one frame that outlives the borrow, so they are
         /// created here rather than returned.
         fn with_io<R>(&self, f: impl FnOnce(&SettingsIo) -> R) -> R {
@@ -5265,7 +5271,7 @@ let snippets = super::data_dir().join("snippets.json");
         }
     }
 
-fn winner(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsItem {
+    fn winner(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsItem {
         SettingsItem {
             key: key.to_string(),
             value: value.to_string(),
@@ -5279,7 +5285,7 @@ fn winner(key: &str, value: &str, updated_at: i64, device_id: &str) -> SettingsI
 
     #[test]
     fn settings_timestamp_tie_resolves_by_device_id() {
-let fake = FakeSettingsIo::new("tie-device");
+        let fake = FakeSettingsIo::new("tie-device");
         fake.seed_baseline("language", "en", 1_000, "dev-a");
 
         // Identical updatedAt, larger deviceId: `merge_settings` resolves this
@@ -5312,7 +5318,7 @@ let fake = FakeSettingsIo::new("tie-device");
         // Same updatedAt AND same deviceId: only the value separates them, and
         // the canonical comparator (`cmp_settings_winner`, shared with
         // `merge_settings` and Android) says the larger value wins.
-let fake = FakeSettingsIo::new("tie-value");
+        let fake = FakeSettingsIo::new("tie-value");
         fake.seed_baseline("ai_polish_style", "dark", 2_000, "dev-a");
         // Pin the comparator itself against the canonical order: equal time,
         // equal device, LARGER value wins (`cmp_settings_winner`, the very
@@ -5329,8 +5335,11 @@ let fake = FakeSettingsIo::new("tie-value");
             "the canonical settings order says the larger value wins a full tie"
         );
         fake.with_io(|io| {
-            SettingsDirtyStore::apply_merged(io, &[winner("ai_polish_style", "light", 2_000, "dev-a")])
-                .expect("full tie resolved by value")
+            SettingsDirtyStore::apply_merged(
+                io,
+                &[winner("ai_polish_style", "light", 2_000, "dev-a")],
+            )
+            .expect("full tie resolved by value")
         });
         assert_eq!(
             fake.settings.borrow().ai_polish_style,
@@ -5374,7 +5383,7 @@ let fake = FakeSettingsIo::new("tie-value");
         // still the stale local one. The next pass then sees "local edit",
         // stamps it `edit_now` and uploads it - reverting the remote winner
         // for good, self-healing toward the wrong state.
-fake.save_fails.set(true);
+        fake.save_fails.set(true);
         let err = fake.with_io(|io| {
             SettingsDirtyStore::apply_merged(io, &[winner("language", "fr", 2_000, "dev-b")])
         });
@@ -5390,7 +5399,7 @@ fake.save_fails.set(true);
 
         // The next pass therefore re-applies the SAME remote winner rather
         // than re-uploading the stale local value.
-fake.save_fails.set(false);
+        fake.save_fails.set(false);
         fake.with_io(|io| {
             SettingsDirtyStore::apply_merged(io, &[winner("language", "fr", 2_000, "dev-b")])
                 .expect("retry re-applies the remote winner")
@@ -5407,7 +5416,7 @@ fake.save_fails.set(false);
         let fake = FakeSettingsIo::new("snippets-write");
         fake.seed_baseline("snippets_enabled", "false", 5_000, "dev-a");
 
-fake.snippet_fails.set(true);
+        fake.snippet_fails.set(true);
         let err = fake.with_io(|io| {
             SettingsDirtyStore::apply_merged(
                 io,
@@ -5436,7 +5445,7 @@ fake.snippet_fails.set(true);
         assert_eq!(meta.keys["snippets_enabled"].t, 5_000);
 
         // Once the store is writable the toggle converges instead of flipping.
-fake.snippet_fails.set(false);
+        fake.snippet_fails.set(false);
         fake.with_io(|io| {
             SettingsDirtyStore::apply_merged(
                 io,

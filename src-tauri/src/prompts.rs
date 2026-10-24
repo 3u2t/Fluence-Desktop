@@ -788,11 +788,7 @@ pub fn claim_legacy_prompt_style(
     //
     // S6: the claim returns `Err` when the durable save fails, so a failed
     // claim surfaces as an error toast, never "Nothing to add".
-    crate::account_scope::claim_legacy_account_styles(
-        Some(&hash),
-        &legacy,
-        Some(&only),
-    )
+    crate::account_scope::claim_legacy_account_styles(Some(&hash), &legacy, Some(&only))
 }
 
 #[tauri::command]

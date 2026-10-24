@@ -2120,7 +2120,13 @@ mod tests {
     // code under test — a test that rebuilt the expectation from the sorter
     // would pass no matter what the sorter did.
 
-    fn dict_wire(sync_id: &str, spoken: &str, corrected: &str, ts: i64, device: &str) -> DictionaryItem {
+    fn dict_wire(
+        sync_id: &str,
+        spoken: &str,
+        corrected: &str,
+        ts: i64,
+        device: &str,
+    ) -> DictionaryItem {
         DictionaryItem {
             sync_id: sync_id.to_string(),
             spoken: spoken.to_string(),
@@ -2167,13 +2173,35 @@ mod tests {
     #[test]
     fn write_side_dictionary_sort_is_deterministic_for_shuffled_input() {
         let shuffled = vec![
-            dict_wire("22222222-2222-4222-8222-222222222222", " Beta ", "B", 3, "dev-b"),
-            dict_wire("33333333-3333-4333-8333-333333333333", "  Alpha", "C", 2, "dev-c"),
-            dict_wire("11111111-1111-4111-8111-111111111111", "alpha", "A", 1, "dev-a"),
+            dict_wire(
+                "22222222-2222-4222-8222-222222222222",
+                " Beta ",
+                "B",
+                3,
+                "dev-b",
+            ),
+            dict_wire(
+                "33333333-3333-4333-8333-333333333333",
+                "  Alpha",
+                "C",
+                2,
+                "dev-c",
+            ),
+            dict_wire(
+                "11111111-1111-4111-8111-111111111111",
+                "alpha",
+                "A",
+                1,
+                "dev-a",
+            ),
         ];
         let mut items = shuffled;
         sort_dictionary_items(&mut items);
-        let bytes = DictionaryEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        let bytes = DictionaryEnvelope {
+            v: ENVELOPE_V1,
+            entries: items,
+        }
+        .to_bytes();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             concat!(
@@ -2193,13 +2221,35 @@ mod tests {
     #[test]
     fn write_side_snippet_sort_is_deterministic_for_shuffled_input() {
         let shuffled = vec![
-            snippet_wire("33333333-3333-4333-8333-333333333333", " Beta ", "C", 3, "dev-c"),
-            snippet_wire("11111111-1111-4111-8111-111111111111", "alpha", "A", 1, "dev-a"),
-            snippet_wire("22222222-2222-4222-8222-222222222222", "  Alpha", "B", 2, "dev-b"),
+            snippet_wire(
+                "33333333-3333-4333-8333-333333333333",
+                " Beta ",
+                "C",
+                3,
+                "dev-c",
+            ),
+            snippet_wire(
+                "11111111-1111-4111-8111-111111111111",
+                "alpha",
+                "A",
+                1,
+                "dev-a",
+            ),
+            snippet_wire(
+                "22222222-2222-4222-8222-222222222222",
+                "  Alpha",
+                "B",
+                2,
+                "dev-b",
+            ),
         ];
         let mut items = shuffled;
         sort_snippet_items(&mut items);
-        let bytes = SnippetEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        let bytes = SnippetEnvelope {
+            v: ENVELOPE_V1,
+            entries: items,
+        }
+        .to_bytes();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             concat!(
@@ -2226,7 +2276,11 @@ mod tests {
         ];
         let mut items = shuffled;
         sort_settings_items(&mut items);
-        let bytes = SettingsEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        let bytes = SettingsEnvelope {
+            v: ENVELOPE_V1,
+            entries: items,
+        }
+        .to_bytes();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             concat!(
@@ -2245,8 +2299,14 @@ mod tests {
         with_tomb[0].deleted_at = Some(9);
         sort_settings_items(&mut with_tomb);
         assert_eq!(
-            String::from_utf8(SettingsEnvelope { v: ENVELOPE_V1, entries: with_tomb }.to_bytes())
-                .unwrap(),
+            String::from_utf8(
+                SettingsEnvelope {
+                    v: ENVELOPE_V1,
+                    entries: with_tomb
+                }
+                .to_bytes()
+            )
+            .unwrap(),
             concat!(
                 r#"{"v":1,"entries":["#,
                 r#"{"key":"language","value":"en","updatedAt":1,"deviceId":"dev-a","deletedAt":9}"#,
@@ -2279,7 +2339,11 @@ mod tests {
         ];
         let mut items = shuffled;
         shards::sort_stats_records(&mut items);
-        let bytes = StatsEnvelope { v: ENVELOPE_V1, entries: items }.to_bytes();
+        let bytes = StatsEnvelope {
+            v: ENVELOPE_V1,
+            entries: items,
+        }
+        .to_bytes();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             concat!(
@@ -2790,8 +2854,7 @@ mod tests {
         let all_bad = br#"{"v":1,"entries":[
             {"syncId":"22222222-2222-4222-8222-222222222222","businessKey":"broken","spoken":"broken","corrected":"missing isEnabled","updatedAt":1713471000123,"deletedAt":null,"deviceId":"device-b"}
         ]}"#.to_vec();
-        let mut drive =
-            FakeDrive::new().with_file("dictionary.json", "id-1", "1", all_bad.clone());
+        let mut drive = FakeDrive::new().with_file("dictionary.json", "id-1", "1", all_bad.clone());
         let mut meta = SyncMetadata::default();
         let mut store = MemStore::<DictionaryItem>::new(Vec::new());
         store.has_dirty = false;
@@ -2817,7 +2880,10 @@ mod tests {
         let mut store = MemStore::new(vec![dict_item("hello", 100)]);
         store.has_dirty = true;
         let _ = sync_dictionary_domain(&mut drive, "hash", &mut meta, &mut store);
-        assert_eq!(drive.put_count, 0, "a 2^32+1 envelope is future, not corrupt");
+        assert_eq!(
+            drive.put_count, 0,
+            "a 2^32+1 envelope is future, not corrupt"
+        );
         assert_eq!(
             drive.contents.get("id-1"),
             Some(&future),
@@ -3162,9 +3228,9 @@ mod tests {
                 }
                 Ok(all)
             }
-        fn get_domain_content(&mut self, file_id: &str) -> Result<Option<Vec<u8>>, SyncError> {
-            Ok(self.contents.get(file_id).cloned())
-        }
+            fn get_domain_content(&mut self, file_id: &str) -> Result<Option<Vec<u8>>, SyncError> {
+                Ok(self.contents.get(file_id).cloned())
+            }
             fn put_domain(
                 &mut self,
                 name: &str,
