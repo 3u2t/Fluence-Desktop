@@ -1,45 +1,52 @@
-## Smarter dictionary suggestions — and less noise
+<!--
+     Release notes convention: this file ALWAYS contains the notes the next
+     pushed tag publishes. release.yml reads it verbatim, so there is exactly
+     one copy — edit here, never in the workflow. Replace this ENTIRE file
+     (this comment included) when cutting a release. Keep the language plain:
+     write for the person using Fluence, not for the person building it. -->
 
-### Suggestions now earn their way onto the list
+## Your dictionary just got smarter — and a lot cleaner
 
-Every correction Fluence notices while you dictate has always been recorded,
-but until now even a single odd sighting could appear as a suggestion.
-Suggestions are now shown only when they repeat:
+### Corrections now have to repeat before they show up
 
-- A correction is saved the first time it is noticed, but it only reaches the
-  Suggestions list once it is seen again — one-off slips stay invisible and
-  just keep counting quietly.
-- Broken pairs are never recorded at all: random typos, near-identical words,
-  and empty or malformed corrections are rejected at the moment of capture.
-- On startup, the app cleans out accumulated junk rows from earlier versions
-  so the list you see is genuinely relevant.
+When Fluence types something odd — like "chief White" when you said a
+name — it quietly remembers the fix. From now on, that fix only appears in
+your Suggestions list if it happens **again**. One-time slips never clutter
+the list; they just keep counting in the background.
 
-### Accepting a suggestion now asks first
+### Junk suggestions are stopped before they start
 
-Pressing accept opens a confirmation telling you exactly what will happen:
-the pair is added to your dictionary, and future dictations that hear that
-mishearing are rewritten automatically. Nothing is added silently anymore.
+Half-written fixes, random typos, and "corrections" that replace a word with
+basically the same word are no longer saved at all. On top of that, the app
+now cleans out old junk entries when it starts — in our testing this cleared
+over 700 useless rows in one go, so the list you see is actually worth
+looking at.
+
+### Nothing is added without asking you first
+
+When you accept a suggestion, you now get a short confirmation that says
+exactly what will happen: the pair is added to your dictionary, and your
+future dictations of that misheard word are fixed automatically. Nothing
+gets added silently anymore.
 
 ### The "Learning signals" list is gone
 
-The in-progress list of sub-threshold corrections that shipped in the
-previous release turned out to be noise on screen. It is removed; the
-learning logic behind it still runs, and you simply no longer see rows that
-are not actionable yet.
+The in-progress list we showed last release turned out to be confusing on
+screen. It has been removed. The learning behind it still runs — you simply
+never see anything that isn't ready to be useful.
 
 ### Also in this release
 
-- The accept-confirmation wording is defined in one place per interface, so
-  the message cannot drift apart between settings screens.
-- New tests pin the threshold behaviour so suggestions cannot silently
-  change buckets again.
+- The confirmation message you see when accepting a suggestion is now
+  written in one place, so it says exactly the same thing on every screen.
+- More automated tests were added so the fixes above stay fixed.
 
 ### For the technical minded
 
-Nothing about your data format changed. History, dictionary, snippets and
-agents are all compatible with previous releases — no re-sync or re-import,
-and you can upgrade and downgrade freely. Audio processing, transcription
-and text injection are untouched.
+Nothing about your data changed. History, dictionary, snippets and agents
+all work exactly as before — you can upgrade and go back without any
+import, export, or re-sync. Recording, transcription and typing behaviour
+are untouched.
 
 ### Known limitations
 
