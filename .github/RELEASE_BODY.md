@@ -1,65 +1,45 @@
-<!-- Release notes convention: this file ALWAYS contains the notes the next
-     pushed tag publishes. release.yml reads it verbatim into `releaseBody`
-     (steps:notes), so there is exactly one copy — edit here, never in the
-     workflow. Never add secrets, internal hostnames, or model URLs not
-     already pinned by digest in src-tauri/moonshine-v2-server/VENDOR.json.
+## Smarter dictionary suggestions — and less noise
 
-     REPLACE THIS ENTIRE FILE (comment included) when cutting a release. -->
+### Suggestions now earn their way onto the list
 
-## Offline Moonshine works, and it tells you when it can't
+Every correction Fluence notices while you dictate has always been recorded,
+but until now even a single odd sighting could appear as a suggestion.
+Suggestions are now shown only when they repeat:
 
-### Local Moonshine transcription starts reliably
+- A correction is saved the first time it is noticed, but it only reaches the
+  Suggestions list once it is seen again — one-off slips stay invisible and
+  just keep counting quietly.
+- Broken pairs are never recorded at all: random typos, near-identical words,
+  and empty or malformed corrections are rejected at the moment of capture.
+- On startup, the app cleans out accumulated junk rows from earlier versions
+  so the list you see is genuinely relevant.
 
-Local Moonshine models often failed to start, and when they did the app could
-sit in a "processing" loop for a minute with no explanation. Several causes,
-all fixed:
+### Accepting a suggestion now asks first
 
-- The sidecar now identifies itself with a private per-launch token over a
-  local handshake, so the app only talks to the copy it actually started.
-- The app waits properly for the model to load instead of giving up after
-  three seconds and killing a sidecar that was still starting.
-- If the sidecar is out of date or the port is held by something else, it says
-  so in seconds rather than hanging silently.
-- A sidecar left behind by a previous run no longer blocks a new one.
+Pressing accept opens a confirmation telling you exactly what will happen:
+the pair is added to your dictionary, and future dictations that hear that
+mishearing are rewritten automatically. Nothing is added silently anymore.
 
-### Offline transcription no longer runs unbounded
+### The "Learning signals" list is gone
 
-Very long takes are now rejected with a clear message instead of growing
-memory without limit. The recording limit is ten minutes.
-
-### A blocked paste now says so
-
-Fluence would previously report "Inserted" even when Windows refused the
-keystrokes, which happens when the target app is running elevated or focus is
-shifting. Partial or blocked input is now reported as the failure it is, with
-the reason on screen, and the transcript stays recoverable — you can **Retry**
-or **Copy** it instead of losing it.
-
-### Your clipboard is no longer silently wiped
-
-Pasting takes over the clipboard, and Fluence can only put text back. If you
-had copied an **image or files**, they were destroyed with no warning. The
-overlay now says **"Inserted (clipboard replaced)"** so you know it happened.
-
-### Agent failures are visible
-
-If an agent action fails — including a copy — the overlay now reports what went
-wrong instead of showing success.
+The in-progress list of sub-threshold corrections that shipped in the
+previous release turned out to be noise on screen. It is removed; the
+learning logic behind it still runs, and you simply no longer see rows that
+are not actionable yet.
 
 ### Also in this release
 
-- Release pipeline: third-party actions are pinned to commit hashes, the Rust
-  toolchain is pinned, and pull requests now run the full test suite.
-- Version numbers are checked across every manifest so they cannot drift apart
-  again.
-- Internal commands are restricted to the app surface that legitimately needs
-  them.
+- The accept-confirmation wording is defined in one place per interface, so
+  the message cannot drift apart between settings screens.
+- New tests pin the threshold behaviour so suggestions cannot silently
+  change buckets again.
 
 ### For the technical minded
 
 Nothing about your data format changed. History, dictionary, snippets and
-agents are all compatible with previous releases — no re-sync or re-import, and
-you can upgrade and downgrade freely. Audio processing is untouched.
+agents are all compatible with previous releases — no re-sync or re-import,
+and you can upgrade and downgrade freely. Audio processing, transcription
+and text injection are untouched.
 
 ### Known limitations
 
