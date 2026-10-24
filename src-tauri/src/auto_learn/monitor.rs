@@ -18,9 +18,32 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::correction_extractor::extract_user_corrections;
+use super::extraction::Candidate;
 use super::learner;
 use super::ui_automation::{FocusedTextReader, ReadResult};
 use super::MonitorRequest;
+
+/// Intra-session pair memory (plan plan-2, Task 3): drop candidates whose
+/// spoken→corrected pair was already saved earlier in THIS monitoring
+/// session, and record everything extracted now.
+///
+/// Cross-session repeats keep accruing frequency - that is the legitimate
+/// systematic-mishearing signal. Intra-session repeats are artifacts of the
+/// settle loop re-diffing the same settled state, and (worst case) were
+/// double-counted by the old per-settle diffing.
+fn filter_session_duplicates(
+    corrections: Vec<Candidate>,
+    session_pairs: &mut std::collections::HashSet<String>,
+) -> Vec<Candidate> {
+    let mut kept = Vec::with_capacity(corrections.len());
+    for c in corrections {
+        let key = crate::dictionary::canonical_entry_key(&c.spoken, &c.corrected);
+        if session_pairs.insert(key) {
+            kept.push(c);
+        }
+    }
+    kept
+}
 
 /// How long to wait after paste before starting to monitor.
 const POST_PASTE_DELAY_MS: u64 = 500;
@@ -329,6 +352,13 @@ fn run_monitoring_session(
     let mut pending_value: Option<String> = None;
     let mut stable_polls: u32 = 0;
     let mut last_extracted_value = initial_value.clone();
+
+    // Dictionary pair keys (canonical): pairs already in the dictionary are
+    // never re-learned (decision core skip chain, JS L161).
+    let known_pair_keys: std::collections::BTreeSet<String> =
+        learner::get_current_dictionary().into_iter().collect();
+    // Session pair memory (plan-2 Task 3): one saved pair per session.
+    let mut session_pairs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let exit_reason: ExitReason;
 
     // Adaptive polling loop
@@ -403,8 +433,15 @@ fn run_monitoring_session(
                 if stable_polls >= SETTLED_POLLS {
                     if let Some(target) = pending_value.take() {
                         stable_polls = 0;
-                        let corrections =
-                            extract_user_corrections(injected_text, &initial_value, &target);
+                        let corrections = filter_session_duplicates(
+                            extract_user_corrections(
+                                injected_text,
+                                &initial_value,
+                                &target,
+                                &known_pair_keys,
+                            ),
+                            &mut session_pairs,
+                        );
 
                         if !corrections.is_empty() {
                             match learner::save_corrections(corrections) {
@@ -486,7 +523,10 @@ fn run_monitoring_session(
     if matches!(exit_reason, ExitReason::Timeout | ExitReason::FocusChanged)
         && last_value != last_extracted_value
     {
-        let corrections = extract_user_corrections(injected_text, &initial_value, &last_value);
+        let corrections = filter_session_duplicates(
+            extract_user_corrections(injected_text, &initial_value, &last_value, &known_pair_keys),
+            &mut session_pairs,
+        );
         if !corrections.is_empty() {
             match learner::save_corrections(corrections) {
                 Ok(count) => {
@@ -627,5 +667,74 @@ mod tests {
             reasons.len(),
             "Some ExitReason variants serialize identically"
         );
+    }
+
+    #[test]
+    fn test_session_memory_keeps_first_occurrence_and_dups_dropped() {
+        let mut memory = std::collections::HashSet::new();
+        let a = Candidate {
+            spoken: "shunade".into(),
+            corrected: "Sinead".into(),
+        };
+        let b = Candidate {
+            spoken: "shunade".into(),
+            corrected: "Sinead".into(),
+        };
+        let c = Candidate {
+            spoken: "wrong".into(),
+            corrected: "Right".into(),
+        };
+        // Same pair twice in one batch: first kept, second dropped.
+        let kept = filter_session_duplicates(vec![a.clone(), b, c], &mut memory);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0], a);
+    }
+
+    #[test]
+    fn test_session_memory_drops_same_pair_across_settles() {
+        // The core anti-inflation property: the same pair observed twice in
+        // one session (e.g. two settles of the same settled state) saves
+        // once; a DIFFERENT pair still saves.
+        let mut memory = std::collections::HashSet::new();
+        let a1 = Candidate {
+            spoken: "shunade".into(),
+            corrected: "Sinead".into(),
+        };
+        let different = Candidate {
+            spoken: "pary".into(),
+            corrected: "party".into(),
+        };
+        assert_eq!(
+            filter_session_duplicates(vec![a1, different], &mut memory).len(),
+            2
+        );
+        let a2 = Candidate {
+            spoken: "shunade".into(),
+            corrected: "Sinead".into(),
+        };
+        let fresh = Candidate {
+            spoken: "veiw".into(),
+            corrected: "view".into(),
+        };
+        let second = filter_session_duplicates(vec![a2, fresh], &mut memory);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].spoken, "veiw");
+    }
+
+    #[test]
+    fn test_session_memory_is_canonical_case_insensitive() {
+        // Case variants of the same pair share the canonical key.
+        let mut memory = std::collections::HashSet::new();
+        let first = Candidate {
+            spoken: "shunade".into(),
+            corrected: "Sinead".into(),
+        };
+        let case_variant = Candidate {
+            spoken: "SHUNADE".into(),
+            corrected: "SINEAD".into(),
+        };
+        let kept = filter_session_duplicates(vec![first, case_variant], &mut memory);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].spoken, "shunade");
     }
 }

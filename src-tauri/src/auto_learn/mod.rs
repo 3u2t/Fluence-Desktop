@@ -9,6 +9,12 @@
 
 pub mod extraction;
 
+// Correction decision core (plan-2 / Task 1), learned from the reference
+// design. Deliberately UNGATED: the
+// suggestion store is not windows-gated and imports this module, so a
+// windows-gated placement would break non-Windows builds (review A5).
+pub mod decision_core;
+
 #[cfg(target_os = "windows")]
 pub mod correction_extractor;
 #[cfg(target_os = "windows")]

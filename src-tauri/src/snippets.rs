@@ -175,21 +175,32 @@ pub(crate) fn save_store_internal(store: &SnippetStore) -> Result<()> {
     Ok(())
 }
 
-fn cached_store() -> SnippetStore {
+/// Observable form of [`cached_store`] (audit Round-4 F3, revalidated
+/// Round-4 second pass): identical cache semantics - including caching the
+/// degraded default on unreadable bytes, so the read failure surfaces
+/// EXACTLY ONCE per cache generation instead of warning on every dictation
+/// take - and the `warn` is recorded HERE, at the one point where the
+/// degraded default is cached. Call order can never suppress it: whether
+/// the first cache-miss caller is the expansion take (`cached_store`, which
+/// discards the Err) or the echo shield, the branch fires before the value
+/// is cached, so later cache-hit callers see Ok(default) after exactly one
+/// warn.
+fn cached_store_checked() -> Result<SnippetStore, anyhow::Error> {
     let cache = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(store) = cache.as_ref() {
-        return store.clone();
+        return Ok(store.clone());
     }
     drop(cache);
     // Deliberate, bounded degradation - NOT a Phase E oversight.
     //
     // `load_store_internal` fails only on unreadable bytes. On this path that
-    // result is intentionally discarded and treated as "no expansions",
-    // because this is the read-only expansion path reached from
-    // `process_transcript`: the transcript has already been produced, there is
-    // no caller left to report an error to, and failing would throw away a
-    // successful dictation for something cosmetic. An empty store is the
-    // correct outcome of a store that cannot be read as expansions.
+    // result is intentionally degraded and treated as "no expansions",
+    // because these are READ-ONLY paths (expansion + the echo shield)
+    // reached from `process_transcript`/`upsert_suggestions`: the transcript
+    // has already been produced, there is no caller left to report an
+    // error to, and failing would throw away a successful dictation for
+    // something cosmetic. An empty store is the correct outcome of a
+    // store that cannot be read as expansions.
     //
     // It is safe precisely because nothing here writes. The corruption is
     // preserved aside by `read_json_file`, and every *mutating* caller
@@ -197,15 +208,107 @@ fn cached_store() -> SnippetStore {
     // resolves the store with `load_store_internal().map_err(..)?` and fails
     // closed, so a corrupt store can never be silently persisted over empty.
     // The two rules have to hold together: read degrades, write refuses.
-    let store = load_store_internal().unwrap_or_default();
+    let (store, err) = match load_store_internal() {
+        Ok(store) => (store, None),
+        // The warning MUST live at this load point, not in the shield
+        // wrapper: `cached_store` swallows the Err by design, so a wrapper
+        // downstream of cached_store never sees it (the cache-first
+        // ordering gap the Round-4 revalidation flagged). Logging here
+        // records the degradation for BOTH read-only consumers, exactly
+        // once per cache generation.
+        Err(err) => {
+            log::warn!(
+                "[Snippets] Snippets store unreadable ({err:?}) - read-only paths run degraded: no expansions and corrections UNSHIELDED until the store is readable"
+            );
+            (SnippetStore::default(), Some(err))
+        }
+    };
     let mut cache2 = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache2 = Some(store.clone());
-    store
+    match err {
+        Some(err) => Err(err),
+        None => Ok(store),
+    }
+}
+
+fn cached_store() -> SnippetStore {
+    // Clippy-clean form of: Ok(store) => store, Err(_) => SnippetStore::default().
+    cached_store_checked().unwrap_or_default()
 }
 
 pub(crate) fn invalidate_cache() {
     let mut cache = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache = None;
+}
+
+/// Canonical trigger→expansion pair keys for ACTIVE snippets - the echo
+/// shield the suggestion store uses (plan plan-2, Task 6).
+///
+/// A snippet whose expansion is a single word (e.g. "again" → "agent")
+/// would otherwise have its own application re-learned as a correction
+/// pair on every dictation take (+1 frequency per run, and the store's
+/// users reported such rows at 8x). The expansion pipeline applies only
+/// the same filters used for actual expansion (`process_transcript`):
+/// master toggle on, not deleted, per-snippet enabled, account-scoped,
+/// non-blank trigger/expansion.
+///
+/// Fail-open is a logged degradation, not a silent one (audit Round-4
+/// F3, revalidated): `cached_store_checked` degrades to an empty store on
+/// read errors and records the `warn` at that load point - an unreadable
+/// snippet store can never block learning, and the lost shielding surfaces
+/// as exactly one `warn` per cache generation regardless of which
+/// read-only caller populates the cache first.
+pub(crate) fn active_snippet_expansion_keys() -> std::collections::BTreeSet<String> {
+    let active_account = crate::sync::metadata::current_account_hash();
+    shield_keys_for(cached_store_checked(), active_account.as_deref())
+}
+
+/// Pure seam behind [`active_snippet_expansion_keys`]: the load result
+/// is an argument, so the fail-open decision (error input → empty key
+/// set; ok input → normal filter path) is hermetically testable without
+/// touching the shared cfg(test) snippet store (the exact shared-root zone
+/// audit F7 flagged). It logs NOTHING: the unreadable-store warn lives in
+/// `cached_store_checked`'s error branch (Round-4 second pass) so the
+/// record cannot depend on call order; an Err input here is the
+/// already-recorded case.
+fn shield_keys_for(
+    load: Result<SnippetStore, anyhow::Error>,
+    active_account: Option<&str>,
+) -> std::collections::BTreeSet<String> {
+    let store = load.unwrap_or_default();
+    active_snippet_expansion_keys_from(&store, active_account)
+}
+
+/// Pure core of [`active_snippet_expansion_keys`]: hermetic and unit-testable.
+pub(crate) fn active_snippet_expansion_keys_from(
+    store: &SnippetStore,
+    active_account: Option<&str>,
+) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    // Master toggle off → no expansion is happening → no echo to shield.
+    if !store.enabled {
+        return keys;
+    }
+    for snippet in &store.snippets {
+        if snippet.deleted_at.is_some() || !snippet.is_enabled {
+            continue;
+        }
+        let trigger = snippet.trigger.trim();
+        let expansion = snippet.expansion.trim();
+        if trigger.is_empty() || expansion.is_empty() {
+            continue;
+        }
+        if !crate::sync::metadata::belongs_to_account(
+            snippet.sync_account.as_deref(),
+            active_account,
+        ) {
+            continue;
+        }
+        // Single canonical key path shared with the dictionary/suggestion
+        // stores, so the shield matches exactly what upsert compares.
+        keys.insert(crate::dictionary::canonical_entry_key(trigger, expansion));
+    }
+    keys
 }
 
 /// Post-transcription pipeline: dictionary corrections first, then
@@ -599,6 +702,158 @@ mod tests {
             expansion: expansion.to_string(),
             ..Default::default()
         }
+    }
+
+    // ── plan plan-2 Task 6: active snippet expansion keys (echo shield) ──
+
+    fn shield_store(enabled: bool, snippets: Vec<Snippet>) -> SnippetStore {
+        SnippetStore { enabled, snippets }
+    }
+
+    #[test]
+    fn test_active_snippet_keys_canonical_include_active_snippets() {
+        let keys = active_snippet_expansion_keys_from(
+            &shield_store(true, vec![snippet("1", "again", "agent")]),
+            None,
+        );
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![&crate::dictionary::canonical_entry_key("again", "agent")]
+        );
+    }
+
+    #[test]
+    fn test_active_snippet_keys_master_toggle_off_is_empty() {
+        // Master toggle off → expansion pipeline never runs → no echo.
+        let keys = active_snippet_expansion_keys_from(
+            &shield_store(false, vec![snippet("1", "again", "agent")]),
+            None,
+        );
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_active_snippet_keys_excludes_disabled_and_deleted_and_blank() {
+        let disabled_row = Snippet {
+            is_enabled: false,
+            ..snippet("2", "brb", "be right back")
+        };
+        let deleted_row = Snippet {
+            deleted_at: Some(1700000000),
+            ..snippet("3", "gtg", "got to go")
+        };
+        let blank_trigger = snippet("4", "   ", "x");
+        let blank_expansion = snippet("5", "x", "  ");
+        let keys = active_snippet_expansion_keys_from(
+            &shield_store(
+                true,
+                vec![
+                    disabled_row,
+                    deleted_row,
+                    blank_trigger,
+                    blank_expansion,
+                    snippet("6", "haha", "lol"),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![&crate::dictionary::canonical_entry_key("haha", "lol")]
+        );
+    }
+
+    #[test]
+    fn test_active_snippet_keys_account_scoped() {
+        let other = Snippet {
+            sync_account: Some("hash-b".to_string()),
+            ..snippet("7", "brb", "be right back")
+        };
+        // Row without account matches any active account.
+        let keys_any = active_snippet_expansion_keys_from(
+            &shield_store(true, vec![snippet("1", "again", "agent")]),
+            Some("hash-a"),
+        );
+        assert_eq!(keys_any.len(), 1);
+        // Row with a different account hash: excluded when active is set…
+        assert!(active_snippet_expansion_keys_from(
+            &shield_store(true, vec![other.clone()]),
+            Some("hash-a")
+        )
+        .is_empty());
+        // …included when the hashes match…
+        let owned = Snippet {
+            sync_account: Some("hash-b".to_string()),
+            ..snippet("8", "brb", "be right back")
+        };
+        assert_eq!(
+            active_snippet_expansion_keys_from(&shield_store(true, vec![owned]), Some("hash-b"))
+                .len(),
+            1
+        );
+        // …and excluded when the row has an account but none is active.
+        let orphan = Snippet {
+            sync_account: Some("hash-b".to_string()),
+            ..snippet("9", "gtg", "got to go")
+        };
+        assert!(
+            active_snippet_expansion_keys_from(&shield_store(true, vec![orphan]), None).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_active_snippet_keys_case_insensitive_canonical() {
+        let keys = active_snippet_expansion_keys_from(
+            &shield_store(true, vec![snippet("1", "AGAIN", "Agent")]),
+            None,
+        );
+        assert!(keys.contains(&crate::dictionary::canonical_entry_key("again", "agent")));
+    }
+
+    // ── Round-4 F3: fail-open seam of the echo shield ────────────────
+
+    #[test]
+    fn test_shield_keys_fail_open_on_unreadable_store() {
+        // A read error yields an EMPTY key set - the shield can never block
+        // learning. The unreadable-store warn is recorded inside
+        // cached_store_checked's load-error branch, once per cache
+        // generation, regardless of call order.
+        let keys = super::shield_keys_for(Err(anyhow::anyhow!("injected unreadable store")), None);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_shield_keys_empty_with_cache_populated_degraded() {
+        // Reviewer Round-4 revalidation (the ordering gap): in real
+        // `process_transcript` order the expansion path's `cached_store()`
+        // runs FIRST and, on an unreadable store, leaves the degraded
+        // default cached; the echo shield wrapper is reached LATER and
+        // must still yield an EMPTY key set off that cache hit - never a
+        // panic, never treated as a fresh store problem. Seed the cache
+        // exactly as a degraded load leaves it (directly, no fs - the F7
+        // shared-root zone stays untouched).
+        let _guard = crate::sync::stores::store_test_guard();
+        let mut cache = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(SnippetStore::default());
+        drop(cache);
+
+        let keys = active_snippet_expansion_keys();
+        assert!(
+            keys.is_empty(),
+            "degraded cached store must yield an empty shield key set: {keys:?}"
+        );
+        // Leave the cache unpopulated so later tests load fresh state.
+        invalidate_cache();
+    }
+
+    #[test]
+    fn test_shield_keys_ok_path_filters_normally() {
+        let store = shield_store(true, vec![snippet("1", "again", "agent")]);
+        let keys = super::shield_keys_for(Ok(store), None);
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![&crate::dictionary::canonical_entry_key("again", "agent")]
+        );
     }
 
     #[test]

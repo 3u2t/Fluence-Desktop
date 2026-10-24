@@ -2,8 +2,17 @@
 // Compares injected text with the current field value to detect
 // word-level corrections made by the user after pasting.
 //
-// Uses word-level LCS to find substitution pairs, then applies
-// conservative filters to avoid learning accidental edits.
+// The anchoring shell (`extract_edited_span`) is Fluence-specific and stays
+// here. All pairing/validation DIFF logic is delegated verbatim to the
+// correction decision core (`decision_core`) - plan
+// plan-2-dictionary-suggestions-garbage-fix, learned from the reference
+// correction-learner design (no reference source copied). The former
+// tie-diagonal rule and the retired `ui_automation::is_valid_correction`
+// filter are gone; the decision core's
+// judge (similarity floor, corrected-length floor, case-identical skip,
+// same-pair dedup) and the LCS rewrite guard now own every decision.
+
+use std::collections::BTreeSet;
 
 use super::extraction::Candidate;
 
@@ -15,10 +24,14 @@ use super::extraction::Candidate;
 /// snapshot and only its counterpart in the current value is diffed - the
 /// rest of the field is never compared, so older sentences cannot
 /// misalign into garbage pairs.
+///
+/// `known_pair_keys` are the canonical keys of pairs already in the
+/// dictionary (never re-learned as new suggestions).
 pub fn extract_user_corrections(
     injected_text: &str,
     baseline_value: &str,
     field_value: &str,
+    known_pair_keys: &BTreeSet<String>,
 ) -> Vec<Candidate> {
     // Identical → no corrections
     if injected_text == field_value {
@@ -33,62 +46,12 @@ pub fn extract_user_corrections(
         None => return Vec::new(),
     };
 
-    let injected_words = tokenize(injected_text);
-    let edited_words = tokenize(&edited_region);
-
-    if injected_words.is_empty() || edited_words.is_empty() {
-        return Vec::new();
-    }
-
-    // Find substitution pairs via word-level LCS
-    let subs = find_substitutions(&injected_words, &edited_words);
-
-    // If more than 50% of words changed, this is a rewrite - not corrections
-    if subs.len() > injected_words.len() / 2 {
-        log::debug!(
-            "[AutoLearn] Skipping: {} of {} words changed (>50%)",
-            subs.len(),
-            injected_words.len()
-        );
-        return Vec::new();
-    }
-
-    // Filter to high-confidence corrections only
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for (original_word, corrected_word) in &subs {
-        let normalized = (original_word.to_lowercase(), corrected_word.to_lowercase());
-
-        // Skip duplicates
-        if !seen.insert(normalized.clone()) {
-            continue;
-        }
-
-        // Apply conservative filters (same rules as pipeline extraction)
-        if !super::ui_automation::is_valid_correction(original_word, corrected_word) {
-            log::debug!(
-                "[AutoLearn] Skipping correction ({} chars → {} chars): failed validation",
-                original_word.chars().count(),
-                corrected_word.chars().count()
-            );
-            continue;
-        }
-
-        candidates.push(Candidate {
-            spoken: original_word.clone(),
-            corrected: corrected_word.clone(),
-        });
-    }
-
-    if !candidates.is_empty() {
-        log::info!(
-            "[AutoLearn] Extracted {} corrections from user edit",
-            candidates.len()
-        );
-    }
-
-    candidates
+    // Decision core: tokenization, LCS pairing, rewrite guard/vetoes and
+    // the per-pair gate chain all live in the decision core module.
+    super::decision_core::extract_corrections(injected_text, &edited_region, known_pair_keys)
+        .into_iter()
+        .map(|(spoken, corrected)| Candidate { spoken, corrected })
+        .collect()
 }
 
 /// Locate the single occurrence of the injected text in the baseline field
@@ -166,108 +129,16 @@ fn extract_edited_span(
         .map(|s| s.to_string())
 }
 
-/// Tokenize text into words, stripping punctuation from edges.
-fn tokenize(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|w| {
-            w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
-                .to_string()
-        })
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-/// Word-level LCS to find [originalWord, editedWord] substitution pairs.
-fn find_substitutions(orig_words: &[String], edited_words: &[String]) -> Vec<(String, String)> {
-    let m = orig_words.len();
-    let n = edited_words.len();
-
-    // Build LCS DP table
-    let mut dp = vec![vec![0u32; n + 1]; m + 1];
-    for i in 1..=m {
-        for j in 1..=n {
-            if orig_words[i - 1].to_lowercase() == edited_words[j - 1].to_lowercase() {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-            } else {
-                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
-            }
-        }
-    }
-
-    // Trace back to find aligned pairs. On a tie (either path preserves the
-    // LCS length) emit a direct substitution pair - Android parity
-    // (WordLcsExtractor emits a pair on ties). This matters because the
-    // >50% rewrite veto downstream, not the traceback, decides whether a
-    // heavily rewritten field is learnable: without tie pairs, a total
-    // rewrite collapses to one spurious boundary pair that slips under the
-    // veto. As a bonus, nearby substitutions pair up correctly instead of
-    // being misattributed across positions.
-    let mut aligned: Vec<(Option<String>, Option<String>)> = Vec::new();
-    let mut i = m;
-    let mut j = n;
-
-    while i > 0 || j > 0 {
-        if i > 0
-            && j > 0
-            && (orig_words[i - 1].to_lowercase() == edited_words[j - 1].to_lowercase()
-                || dp[i - 1][j] == dp[i][j - 1])
-        {
-            aligned.push((
-                Some(orig_words[i - 1].clone()),
-                Some(edited_words[j - 1].clone()),
-            ));
-            i -= 1;
-            j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
-            aligned.push((None, Some(edited_words[j - 1].clone())));
-            j -= 1;
-        } else {
-            aligned.push((Some(orig_words[i - 1].clone()), None));
-            i -= 1;
-        }
-    }
-
-    aligned.reverse();
-
-    // Extract substitution pairs: direct diagonal pairs whose words differ,
-    // plus consecutive [orig, null] + [null, edited] gaps from strictly
-    // one-sided traceback steps. Equal-word diagonals are alignment, not
-    // substitutions, and are skipped.
-    let mut subs = Vec::new();
-    for k in 0..aligned.len() {
-        let (ref orig_w, ref edit_w) = aligned[k];
-
-        if let (Some(orig), Some(edit)) = (orig_w, edit_w) {
-            if orig.to_lowercase() != edit.to_lowercase() {
-                subs.push((orig.clone(), edit.clone()));
-            }
-            continue;
-        }
-
-        if k + 1 >= aligned.len() {
-            continue;
-        }
-        let (ref next_orig, ref next_edit) = aligned[k + 1];
-
-        if orig_w.is_some() && edit_w.is_none() && next_orig.is_none() && next_edit.is_some() {
-            if let (Some(orig), Some(edit)) = (orig_w, next_edit) {
-                subs.push((orig.clone(), edit.clone()));
-            }
-        }
-    }
-
-    subs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Test shorthand for the single-sentence case: the baseline snapshot
     /// equals what was injected (fresh empty field), so anchoring always
-    /// succeeds with empty affixes. Shadows the 3-arg function for brevity.
+    /// succeeds with empty affixes. Shadows the 4-arg function for brevity.
     fn extract_user_corrections(injected_text: &str, field_value: &str) -> Vec<Candidate> {
-        super::extract_user_corrections(injected_text, injected_text, field_value)
+        super::extract_user_corrections(injected_text, injected_text, field_value, &BTreeSet::new())
     }
 
     #[test]
@@ -286,20 +157,22 @@ mod tests {
 
     #[test]
     fn test_rewrite_detection() {
-        // More than 50% changed - treated as rewrite
+        // Full rewrite (no shared coverage) - rejected by the LCS rewrite
+        // guard in the ported core.
         let corrections = extract_user_corrections("the quick brown fox", "a slow red cat jumped");
         assert!(corrections.is_empty());
     }
 
     #[test]
-    fn test_short_words_surface_for_human_review() {
-        // Android parity: only BOTH sides < 2 chars is rejected, so
-        // "a" → "the" now surfaces; the human Accept step stays the gate.
-        // (Single-word utterances remain guarded by the >50% rewrite veto.)
+    fn test_short_words_stop_surfacing() {
+        // Reference parity (OQ-2, owner-confirmed): corrected words
+        // shorter than 3 chars are rejected by the ported judge; the human
+        // Accept path (manual Words-tab add) remains available. This
+        // replaces the retired Android-parity `a→the` acceptance - the
+        // original manual-add regression type (`shwande→Sinead`) is now
+        // accepted to fall back to manual add too (OQ-1).
         let corrections = extract_user_corrections("I am a test", "I am the test");
-        assert_eq!(corrections.len(), 1);
-        assert_eq!(corrections[0].spoken, "a");
-        assert_eq!(corrections[0].corrected, "the");
+        assert!(corrections.is_empty());
     }
 
     #[test]
@@ -310,6 +183,8 @@ mod tests {
 
     #[test]
     fn test_capitalization_only_skipped() {
+        // Reference parity (OQ-5, owner-confirmed): lowercase-identical
+        // tokens produce no pairs; case-only edits are never learned.
         let corrections = extract_user_corrections("hello world", "Hello World");
         assert!(corrections.is_empty());
     }
@@ -367,7 +242,8 @@ mod tests {
         let baseline = "Old notes stay. I went to sined yesterday";
         let injected = "I went to sined yesterday";
         let current = "Old notes stay. I went to Sinead yesterday";
-        let corrections = super::extract_user_corrections(injected, baseline, current);
+        let corrections =
+            super::extract_user_corrections(injected, baseline, current, &BTreeSet::new());
         assert_eq!(corrections.len(), 1);
         assert_eq!(corrections[0].spoken, "sined");
         assert_eq!(corrections[0].corrected, "Sinead");
@@ -380,7 +256,8 @@ mod tests {
         let baseline = "Old notes stay. I went to sined yesterday";
         let injected = "I went to sined yesterday";
         let current = "Completely rewritten intro here. I went to sined yesterday";
-        let corrections = super::extract_user_corrections(injected, baseline, current);
+        let corrections =
+            super::extract_user_corrections(injected, baseline, current, &BTreeSet::new());
         assert!(corrections.is_empty());
     }
 
@@ -423,81 +300,23 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_basic() {
-        let tokens = tokenize("hello world test");
-        assert_eq!(tokens, vec!["hello", "world", "test"]);
-    }
-
-    #[test]
-    fn test_tokenize_strips_punctuation() {
-        let tokens = tokenize("hello, world! test.");
-        assert_eq!(tokens, vec!["hello", "world", "test"]);
-    }
-
-    #[test]
-    fn test_tokenize_empty() {
-        let tokens = tokenize("");
-        assert!(tokens.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_whitespace_only() {
-        let tokens = tokenize("   ");
-        assert!(tokens.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_single_word() {
-        let tokens = tokenize("hello");
-        assert_eq!(tokens, vec!["hello"]);
-    }
-
-    #[test]
-    fn test_find_substitutions_identical() {
-        let orig = vec!["hello".to_string(), "world".to_string()];
-        let edited = vec!["hello".to_string(), "world".to_string()];
-        let subs = find_substitutions(&orig, &edited);
-        assert!(subs.is_empty());
-    }
-
-    #[test]
-    fn test_find_substitutions_single() {
-        let orig = vec!["hello".to_string(), "shunade".to_string()];
-        let edited = vec!["hello".to_string(), "Sinead".to_string()];
-        let subs = find_substitutions(&orig, &edited);
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].0, "shunade");
-        assert_eq!(subs[0].1, "Sinead");
-    }
-
-    #[test]
-    fn test_find_substitutions_insertion_only() {
-        let orig = vec!["hello".to_string()];
-        let edited = vec!["hello".to_string(), "world".to_string()];
-        let subs = find_substitutions(&orig, &edited);
-        assert!(subs.is_empty());
-    }
-
-    #[test]
-    fn test_find_substitutions_deletion_only() {
-        let orig = vec!["hello".to_string(), "world".to_string()];
-        let edited = vec!["hello".to_string()];
-        let subs = find_substitutions(&orig, &edited);
-        assert!(subs.is_empty());
-    }
-
-    #[test]
-    fn test_duplicate_corrections_deduped() {
-        let corrections = extract_user_corrections("the shunade shunade", "the shunade Sinead");
-        let unique: std::collections::HashSet<_> =
-            corrections.iter().map(|c| c.corrected.clone()).collect();
-        assert_eq!(unique.len(), corrections.len());
+    fn test_known_dictionary_pair_not_relearned() {
+        // Pairs already in the dictionary (canonical keys) are skipped.
+        let mut known = BTreeSet::new();
+        known.insert(crate::dictionary::canonical_entry_key("shunade", "Sinead"));
+        let corrections = super::extract_user_corrections(
+            "I went to the shunade",
+            "I went to the shunade",
+            "I went to the Sinead",
+            &known,
+        );
+        assert!(corrections.is_empty());
     }
 
     #[test]
     fn test_rewrite_detection_boundary_exact_50_percent() {
-        // 5 words, 1 sub = 2 changed / 5 total = 40% (NOT > 50%)
-        // "shunade" → "Sinead" has similarity ~0.46
+        // 1 sub of 5 words = under the >50% veto; `shunade → Sinead`
+        // (dist 4/7 = 0.57 <= 0.65) passes the similarity floor.
         let corrections = extract_user_corrections("I went to the shunade", "I went to the Sinead");
         assert_eq!(corrections.len(), 1);
         assert_eq!(corrections[0].spoken, "shunade");
@@ -506,6 +325,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_detection_over_50_percent() {
+        // No shared coverage (LCS 0 of 5) - rewrite guard rejects.
         let corrections = extract_user_corrections("the big red cat sat", "a small blue dog ran");
         assert!(corrections.is_empty());
     }

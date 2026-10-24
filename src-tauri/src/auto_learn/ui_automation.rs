@@ -337,46 +337,33 @@ impl FocusedTextReader {
     }
 }
 
-/// Check if a word looks like a high-confidence correction.
+/// RETIRED (plan plan-2, Task 2): `is_valid_correction`.
 ///
-/// Android-parity rules (see `WordLcsExtractor.isValidCorrection`): no
-/// similarity score - a pair is accepted unless it is identical
-/// (case-sensitive), trivially short on both sides, or mixes numbers with
-/// non-numbers. Case-only and dissimilar pairs are intentionally allowed
-/// through here; the human Accept step on suggestions is the quality gate.
-pub fn is_valid_correction(original_word: &str, corrected_word: &str) -> bool {
-    if original_word.is_empty() || corrected_word.is_empty() {
-        return false;
-    }
-
-    // Identical pair - nothing actually changed.
-    if original_word == corrected_word {
-        return false;
-    }
-
-    // Reject only when BOTH sides are trivially short. Single-word
-    // utterances are still guarded by the >50% rewrite veto in the
-    // extractor, not here.
-    if original_word.chars().count() < 2 && corrected_word.chars().count() < 2 {
-        return false;
-    }
-
-    // Exclude pure numbers unless both sides are numbers
-    // ("123" → "456" is a plausible correction; "123" → "abc" is not).
-    let orig_is_num = original_word.chars().all(|c| c.is_ascii_digit());
-    let corr_is_num = corrected_word.chars().all(|c| c.is_ascii_digit());
-    if orig_is_num != corr_is_num {
-        return false;
-    }
-
-    true
-}
-
+/// The old Android-parity filter (`see WordLcsExtractor`) accepted every
+/// pair except case-sensitive-identical / both-<2-chars / digit-mixed -
+/// no similarity floor, no corrected-length floor - which let the
+/// screenshot garbage pairs (`stuck→agent`, `do→add`, `CS50→tabs`, ...)
+/// through at 4-8x frequency. The Android contract is void: Android's own
+/// pipeline shows ZERO suggestions after days of use.
+///
+/// All U-path pair validation now goes through the correction decision
+/// core (`super::decision_core`), learned from the reference
+/// correction-learner design (similarity skip chain + the
+/// LCS rewrite guard).
+///
+/// The tests below are the original filter's suite, flipped to the single
+/// decision core per the plan's test-flip ledger (owner-confirmed
+/// OQ-1/2/5/6 defaults).
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::decision_core::is_valid_pair;
+    use std::collections::BTreeSet;
 
-    // ── is_valid_correction tests ────────────────────────────────
+    // The retired filter's original suite, flipped to the decision core's judge.
+    // Assertion changes are annotated with the plan decision they encode.
+    fn is_valid_correction(original_word: &str, corrected_word: &str) -> bool {
+        is_valid_pair(original_word, corrected_word, &BTreeSet::new())
+    }
 
     #[test]
     fn test_valid_correction_phonetic() {
@@ -416,12 +403,15 @@ mod tests {
 
     #[test]
     fn test_accept_short_corrected() {
-        assert!(is_valid_correction("abcd", "ab"));
+        // FLIP (OQ-2, owner-confirmed): corrected words < 3 chars no
+        // longer surface; manual Words-tab add is the fallback.
+        assert!(!is_valid_correction("abcd", "ab"));
     }
 
     #[test]
     fn test_accept_both_short_but_not_trivial() {
-        assert!(is_valid_correction("ab", "cd"));
+        // FLIP: ab→cd has similarity 0.0 - below the 0.35 floor.
+        assert!(!is_valid_correction("ab", "cd"));
     }
 
     #[test]
@@ -431,44 +421,52 @@ mod tests {
 
     #[test]
     fn test_allow_case_only_difference() {
-        // Allowed through here on purpose: the human Accept step on
-        // suggestions is the quality gate for case-only corrections.
-        assert!(is_valid_correction("hello", "Hello"));
+        // FLIP (OQ-5, owner-confirmed): case-only pairs are skipped -
+        // reference parity; the Words tab's manual Add is the path.
+        assert!(!is_valid_correction("hello", "Hello"));
     }
 
     #[test]
     fn test_allow_case_only_difference_all_upper() {
-        assert!(is_valid_correction("HELLO", "hello"));
+        // FLIP (OQ-5).
+        assert!(!is_valid_correction("HELLO", "hello"));
     }
 
     #[test]
     fn test_allow_punctuation_only_difference() {
-        // Passes this gate; in practice the extractor's tokenizer strips
-        // edge punctuation before pairs ever reach here.
-        assert!(is_valid_correction("dr.", "dr"));
+        // FLIP: dr→dr is a 2-char corrected word - rejected by the
+        // corrected-length rule ('hello'→hello stays allowed below).
+        assert!(!is_valid_correction("dr.", "dr"));
     }
 
     #[test]
     fn test_allow_punctuation_only_difference_quotes() {
+        // Judge level only (Round-4 F4): dist 2/7 (0.286) passes the gates.
+        // The full pipeline can never form this candidate - the extractor
+        // tokenizes edges on both sides, stripping quotes ('hello'/hello →
+        // tokens hello/hello), so no such candidate reaches this judge
+        // (asserted in decision_core::test_extract_quoted_tokens_form_no_pair).
         assert!(is_valid_correction("'hello'", "hello"));
     }
 
     #[test]
     fn test_accept_dissimilar_words() {
-        // No similarity gate by design (Android parity).
-        assert!(is_valid_correction("abc", "xyz"));
+        // FLIP: abc→xyz similarity 0.0 - below the floor (similarity gate
+        // by design in the ported reference).
+        assert!(!is_valid_correction("abc", "xyz"));
     }
 
     #[test]
     fn test_accept_reported_case() {
-        // Regression: "shwande" → "Sinead" (similarity ~0.29) was rejected
-        // by the old 0.40 Levenshtein gate and produced zero suggestions.
-        assert!(is_valid_correction("shwande", "Sinead"));
+        // FLIP (OQ-1, owner-accepted): shwande→Sinead (sim 0.286) sits
+        // below the 0.35 floor; no floor admits it without re-admitting
+        // do→add (0.333). Manual Words-tab add is the fallback.
+        assert!(!is_valid_correction("shwande", "Sinead"));
     }
 
     #[test]
     fn test_accept_boundary_similarity() {
-        // "abc" → "axc" has high similarity (~0.667)
+        // "abc" → "axc" (dist 1/3 = 0.333) passes the 0.35 floor.
         assert!(is_valid_correction("abc", "axc"));
     }
 
@@ -482,32 +480,35 @@ mod tests {
 
     #[test]
     fn test_accept_unrelated_words() {
-        // No similarity gate by design (Android parity); the >50% rewrite
-        // veto in the extractor remains the guard against rewrites.
-        assert!(is_valid_correction("banana", "elephant"));
-        assert!(is_valid_correction("computer", "elephant"));
+        // FLIP: unrelated words are rejected by the similarity gate; the
+        // >50% rewrite vetoes in the ported extractor handle rewrites.
+        assert!(!is_valid_correction("banana", "elephant"));
+        assert!(!is_valid_correction("computer", "elephant"));
     }
 
     #[test]
     fn test_3_char_minimum_boundary() {
-        // Exactly 3 chars - should pass if other conditions met
+        // Exactly 3 chars - passes if the gates allow (abc→axc = 0.333).
         assert!(is_valid_correction("abc", "axc"));
     }
 
     #[test]
     fn test_numeric_words() {
-        // Numeric words should work if they meet criteria
         assert!(is_valid_correction("forteen", "fourteen"));
     }
 
     #[test]
     fn test_accept_number_to_number() {
-        assert!(is_valid_correction("123", "456"));
+        // FLIP (OQ-6, owner-confirmed): exact reference parity - NO
+        // numeric-mix or numeric exemption rule is ported; 123→456 is
+        // rejected by the similarity gate itself (sim 0.0, dist 3/3).
+        assert!(!is_valid_correction("123", "456"));
     }
 
     #[test]
     fn test_reject_mixed_number_and_word() {
-        // Android parity: pure numbers must map to numbers.
+        // Stays rejected WITHOUT any digit rule - the gates do it
+        // (ratio 1.0 > 0.65): exact parity behavior, test stays green.
         assert!(!is_valid_correction("123", "abc"));
         assert!(!is_valid_correction("abc", "123"));
     }

@@ -526,7 +526,10 @@ pub(crate) enum DictionaryUpdateOutcome {
     /// true when the old row had been pushed (a durable tombstone propagates
     /// the deletion) and false when it had never been pushed (hard-deleted;
     /// peers never saw it, so there is nothing to propagate).
-    Renamed { new_id: String, old_tombstoned: bool },
+    Renamed {
+        new_id: String,
+        old_tombstoned: bool,
+    },
 }
 
 /// Sync business key of a spoken form — the exact identity
@@ -615,8 +618,8 @@ pub(crate) fn update_dictionary_entry_internal(
                 .to_string(),
         ),
     };
-        let old_key = dict_sync_business_key(&all_entries[pos].spoken);
-        let new_key = dict_sync_business_key(&spoken);
+    let old_key = dict_sync_business_key(&all_entries[pos].spoken);
+    let new_key = dict_sync_business_key(&spoken);
     let dismissed_pair: Option<(String, String)>;
     let outcome = if old_key == new_key {
         let entry = &mut all_entries[pos];
@@ -1267,24 +1270,40 @@ mod tests {
         h3_cleanup();
         save_dictionary_internal(&[h3_entry("old-1", "h3renx alpha", true)]).unwrap();
 
-        let outcome =
-            update_dictionary_entry_internal("old-1".to_string(), "h3renx beta".to_string(), "H3 New".to_string(), None)
-                .expect("rename must succeed");
+        let outcome = update_dictionary_entry_internal(
+            "old-1".to_string(),
+            "h3renx beta".to_string(),
+            "H3 New".to_string(),
+            None,
+        )
+        .expect("rename must succeed");
         let new_id = match outcome {
-            DictionaryUpdateOutcome::Renamed { new_id, old_tombstoned } => {
+            DictionaryUpdateOutcome::Renamed {
+                new_id,
+                old_tombstoned,
+            } => {
                 assert!(old_tombstoned, "a pushed row must leave a tombstone");
                 new_id
             }
             DictionaryUpdateOutcome::Edited => panic!("a key move must not edit in place"),
         };
-        assert_ne!(new_id, "old-1", "the renamed entry needs a fresh sync identity");
+        assert_ne!(
+            new_id, "old-1",
+            "the renamed entry needs a fresh sync identity"
+        );
 
         let after = load_dictionary_internal().unwrap();
-        let old = after.iter().find(|e| e.id == "old-1").expect("tombstone persists");
+        let old = after
+            .iter()
+            .find(|e| e.id == "old-1")
+            .expect("tombstone persists");
         assert!(old.deleted_at.is_some(), "old row is a tombstone");
         assert!(old.dirty, "tombstone is dirty so it uploads");
         assert_eq!(old.spoken, "h3renx alpha", "tombstone keeps the old key");
-        let new = after.iter().find(|e| e.id == new_id).expect("new row exists");
+        let new = after
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("new row exists");
         assert_eq!(new.spoken, "h3renx beta");
         assert!(new.deleted_at.is_none());
         assert!(new.dirty);
@@ -1299,11 +1318,18 @@ mod tests {
         h3_cleanup();
         save_dictionary_internal(&[h3_entry("old-2", "h3renx gamma", false)]).unwrap();
 
-        let outcome =
-            update_dictionary_entry_internal("old-2".to_string(), "h3renx delta".to_string(), "H3 New".to_string(), None)
-                .expect("rename must succeed");
+        let outcome = update_dictionary_entry_internal(
+            "old-2".to_string(),
+            "h3renx delta".to_string(),
+            "H3 New".to_string(),
+            None,
+        )
+        .expect("rename must succeed");
         match outcome {
-            DictionaryUpdateOutcome::Renamed { new_id, old_tombstoned } => {
+            DictionaryUpdateOutcome::Renamed {
+                new_id,
+                old_tombstoned,
+            } => {
                 assert!(!old_tombstoned, "a never-pushed row leaves no tombstone");
                 assert_ne!(new_id, "old-2");
             }
@@ -1316,7 +1342,9 @@ mod tests {
             "the never-pushed old row is removed locally"
         );
         assert!(
-            after.iter().any(|e| e.spoken == "h3renx delta" && e.deleted_at.is_none()),
+            after
+                .iter()
+                .any(|e| e.spoken == "h3renx delta" && e.deleted_at.is_none()),
             "the renamed entry exists exactly once and live"
         );
         h3_cleanup();
@@ -1343,7 +1371,10 @@ mod tests {
 
         let after = load_dictionary_internal().unwrap();
         let old = after.iter().find(|e| e.id == "old-3").unwrap();
-        assert_eq!(old.spoken, "h3renx epsilon", "refused rename leaves the row byte-identical");
+        assert_eq!(
+            old.spoken, "h3renx epsilon",
+            "refused rename leaves the row byte-identical"
+        );
         assert!(old.deleted_at.is_none());
         assert!(!old.dirty);
         h3_cleanup();
@@ -1365,7 +1396,13 @@ mod tests {
         assert_eq!(outcome, DictionaryUpdateOutcome::Edited);
 
         let after = load_dictionary_internal().unwrap();
-        assert_eq!(after.iter().filter(|e| e.spoken.starts_with("h3renx ")).count(), 1);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| e.spoken.starts_with("h3renx "))
+                .count(),
+            1
+        );
         let row = after.iter().find(|e| e.id == "row-4").unwrap();
         assert_eq!(row.corrected, "H3 Corrected 2");
         assert!(row.deleted_at.is_none());
@@ -1390,7 +1427,13 @@ mod tests {
         assert_eq!(outcome, DictionaryUpdateOutcome::Edited);
 
         let after = load_dictionary_internal().unwrap();
-        assert_eq!(after.iter().filter(|e| e.spoken.starts_with("H3RENX ")).count(), 1);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| e.spoken.starts_with("H3RENX "))
+                .count(),
+            1
+        );
         h3_cleanup();
     }
 }

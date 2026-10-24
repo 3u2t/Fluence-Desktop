@@ -169,10 +169,66 @@ fn should_skip_new_candidate(candidate_key: &str, dictionary_keys: &HashSet<Stri
     dictionary_keys.contains(candidate_key)
 }
 
-/// Upsert suggestions from extracted candidates.
-/// Repeated observations increment frequency and update last_seen.
-/// Dismissed suggestions remain dismissed (user intent is respected).
-/// Pairs already in the dictionary are skipped (never re-learned).
+/// What `upsert_suggestions` does with one incoming candidate.
+/// Pure decision core (plan plan-2, Tasks 5+6) so every skip rule is
+/// unit-testable without touching the filesystem.
+enum UpsertAction {
+    /// Do nothing: snippet-shielded, already dictionary-known, or deduped.
+    Skip,
+    /// Existing row: frequency += 1, last_seen refreshed. Never resets
+    /// Dismissed (user intent is respected) and never creates a duplicate.
+    UpdateExisting,
+    /// Create the new Pending row.
+    Insert,
+}
+
+/// Pure per-candidate decision (evaluated in order; intra-batch dedup is
+/// applied by the caller before this runs).
+fn classify_candidate(
+    candidate_key: &str,
+    snippet_keys: &std::collections::BTreeSet<String>,
+    dictionary_keys: &HashSet<String>,
+    has_existing_row: bool,
+) -> UpsertAction {
+    // Task 6 - snippet echo shield: a snippet's own trigger→expansion
+    // application is not a correction. This check MUST run before the
+    // existing-row branch, otherwise an existing row from pre-shield
+    // sessions (e.g. `again→agent` at 8x) keeps inflating every take.
+    if snippet_keys.contains(candidate_key) {
+        return UpsertAction::Skip;
+    }
+
+    // Existing row for this pair: increment.
+    if has_existing_row {
+        return UpsertAction::UpdateExisting;
+    }
+
+    // Dictionary is the source of truth: never re-learn accepted pairs.
+    if should_skip_new_candidate(candidate_key, dictionary_keys) {
+        return UpsertAction::Skip;
+    }
+
+    UpsertAction::Insert
+}
+
+/// Task 5: dedup an incoming batch by canonical pair key (first wins).
+/// P-path batches can carry the same pair twice; without this the store's
+/// row inflates by batch artifacts, not by genuine re-observations.
+fn dedup_candidates(
+    candidates: Vec<crate::auto_learn::Candidate>,
+) -> Vec<crate::auto_learn::Candidate> {
+    let mut seen: HashSet<String> = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|c| {
+            seen.insert(crate::dictionary::canonical_entry_key(
+                &c.spoken,
+                &c.corrected,
+            ))
+        })
+        .collect()
+}
+
 pub fn upsert_suggestions(candidates: Vec<crate::auto_learn::Candidate>) -> Result<(), String> {
     let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
 
@@ -183,41 +239,65 @@ pub fn upsert_suggestions(candidates: Vec<crate::auto_learn::Candidate>) -> Resu
         .into_iter()
         .collect();
 
-    for candidate in candidates {
+    // Task 6: snippet echo shield keys (fail-open by construction).
+    let snippet_keys = crate::snippets::active_snippet_expansion_keys();
+
+    for candidate in dedup_candidates(candidates) {
         let candidate_key =
             crate::dictionary::canonical_entry_key(&candidate.spoken, &candidate.corrected);
 
-        // Find existing suggestion for this spoken→corrected pair,
-        // using the canonical normalization path.
-        let existing = database.suggestions.iter_mut().find(|s| {
+        let has_existing = database.suggestions.iter().any(|s| {
             crate::dictionary::canonical_entry_key(&s.spoken, &s.corrected) == candidate_key
         });
 
-        if let Some(suggestion) = existing {
-            // Always update frequency and last_seen
-            suggestion.frequency += 1;
-            suggestion.last_seen = now.clone();
+        match classify_candidate(
+            &candidate_key,
+            &snippet_keys,
+            &dictionary_keys,
+            has_existing,
+        ) {
+            UpsertAction::Skip => {
+                // Round-4 F2: distinct reasons for soak diagnostics. The
+                // shield check mirrors classify_candidate's first gate, so
+                // the line names the ACTUAL rule that skipped the row.
+                if snippet_keys.contains(&candidate_key) {
+                    log::debug!(
+                        "Skipping suggestion candidate ({} chars → {} chars): snippet trigger→expansion echo (shield)",
+                        candidate.spoken.chars().count(),
+                        candidate.corrected.chars().count()
+                    );
+                } else {
+                    log::debug!(
+                        "Skipping suggestion candidate ({} chars → {} chars): pair already in dictionary",
+                        candidate.spoken.chars().count(),
+                        candidate.corrected.chars().count()
+                    );
+                }
+            }
+            UpsertAction::UpdateExisting => {
+                if let Some(suggestion) = database.suggestions.iter_mut().find(|s| {
+                    crate::dictionary::canonical_entry_key(&s.spoken, &s.corrected) == candidate_key
+                }) {
+                    // Always update frequency and last_seen
+                    suggestion.frequency += 1;
+                    suggestion.last_seen = now.clone();
 
-            // But do NOT reset Dismissed to Pending (respect user intent)
-        } else if should_skip_new_candidate(&candidate_key, &dictionary_keys) {
-            log::debug!(
-                "Skipping new suggestion ({} chars → {} chars): already in dictionary",
-                candidate.spoken.chars().count(),
-                candidate.corrected.chars().count()
-            );
-        } else {
-            // New suggestion
-            database.suggestions.push(SuggestionEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                spoken: candidate.spoken,
-                corrected: candidate.corrected,
-                frequency: 1,
-                created_at: now.clone(),
-                last_seen: now.clone(),
-                source: SuggestionSource::Auto,
-                status: SuggestionStatus::Pending,
-                accepted_at: None,
-            });
+                    // But do NOT reset Dismissed to Pending (respect user intent)
+                }
+            }
+            UpsertAction::Insert => {
+                database.suggestions.push(SuggestionEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    spoken: candidate.spoken,
+                    corrected: candidate.corrected,
+                    frequency: 1,
+                    created_at: now.clone(),
+                    last_seen: now.clone(),
+                    source: SuggestionSource::Auto,
+                    status: SuggestionStatus::Pending,
+                    accepted_at: None,
+                });
+            }
         }
     }
 
@@ -601,12 +681,81 @@ fn is_expired(last_seen: &str, cutoff: &DateTime<Utc>) -> bool {
         .unwrap_or(false)
 }
 
+/// Plan plan-2 Task 4 - one-time cleanup for garbage pending rows produced
+/// by the old learn-everything extractor (e.g. `stuck→agent(8x)`,
+/// `do→add(4x)` from snippet echo).
+///
+/// Passes every Pending row through the shared pair judge
+/// ([`crate::auto_learn::decision_core::is_valid_pair`], the same
+/// decision core that now gates new upserts) and DEMOTES (OQ-7: never
+/// deletes, so history and provenance are preserved) rows that fail to
+/// Dismissed. Accepted and already-Dismissed rows are untouched, so manual
+/// decisions and the auto-accept audit trail survive; rows Pending but
+/// already re-observed-as-expired stay Pending below the freshness cutoff
+/// when the judge accepts them, exactly as before.
+fn purge_invalid_pending_suggestions(
+    database: &mut SuggestionDatabase,
+    dictionary_keys: &std::collections::BTreeSet<String>,
+) -> usize {
+    let mut demoted = 0usize;
+
+    for suggestion in database.suggestions.iter_mut() {
+        // Only Pending rows are re-judged. Accepted rows were explicitly
+        // promoted (manual or auto-accept) - keep them. Dismissed rows keep
+        // their manual provenance.
+        if suggestion.status != SuggestionStatus::Pending {
+            continue;
+        }
+
+        // Dictionary-known pairs count as failed (stale pending duplicate
+        // of an accepted correction): the judge's skip chain rejects them.
+        // Round-4 F2: the reject reason comes from the judge's own gate
+        // chain, so soak logs name the exact rule (per plan Task 4's
+        // per-reason breakdown).
+        let reason = match crate::auto_learn::decision_core::invalid_pair_reason(
+            &suggestion.spoken,
+            &suggestion.corrected,
+            dictionary_keys,
+        ) {
+            Some(reason) => reason,
+            None => continue,
+        };
+
+        log::info!(
+            "[AutoLearn] Purging suggestion ({} chars → {} chars): {}",
+            suggestion.spoken.chars().count(),
+            suggestion.corrected.chars().count(),
+            reason
+        );
+        suggestion.status = SuggestionStatus::Dismissed;
+        demoted += 1;
+    }
+
+    demoted
+}
+
 /// Expire stale suggestions that haven't been seen in 30 days.
 /// Run at application startup and when suggestions page is opened.
 pub fn expire_stale_suggestions() -> Result<u32, String> {
     let _guard = SUGGESTION_LOCK.lock().map_err(|e| e.to_string())?;
 
     let mut database = load_from_disk().map_err(|e| e.to_string())?;
+
+    // Plan plan-2 Task 4: purge first, in the SAME locked read-modify-write
+    // and BEFORE expiry. Order matters: a >30-day-old garbage Pending row
+    // must not expire into Dismissed before the purge sees it - expiry would
+    // give it legitimate-looking Dismissed provenance and the purge would
+    // then count zero forever.
+    //
+    // Dictionary keys are mirrored from `learner::get_current_dictionary`
+    // (same canonical-key mapping as the upsert path). Read failure yields
+    // an empty set (fail-open): purge then validates shape gates only and
+    // can never demote rows because of a transient dictionary I/O error.
+    let dictionary_keys: std::collections::BTreeSet<String> =
+        crate::auto_learn::learner::get_current_dictionary()
+            .into_iter()
+            .collect();
+    let purged = purge_invalid_pending_suggestions(&mut database, &dictionary_keys) as u32;
 
     let cutoff = Utc::now() - chrono::Duration::days(30);
     let mut expired_count = 0;
@@ -622,8 +771,16 @@ pub fn expire_stale_suggestions() -> Result<u32, String> {
         }
     }
 
-    if expired_count > 0 {
+    if expired_count + purged > 0 {
         save_to_disk(&database).map_err(|e| e.to_string())?;
+    }
+    if purged > 0 {
+        log::info!(
+            "[AutoLearn] Startup purge demoted {} invalid Pending suggestion(s) to Dismissed",
+            purged
+        );
+    }
+    if expired_count > 0 {
         log::info!("Expired {} stale suggestions", expired_count);
     }
 
@@ -719,7 +876,9 @@ fn is_auto_added(row: &SuggestionEntry) -> bool {
 /// the file. No UI group renders this; it exists so the dictionary page
 /// can badge auto-added rows without re-deriving trigger state.
 #[tauri::command]
-pub fn get_auto_accepted_suggestions(window: tauri::Window) -> Result<Vec<SuggestionEntry>, String> {
+pub fn get_auto_accepted_suggestions(
+    window: tauri::Window,
+) -> Result<Vec<SuggestionEntry>, String> {
     crate::acl::require_caller(&window, &[crate::acl::MAIN_WINDOW])?;
     // Suggestion content is user-authored dictionary data: main-only.
     const AUTO_ADDED_FEED_CAP: usize = 50;
@@ -892,6 +1051,189 @@ mod tests {
             .into();
         assert!(!is_expired("2024-01-15T00:00:00Z", &cutoff));
         assert!(is_expired("2024-01-14T23:59:59Z", &cutoff));
+    }
+
+    // ── Task 4: purge_invalid_pending_suggestions ────────────────────
+
+    #[test]
+    fn test_purge_demotes_garbage_and_keeps_valid_pending() {
+        // Real §1 rows + a valid systematic-mishearing row.
+        let mut db = SuggestionDatabase {
+            suggestions: vec![
+                pending_entry("stuck", "agent", 8),    // dist 5/5 = 1.0 → reject
+                pending_entry("do", "add", 4),         // dist 2/3 = 0.667 > 0.65 → reject
+                pending_entry("shunade", "Sinead", 2), // dist 4/7 ≈ 0.57 → keep
+            ],
+            ..Default::default()
+        };
+        let demoted =
+            purge_invalid_pending_suggestions(&mut db, &std::collections::BTreeSet::new());
+        assert_eq!(demoted, 2);
+        assert_eq!(db.suggestions[0].status, SuggestionStatus::Dismissed);
+        assert_eq!(db.suggestions[1].status, SuggestionStatus::Dismissed);
+        assert_eq!(db.suggestions[2].status, SuggestionStatus::Pending);
+        // OQ-7: demote never rewrites history fields.
+        assert_eq!(db.suggestions[0].frequency, 8);
+        assert_eq!(db.suggestions[1].frequency, 4);
+    }
+
+    #[test]
+    fn test_purge_is_idempotent_then_counts_zero() {
+        let mut db = SuggestionDatabase {
+            suggestions: vec![pending_entry("stuck", "agent", 8)],
+            ..Default::default()
+        };
+        assert_eq!(
+            purge_invalid_pending_suggestions(&mut db, &std::collections::BTreeSet::new()),
+            1
+        );
+        // After demotion, no Pending garbage remains: second pass = 0.
+        assert_eq!(
+            purge_invalid_pending_suggestions(&mut db, &std::collections::BTreeSet::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_purge_leaves_accepted_and_manually_dismissed_untouched() {
+        let mut db = SuggestionDatabase {
+            suggestions: vec![
+                accepted_entry("veiw", "view", None),
+                {
+                    let mut e = pending_entry("qwertyuiop", "zzzz", 1);
+                    e.status = SuggestionStatus::Dismissed;
+                    e
+                },
+                pending_entry("stuck", "agent", 8),
+            ],
+            ..Default::default()
+        };
+        let demoted =
+            purge_invalid_pending_suggestions(&mut db, &std::collections::BTreeSet::new());
+        assert_eq!(demoted, 1);
+        assert_eq!(db.suggestions[0].status, SuggestionStatus::Accepted);
+        assert_eq!(db.suggestions[1].status, SuggestionStatus::Dismissed);
+    }
+
+    #[test]
+    fn test_purge_demotes_dictionary_known_pending_pairs() {
+        let mut keys = std::collections::BTreeSet::new();
+        keys.insert(crate::dictionary::canonical_entry_key("veiw", "view"));
+        let mut db = SuggestionDatabase {
+            suggestions: vec![
+                pending_entry("veiw", "view", 3), // already in dictionary → stale dup
+                pending_entry("pary", "party", 2), // valid → keep
+            ],
+            ..Default::default()
+        };
+        let demoted = purge_invalid_pending_suggestions(&mut db, &keys);
+        assert_eq!(demoted, 1);
+        assert_eq!(db.suggestions[0].status, SuggestionStatus::Dismissed);
+        assert_eq!(db.suggestions[1].status, SuggestionStatus::Pending);
+    }
+
+    // ── Task 6: classify_candidate (snippet echo shield) ─────────────
+
+    fn candidate(spoken: &str, corrected: &str) -> crate::auto_learn::Candidate {
+        crate::auto_learn::Candidate {
+            spoken: spoken.to_string(),
+            corrected: corrected.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_classify_snippet_shield_blocks_existing_row_inflation() {
+        // `again→agent` at 8x: the row exists AND a snippet now shields it.
+        // MUST skip, not increment (plan-2 reviewer Task 6 issue 1).
+        let mut snippet_keys = std::collections::BTreeSet::new();
+        snippet_keys.insert(crate::dictionary::canonical_entry_key("again", "agent"));
+        let action = classify_candidate(
+            &crate::dictionary::canonical_entry_key("again", "agent"),
+            &snippet_keys,
+            &HashSet::new(),
+            true,
+        );
+        assert!(matches!(action, UpsertAction::Skip));
+    }
+
+    #[test]
+    fn test_classify_snippet_shield_blocks_new_row() {
+        let mut snippet_keys = std::collections::BTreeSet::new();
+        snippet_keys.insert(crate::dictionary::canonical_entry_key("again", "agent"));
+        let action = classify_candidate(
+            &crate::dictionary::canonical_entry_key("again", "agent"),
+            &snippet_keys,
+            &HashSet::new(),
+            false,
+        );
+        assert!(matches!(action, UpsertAction::Skip));
+    }
+
+    #[test]
+    fn test_classify_existing_row_increments_without_shield() {
+        let action = classify_candidate(
+            &crate::dictionary::canonical_entry_key("shunade", "Sinead"),
+            &std::collections::BTreeSet::new(),
+            &HashSet::new(),
+            true,
+        );
+        assert!(matches!(action, UpsertAction::UpdateExisting));
+    }
+
+    #[test]
+    fn test_classify_dictionary_known_blocks_new_row_only() {
+        let mut dictionary_keys = HashSet::new();
+        dictionary_keys.insert(crate::dictionary::canonical_entry_key("veiw", "view"));
+        // Pending row exists → increments even though pair is dictionary-known.
+        let existing = classify_candidate(
+            &crate::dictionary::canonical_entry_key("veiw", "view"),
+            &std::collections::BTreeSet::new(),
+            &dictionary_keys,
+            true,
+        );
+        assert!(matches!(existing, UpsertAction::UpdateExisting));
+        // No row → skip (never re-learn).
+        let fresh = classify_candidate(
+            &crate::dictionary::canonical_entry_key("veiw", "view"),
+            &std::collections::BTreeSet::new(),
+            &dictionary_keys,
+            false,
+        );
+        assert!(matches!(fresh, UpsertAction::Skip));
+    }
+
+    #[test]
+    fn test_classify_fresh_pair_inserts() {
+        let action = classify_candidate(
+            &crate::dictionary::canonical_entry_key("pary", "party"),
+            &std::collections::BTreeSet::new(),
+            &HashSet::new(),
+            false,
+        );
+        assert!(matches!(action, UpsertAction::Insert));
+    }
+
+    // ── Task 5: intra-batch dedup ────────────────────────────────────
+
+    #[test]
+    fn test_dedup_candidates_first_occurrence_wins() {
+        let batch = vec![
+            candidate("aaw", "aw"),
+            candidate("aaw", "aw"), // exact duplicate
+            candidate("cool", "Good"),
+        ];
+        let out = dedup_candidates(batch);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].spoken, "aaw");
+        assert_eq!(out[1].spoken, "cool");
+    }
+
+    #[test]
+    fn test_dedup_candidates_is_canonical_case_insensitive() {
+        let batch = vec![candidate("aaw", "aw"), candidate("AAW", "AW")];
+        let out = dedup_candidates(batch);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].spoken, "aaw");
     }
 
     fn pending_entry(spoken: &str, corrected: &str, frequency: u32) -> SuggestionEntry {
