@@ -1,5 +1,5 @@
 /**
- * Fluence Windows - Siri-Style Canvas Waveform Visualizer
+ * Fluence Windows - Canvas Waveform Visualizer
  * 
  * Android-inspired stateless visualization behavior using the existing
  * Windows RMS telemetry.
@@ -17,6 +17,7 @@ class AuraVisualizer {
     this.ctx = this.canvas?.getContext('2d');
     this.overlayRoot = document.getElementById('overlay-root');
     this.currentState = 'idle';
+    this.style = 'waves';            // "waves" | "bars"
     this.smoothedAmplitude = 0;      // 0.0 – 1.0
     this.phase = 0;                  // integrated phase (radians)
     this.recordingStartTime = 0;
@@ -343,6 +344,15 @@ class AuraVisualizer {
 
   getState() { return this.currentState; }
 
+  // Waveform animation pick (Floating Bubble > Appearance). Unknown or
+  // missing values normalize back to "waves" so a hand-edited settings
+  // file can never break the draw loop. Switching styles keeps the
+  // running meter (amplitude, gate, phase) untouched, so a mid-recording
+  // change glides instead of snapping.
+  setStyle(style) {
+    this.style = (style === 'bars') ? 'bars' : 'waves';
+  }
+
   _loop(timestamp) {
     if (!this._isRunning && this.currentState === 'idle') {
       this._rafId = null;
@@ -401,6 +411,15 @@ class AuraVisualizer {
     }
 
     ctx.clearRect(0, 0, W, H);
+
+    // Additive animation dispatch: "waves" keeps the exact original body
+    // below. Bars draws on the same smoothed meter, phase, colors, and
+    // per-tier scales, so the visualizer only changes paint, never
+    // sensing.
+    if (this.style === 'bars') {
+      this._drawBars(W, H);
+      return;
+    }
 
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -510,6 +529,93 @@ class AuraVisualizer {
     ctx.shadowBlur = 0;
     ctx.shadowColor = 'transparent';
   }
+
+  // ── Bars (additive style) ─────────────────────────────────────────
+  // Reads the exact production meter ("waves" factors): same mode colors
+  // (amethyst / cyan), same tier line-width and bubble scales, same 6%
+  // calm baseline and 40% headroom, same gated smoothedAmplitude, same
+  // phase integration. Only the paint differs, so switching the setting
+  // never changes sensing behavior.
+
+  _styleFactors(W, H) {
+    const isAgent = this.currentState === 'agent' || this.currentState === 'agent_transcribing';
+    const isBubble = this.overlayRoot?.classList.contains('style-bubble');
+    const isCompact = this.overlayRoot?.classList.contains('style-compact');
+    const primaryColor = isAgent ? '#0BD6E3' : '#8B45D8';
+    const forefrontColor = isAgent ? '#E6FFFA' : '#F1EAF5';
+    const primaryAlpha = isCompact ? 0.26 : 0.32;
+    const lwScale = isBubble ? 0.82 : isCompact ? 0.9 : 1;
+    const bubbleScale = isBubble ? 0.62 : 1;
+    const level = this.smoothedAmplitude;
+    // Identical production meter: 6% calm baseline, 40% height headroom.
+    const base = (level * 0.88 + 0.06) * (H * 0.40) * bubbleScale;
+    const glow = level > 0.28 ? level * 7 : 0;
+    return { primaryColor, forefrontColor, primaryAlpha, lwScale, bubbleScale, level, base, glow };
+  }
+
+  // One L-to-R gradient shared by every stroke of a pass. Canvas
+  // gradients resolve per geometry in user space, so edge bars fade
+  // exactly like the waves' parabolic-to-gradient edge treatment.
+  _altGrad(ctx, W, hex, alpha) {
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, 'transparent');
+    grad.addColorStop(0.5, hexAlpha(hex, alpha));
+    grad.addColorStop(1, 'transparent');
+    return grad;
+  }
+
+  _drawBars(W, H) {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    const s = this._styleFactors(W, H);
+    const centerY = H / 2;
+    // Pitch stays absolute pixels so tier width changes density, not shape.
+    const count = W < 60 ? 7 : Math.min(25, Math.max(9, Math.floor(W / 6)));
+    const edge = (x) => Math.pow(Math.sin((x / W) * Math.PI), 1.22);
+    const clampH = (h) => Math.min(h, H * 0.48);
+
+    // Soft primary bed: taller, fainter, the background role.
+    ctx.strokeStyle = this._altGrad(ctx, W, s.primaryColor, s.primaryAlpha * 1.05);
+    ctx.lineWidth = 2.4 * s.lwScale;
+    for (let i = 0; i < count; i++) {
+      const x = ((i + 0.5) / count) * W;
+      const e = edge(x);
+      const u1 = Math.abs(Math.sin(x * (W < 60 ? 0.16 : 0.11) + this.phase * 1.35));
+      const u2 = Math.abs(Math.sin(x * (W < 60 ? 0.24 : 0.17) - this.phase * 1.05));
+      const hBg = clampH((s.base * (0.34 + 0.52 * Math.min(1, u1 * 0.62 + u2 * 0.38)) + 1.2) * e);
+      ctx.beginPath();
+      ctx.moveTo(x, centerY - hBg);
+      ctx.lineTo(x, centerY + hBg);
+      ctx.stroke();
+    }
+
+    // Crisp forefront row: only grows when the speech gate is open, so a
+    // quiet room keeps a calm low rug of bars (same gate as the waves).
+    ctx.strokeStyle = this._altGrad(ctx, W, s.forefrontColor, 0.88);
+    ctx.lineWidth = 1.9 * s.lwScale;
+    if (s.glow > 0) {
+      ctx.shadowColor = hexAlpha(s.forefrontColor, 0.22);
+      ctx.shadowBlur = s.glow;
+    }
+    for (let i = 0; i < count; i++) {
+      const x = ((i + 0.5) / count) * W;
+      const e = edge(x);
+      const u1 = Math.abs(Math.sin(x * (W < 60 ? 0.16 : 0.11) + this.phase * 1.35));
+      const u2 = Math.abs(Math.sin(x * (W < 60 ? 0.24 : 0.17) - this.phase * 1.05));
+      const shape = Math.min(1, u1 * 0.62 + u2 * 0.38);
+      const hFt = clampH((s.base * (0.10 + 0.62 * shape * Math.max(0.25, s.level)) + 1.6) * e);
+      ctx.beginPath();
+      ctx.moveTo(x, centerY - hFt);
+      ctx.lineTo(x, centerY + hFt);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+    ctx.shadowColor = 'transparent';
+    return;
+  }
+
 }
 
 function hexAlpha(hex, alpha) {

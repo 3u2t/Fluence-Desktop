@@ -56,6 +56,14 @@ pub struct AppSettings {
     pub overlay_position: String, // "center" | "bottom_left" | "bottom_right" | "top_left" | "top_center" | "top_right"
     #[serde(default = "default_overlay_style")]
     pub overlay_style: String, // "full" | "compact" | "bubble"
+    /// Waveform animation of the recording overlay
+    /// ("waves" | "bars"). Frontend normalizes unknown
+    /// values back to "waves", so legacy and hand-edited files stay safe.
+    /// Default keeps the shipped layered-ripple look: existing users see
+    /// nothing change until they pick another style in Floating Bubble.
+    /// Device-local by design (not added to the sync allowlist).
+    #[serde(default = "default_waveform_style")]
+    pub waveform_style: String,
     /// Soft halo around the overlay border (Android pill-glow parity).
     /// Default ON: dropping the halo is one toggle away in Floating Bubble.
     #[serde(default = "default_true")]
@@ -146,6 +154,9 @@ fn default_overlay_position() -> String {
 fn default_overlay_style() -> String {
     "full".to_string()
 }
+fn default_waveform_style() -> String {
+    "waves".to_string()
+}
 fn default_false() -> bool {
     false
 }
@@ -201,6 +212,7 @@ impl Default for AppSettings {
             recording_mode: default_recording_mode(),
             overlay_position: default_overlay_position(),
             overlay_style: default_overlay_style(),
+            waveform_style: default_waveform_style(),
             overlay_glow: default_true(),
             show_app_pill: default_true(),
             audio_device_id: None,

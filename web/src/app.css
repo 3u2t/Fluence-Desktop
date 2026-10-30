@@ -797,6 +797,30 @@ button.history-group-header {
   padding: 10px 8px;
 }
 
+/* Waveform animation picker (Floating Bubble > Appearance): same row
+ * grammar as the style rows, but the stage is a bare canvas — one meter,
+ * no overlay chrome. Shorter rows keep the list calm; the selected row
+ * animates, the rest stay frozen (WaveformStage). */
+.wave-option {
+  height: 96px;
+  min-height: 96px;
+  border-radius: 0;
+}
+
+.wave-option.selected {
+  background: var(--color-interactive-active);
+}
+
+.wave-live-stage {
+  min-height: 76px;
+}
+
+.wave-stage-canvas {
+  display: block;
+  width: 210px;
+  height: 44px;
+}
+
 .overlay-preview {
   display: block;
   flex: none;

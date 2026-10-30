@@ -836,6 +836,13 @@ body.agent-placement-above .app-pill {
   transition: opacity 100ms ease;
 }
 
+/* Icon-only finish (paste outcomes): the green check / red X carries the
+   result; the message text stays in the DOM for aria-live + tooltips but
+   is not painted. Placed after the state rules so it wins the cascade. */
+.overlay-root.status-text-hidden .status-msg {
+  opacity: 0;
+}
+
 /* ── Hold-to-Record Hint ───────────────────────────────────────── */
 .rec-hint {
   font-family: var(--font-body), system-ui, sans-serif;

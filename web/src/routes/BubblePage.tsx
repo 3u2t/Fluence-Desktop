@@ -15,6 +15,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from '@/components/fluence/Toasts';
 import { SettingsSectionHeader } from '@/components/fluence/SettingsSection';
 import { OverlayPreview, type OverlayTier } from '@/components/fluence/OverlayPreview';
+import { WaveformStage } from '@/components/fluence/WaveformStage';
+import {
+  WAVEFORM_STYLE_OPTIONS,
+  normalizeWaveformStyle,
+  type WaveformStyle,
+} from '@/components/fluence/waveform';
 import {
   getCachedSettings,
   loadSettings,
@@ -49,6 +55,9 @@ export function BubblePage() {
   const [overlayPosition, setOverlayPosition] = useState('bottom_right');
   const [overlayGlow, setOverlayGlow] = useState(true);
   const [showAppPill, setShowAppPill] = useState(true);
+  // Waveform animation pick: default boots to the shipped look even before
+  // settings arrive, so the row list never flashes the wrong frame.
+  const [waveformStyle, setWaveformStyle] = useState<WaveformStyle>('waves');
 
   // Style picks the overlay; Appearance tunes how it looks and where it
   // sits. Placement lives with appearance (a one-row tab of its own would
@@ -71,6 +80,7 @@ export function BubblePage() {
         setOverlayPosition(str(s.overlay_position, 'bottom_right'));
         setOverlayGlow((s.overlay_glow as boolean) !== false);
         setShowAppPill((s.show_app_pill as boolean) !== false);
+        setWaveformStyle(normalizeWaveformStyle(s.waveform_style));
       }
     })();
     const unsub = subscribeSettings(() => {
@@ -80,6 +90,7 @@ export function BubblePage() {
       setOverlayPosition(str(s.overlay_position, 'bottom_right'));
       setOverlayGlow((s.overlay_glow as boolean) !== false);
       setShowAppPill((s.show_app_pill as boolean) !== false);
+      setWaveformStyle(normalizeWaveformStyle(s.waveform_style));
     });
     return () => {
       cancelled = true;
@@ -114,6 +125,14 @@ export function BubblePage() {
     setOverlayGlow(value);
     if (getCachedSettings()) {
       setSettingField('overlay_glow', value);
+    }
+  };
+
+  const onWaveformChange = (value: string) => {
+    const v = normalizeWaveformStyle(value);
+    setWaveformStyle(v);
+    if (getCachedSettings()) {
+      setSettingField('waveform_style', v);
     }
   };
 
@@ -242,6 +261,49 @@ export function BubblePage() {
               </Field>
             </div>
           </div>
+        </div>
+
+        <SettingsSectionHeader
+          title="Waveform Animation"
+          description="The shape of the live recording meter. The selected style animates"
+        />
+        <div className="settings-card">
+          <RadioGroup
+            className="bubble-option-list"
+            value={waveformStyle}
+            onValueChange={onWaveformChange}
+            aria-label="Waveform animation"
+          >
+            {WAVEFORM_STYLE_OPTIONS.map((option) => {
+              const selected = waveformStyle === option.value;
+              return (
+                <div
+                  key={option.value}
+                  className={`choice-surface selection-row bubble-option wave-option${selected ? ' selected' : ''}`}
+                  onClick={() => onWaveformChange(option.value)}
+                >
+                  <RadioGroupItem value={option.value} asChild>
+                    <button
+                      type="button"
+                      className="selection-row-main"
+                      aria-label={`Select ${option.title}`}
+                    >
+                      <span className="selection-radio" aria-hidden="true" />
+                      <span className="selection-row-copy">
+                        <span className="selection-row-heading">
+                          <span className="selection-row-title">{option.title}</span>
+                        </span>
+                        <span className="selection-row-description">{option.desc}</span>
+                      </span>
+                    </button>
+                  </RadioGroupItem>
+                  <div className="bubble-live-stage wave-live-stage" onClick={(e) => e.stopPropagation()}>
+                    <WaveformStage style={option.value} animate={selected} />
+                  </div>
+                </div>
+              );
+            })}
+          </RadioGroup>
         </div>
 
         <SettingsSectionHeader

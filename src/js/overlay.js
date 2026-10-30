@@ -640,7 +640,14 @@ async function applyOverlayStyle(style, glowOn = true) {
 
 // ── Status Message + Retry ──────────────────────────────────────
 
-function setStatusMessage(text) {
+function setStatusMessage(text, opts = {}) {
+  // markOnly = icon-only finish (green check / red X). The text stays in
+  // the DOM for aria-live and hover tooltips but is hidden visually
+  // (.status-text-hidden in overlay.css). A plain call without markOnly
+  // clears the class, so unrelated notices go back to text.
+  if (overlayRoot) {
+    overlayRoot.classList.toggle('status-text-hidden', opts.markOnly === true);
+  }
   if (statusMsg) {
     statusMsg.textContent = text || '';
     // Compact/bubble hide the text visually - keep it available as hover
@@ -879,7 +886,7 @@ async function handlePasteFailure(pending, err, sessionId) {
   pendingInjection = pending;
   console.error('[overlay] injection failed:', String(err || ''));
   setState('error');
-  setStatusMessage(describeInjectError(err));
+  setStatusMessage(describeInjectError(err), { markOnly: true });
   if (pending.kind === 'text') showCopy();
   showRetry();
   scheduleAutoDismiss(12000);
@@ -899,7 +906,7 @@ async function retryPendingInjection(sessionId) {
     }
     if (!isSessionActive(sessionId)) return;
     setState('success');
-    setStatusMessage(pending.kind === 'text' ? 'Inserted' : 'Executed');
+    setStatusMessage(pending.kind === 'text' ? 'Inserted' : 'Executed', { markOnly: true });
     playCompletionChime();
     agentRetryContext = null;
     await new Promise(r => setTimeout(r, 800));
@@ -1035,15 +1042,20 @@ function setupDiscardButton() {
 }
 
 async function getRecordingPreferences() {
-  try {
-    cachedSettings = await invoke('get_settings');
-  } catch {
-    cachedSettings = cachedSettings || {};
-  }
+    try {
+      cachedSettings = await invoke('get_settings');
+      // One hook covers every caller of getRecordingPreferences (session
+      // starts, reconcile, DOMContentLoaded): the pick rides the existing
+      // settings fetch, unknown values normalize inside setStyle.
+      if (aura) aura.setStyle(cachedSettings.waveform_style);
+    } catch {
+      cachedSettings = cachedSettings || {};
+    }
 
-  return {
-    overlayPosition: cachedSettings.overlay_position || 'bottom_right',
-    overlayStyle: cachedSettings.overlay_style || 'full',
+    return {
+      overlayPosition: cachedSettings.overlay_position || 'bottom_right',
+      overlayStyle: cachedSettings.overlay_style || 'full',
+      waveformStyle: cachedSettings.waveform_style || 'waves',
     overlayGlow: cachedSettings.overlay_glow !== false,
     showAppPill: cachedSettings.show_app_pill !== false,
     audioDeviceId: cachedSettings.audio_device_id || null,
@@ -1189,9 +1201,9 @@ async function runSttFlow(sessionId, retry = false) {
       if (!isSessionActive(sessionId)) return;
       setState('success');
       if (replacedClipboard) {
-        setStatusMessage('Inserted (clipboard replaced)');
+        setStatusMessage('Inserted (clipboard replaced)', { markOnly: true });
       } else {
-        setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted');
+        setStatusMessage(result.realtimeFallback ? 'Inserted (standard mode)' : 'Inserted', { markOnly: true });
       }
       playCompletionChime();
       await new Promise(r => setTimeout(r, 1000));
