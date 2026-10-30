@@ -5,58 +5,27 @@
      (this comment included) when cutting a release. Keep the language plain:
      write for the person using Fluence, not for the person building it. -->
 
-## Choose the color of Fluence
+## Waveform animation choices and cleaner completion
 
-### Six accent presets, from Fluence Original to pure monochrome
+### Waves or Amp Bars for your recording overlay
 
-Open Settings, go to General and pick the new Appearance tab. There you
-find six accent colors: Fluence Original, Orange, Olive Green, Yellow,
-Rose and Monochrome. Pick one and the accent color follows you across the
-settings window: primary buttons, toggles, selection highlights, the update
-button and the charts on your dashboard all pick it up.
+You can now customize how the floating recording bubble animates while you speak. In Settings under Floating Bubble, look for the new **Waveform Animation** section:
+- **Waves**: Three layered ripples. The signature animation Fluence ships with.
+- **Amp Bars**: Vertical equalizer bars that rise and fall with your voice volume.
 
-### Reads well in dark and light
+The selected style shows a live preview directly in the settings window, and adapts to your system motion settings.
 
-Every preset arrives in two shades. When the app looks dark you get the
-brighter shade, when you switch to light mode the app swaps to a darker one
-so buttons and text stay easy to read. The switch happens automatically and
-you can flip the look at any time with Ctrl+Shift+L.
+### Cleaner completion feedback
 
-### What stays the same on purpose
+When Fluence finishes typing your dictation into an app, the overlay now gives you a clean, distraction-free visual checkmark without obscuring your screen with extra text. The text remains fully accessible for screen readers and tooltips.
 
-The app's surfaces keep their calm dark styling. The fluence logo, the
-floating recording overlay and the first-run wizard look exactly like
-before, no accent in the list touches them. Picking Fluence Original gives
-you precisely the color behavior of the previous release, so if you want
-nothing to change, leave it there.
+### What stays the same
 
-### Also in this release
-
-- In light mode the outline shown when you move through controls with the
-  keyboard now matches your chosen accent instead of always being teal.
-- The charts on the dashboard follow your accent. With Fluence
-  Original they keep the same purple to cyan range as before.
-
-### For the technical minded
-
-Nothing about your data changed. History, dictionary, snippets and agents
-work exactly as before, and recording, transcription and typing behaviour
-are untouched. Accent choice lives on the device in the settings window,
-it is not part of sync yet. The accent layer is built only from token
-references with safe fallbacks, so windows that do not know about it keep
-rendering the previous values.
+Your audio detection, dictation shortcuts, language models, history, snippets, and sync data are completely unaffected. The waveform animation pick is saved locally on your device.
 
 ### Known limitations
 
-- The accent applies to the settings window. The overlay and the first-run
-  wizard keep their own look on purpose.
-- The installer is **not code-signed**, so Windows SmartScreen may warn the
-  first time you run it. Choose "More info" → "Run anyway". This is unchanged
-  from previous releases.
-- Agent mode carries out its actions without asking first, so a misheard
-  command can act on the window you are in.
-- Text goes wherever your cursor is when transcription finishes, that is the
-  intended behaviour, and it means switching apps while dictating pastes into
-  whichever app you end up in.
-- An image or file list on your clipboard is replaced by a paste and cannot be
-  restored afterwards. You are told when this happens.
+- The installer is **not code-signed**, so Windows SmartScreen may warn the first time you run it. Choose "More info" → "Run anyway". This is unchanged from previous releases.
+- Agent mode carries out its actions without asking first, so a misheard command can act on the window you are in.
+- Text goes wherever your cursor is when transcription finishes; switching apps while dictating pastes into whichever app you end up in.
+- An image or file list on your clipboard is replaced by a paste and cannot be restored afterwards. You are told when this happens.
