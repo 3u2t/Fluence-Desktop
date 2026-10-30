@@ -171,7 +171,7 @@ export function Sidebar({
               </defs>
             </svg>
             <span className="logo-text">
-              flu<span style={{ color: 'var(--color-brand-cyan)' }}>ence</span>
+              flu<span style={{ color: 'var(--color-logo-cyan)' }}>ence</span>
               <span className="logo-tagline">Transcribe</span>
             </span>
           </div>

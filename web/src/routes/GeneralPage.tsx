@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Field } from '@/components/ui/field';
@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { toast } from '@/components/fluence/Toasts';
 import { SettingsSectionHeader } from '@/components/fluence/SettingsSection';
 import {
@@ -30,6 +31,7 @@ import {
   persistGeneral,
   setHotkeyRecording,
 } from '@/ipc/general';
+import { ACCENT_THEMES, type AccentTheme } from '@/lib/theme';
 
 type HotkeyKey = 'hotkey' | 'agent_hotkey';
 
@@ -47,7 +49,13 @@ function str(value: unknown, fallback: string): string {
 // populateAudioDevices, setupSaveButtons general branch). Same DOM
 // ids/classes, same copy, same toasts, same debounced persistence with the
 // vanilla flush features ('hotkeys' re-registers, 'autostart' applies).
-export function GeneralPage() {
+export function GeneralPage({
+  accentTheme,
+  onAccentThemeChange,
+}: {
+  accentTheme: AccentTheme;
+  onAccentThemeChange: (accentTheme: AccentTheme) => void;
+}) {
   const [hotkey, setHotkey] = useState(DEFAULT_HOTKEY);
   const [agentHotkey, setAgentHotkey] = useState(DEFAULT_AGENT_HOTKEY);
   const [recordingMode, setRecordingMode] = useState('push_to_toggle');
@@ -62,7 +70,7 @@ export function GeneralPage() {
 
   // One concern visible at a time (Providers pattern): shortcuts for the
   // hotkeys, audio for input/language/feedback, system for OS behavior.
-  type GeneralTab = 'shortcuts' | 'audio' | 'system';
+  type GeneralTab = 'shortcuts' | 'audio' | 'system' | 'appearance';
   const [tab, setTab] = useState<GeneralTab>('shortcuts');
 
   const [recording, setRecording] = useState<HotkeyKey | null>(null);
@@ -271,6 +279,7 @@ export function GeneralPage() {
           <TabsTrigger value="shortcuts">Shortcuts</TabsTrigger>
           <TabsTrigger value="audio">Audio</TabsTrigger>
           <TabsTrigger value="system">System</TabsTrigger>
+          <TabsTrigger value="appearance">Appearance</TabsTrigger>
         </TabsList>
 
       <TabsContent value="shortcuts">
@@ -582,11 +591,48 @@ export function GeneralPage() {
           </CardContent>
         </Card>
       </TabsContent>
+      <TabsContent value="appearance">
+        <SettingsSectionHeader title="Accent theme" description="Choose a preset accent for the Fluence settings window" />
+        <Card className="settings-card">
+          <CardContent className="settings-card-content accent-theme-content">
+            <RadioGroup
+              className="accent-preset-grid"
+              value={accentTheme}
+              onValueChange={(value) => onAccentThemeChange(value as AccentTheme)}
+              aria-label="Accent theme"
+              aria-describedby="accent-theme-note"
+            >
+              {ACCENT_THEMES.map((preset) => (
+                <RadioGroupItem
+                  key={preset.value}
+                  asChild
+                  value={preset.value}
+                  className="accent-preset-radio"
+                  style={{
+                    '--preset-accent-dark': preset.dark,
+                    '--preset-accent-light': preset.light,
+                  } as CSSProperties}
+                >
+                  <button type="button" className="accent-preset-card">
+                    <span className="accent-preset-swatch" aria-hidden="true" />
+                    <span className="accent-preset-label">{preset.label}</span>
+                  </button>
+                </RadioGroupItem>
+              ))}
+            </RadioGroup>
+            <p className="accent-theme-note" id="accent-theme-note">
+              Accents adapt for dark and light appearance. Your surfaces, Fluence logo, and floating overlay stay unchanged.
+            </p>
+          </CardContent>
+        </Card>
+      </TabsContent>
       </Tabs>
 
-      <div className="page-actions">
-        <Button variant="default" id="save-general-btn" onClick={() => void onSaveAll()}>Save Changes</Button>
-      </div>
+      {tab !== 'appearance' && (
+        <div className="page-actions">
+          <Button variant="default" id="save-general-btn" onClick={() => void onSaveAll()}>Save Changes</Button>
+        </div>
+      )}
     </section>
   );
 }

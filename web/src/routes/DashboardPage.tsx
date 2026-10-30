@@ -43,7 +43,7 @@ import {
 } from '@/ipc/dashboard';
 import { copyText, subscribeHistoryUpdated } from '@/ipc/history';
 import { subscribeSyncStatus } from '@/ipc/sync';
-import type { Theme } from '@/lib/theme';
+import { getAccentColor, type AccentTheme, type Theme } from '@/lib/theme';
 
 const DAY_MS = 86400000;
 
@@ -334,20 +334,22 @@ function weekdayData(buckets: DailyBucket[], range: Range): WeekdayPoint[] {
 
 // Interpolates the chart duo (a -> b -> c) into n slice fills so the donut
 // stays in the existing chart language without introducing new tokens.
-function duoRamp(duo: { a: string; b: string; c: string }, n: number): string[] {
+function mixHex(from: string, to: string, t: number): string {
   const toRgb = (hex: string): [number, number, number] => {
-    const v = parseInt(hex.slice(1), 16);
-    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+    const value = parseInt(hex.slice(1), 16);
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
   };
-  const mix = (from: string, to: string, t: number): string => {
-    const f = toRgb(from);
-    const e = toRgb(to);
-    const c = f.map((x, i) => Math.round(x + (e[i] - x) * t));
-    return `#${c.map((x) => x.toString(16).padStart(2, '0')).join('')}`;
-  };
+  const start = toRgb(from);
+  const end = toRgb(to);
+  const channel = (from: number, to: number) =>
+    Math.round(from + (to - from) * t).toString(16).padStart(2, '0');
+  return `#${channel(start[0], end[0])}${channel(start[1], end[1])}${channel(start[2], end[2])}`;
+}
+
+function duoRamp(duo: { a: string; b: string; c: string }, n: number): string[] {
   return Array.from({ length: n }, (_, i) => {
     const t = n < 2 ? 0 : i / (n - 1);
-    return t < 0.5 ? mix(duo.a, duo.b, t * 2) : mix(duo.b, duo.c, (t - 0.5) * 2);
+    return t < 0.5 ? mixHex(duo.a, duo.b, t * 2) : mixHex(duo.b, duo.c, (t - 0.5) * 2);
   });
 }
 
@@ -407,7 +409,13 @@ let cachedBuckets: DailyBucket[] | null = null;
 let dashboardLoaded = false;
 let skeletonCleared = false;
 
-export function DashboardPage({ theme = 'dark' }: { theme?: Theme }) {
+export function DashboardPage({
+  theme = 'dark',
+  accentTheme = 'fluence',
+}: {
+  theme?: Theme;
+  accentTheme?: AccentTheme;
+}) {
   const [buckets, setBuckets] = useState<DailyBucket[]>(cachedBuckets ?? []);
   const [loaded, setLoaded] = useState(dashboardLoaded);
   const [skeleton, setSkeleton] = useState(!skeletonCleared);
@@ -433,20 +441,31 @@ export function DashboardPage({ theme = 'dark' }: { theme?: Theme }) {
     [],
   );
 
-  // Chart duo follows the settings-shell theme (owner direction: muted
-  // amethyst-to-cyan, desaturated, no glow). Light stops deepen for white.
-  const duo =
-    theme === 'dark'
-      ? { a: '#8E7CC3', b: '#7498C6', c: '#5FB4C2' }
-      : { a: '#6E5AA8', b: '#4E7FA8', c: '#2E8B99' };
+  // Alternative accents tint the existing chart duo; Fluence Original keeps
+  // its exact amethyst-to-cyan chart colors.
+  const accentColor = getAccentColor(accentTheme, theme);
+  const baseDuo = theme === 'dark'
+    ? { a: '#8E7CC3', b: '#7498C6', c: '#5FB4C2' }
+    : { a: '#6E5AA8', b: '#4E7FA8', c: '#2E8B99' };
+  const duo = accentTheme === 'fluence'
+    ? baseDuo
+    : accentTheme === 'monochrome'
+      ? theme === 'dark'
+        ? { a: '#737373', b: '#A3A3A3', c: '#FFFFFF' }
+        : { a: '#71717A', b: '#52525B', c: '#27272A' }
+      : {
+          a: mixHex(baseDuo.a, accentColor, 0.25),
+          b: mixHex(baseDuo.b, accentColor, 0.6),
+          c: accentColor,
+        };
   const themedConfig = useMemo(
     () => ({
       sessions: {
         label: 'Sessions',
-        color: theme === 'dark' ? '#0BD6E3' : '#0E7490',
+        color: accentColor,
       },
     }),
-    [theme],
+    [accentColor],
   );
 
   // Full authoritative snapshot (mount, account switch): replaces the
@@ -609,13 +628,12 @@ export function DashboardPage({ theme = 'dark' }: { theme?: Theme }) {
     weekdayTotal === 0
       ? `No activity in this range yet`
       : `Peak ${weekdayPeak.full} ${weekdayPeakShare}% · ${weekdayValue(weekdayPeak).toLocaleString()} ${weekdayUnit(weekdayValue(weekdayPeak))} · ${rangeLabel.toLowerCase()}`;
-  // Slice fills interpolated from the existing chart duo (no new tokens).
-  // Depend on `theme`, not the `duo` object literal, which is rebuilt every
-  // render and would defeat the memo.
+  // Slice fills use the selected accent; depend on stable choices, not the
+  // rebuilt duo object.
   const weekdayFills = useMemo(
     () => duoRamp(duo, weekdayPoints.length),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [theme, weekdayPoints.length],
+    [theme, accentTheme, weekdayPoints.length],
   );
 
   // Additive momentum ring: today vs trailing daily average from the same

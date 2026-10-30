@@ -190,7 +190,7 @@ body.is-maximized {
   height: 100%;
   background: var(--color-brand-cyan);
   transition: width 0.2s ease;
-  box-shadow: 0 0 6px rgba(11, 214, 227, 0.5);
+  box-shadow: 0 0 6px rgba(var(--color-accent-rgb, 11, 214, 227), 0.5);
 }
 
 .sidebar-update-btn {
@@ -236,11 +236,11 @@ body.is-maximized {
   color: #09090B;
   font-weight: 600;
   border-color: var(--color-brand-cyan);
-  box-shadow: 0 2px 8px rgba(11, 214, 227, 0.25);
+  box-shadow: 0 2px 8px rgba(var(--color-accent-rgb, 11, 214, 227), 0.25);
 }
 
 .sidebar-update-btn.btn-has-update:hover {
-  box-shadow: 0 3px 12px rgba(11, 214, 227, 0.35);
+  box-shadow: 0 3px 12px rgba(var(--color-accent-rgb, 11, 214, 227), 0.35);
   transform: translateY(-1px);
 }
 
@@ -424,7 +424,7 @@ body.is-maximized {
 .hotkey-display.recording {
   background: var(--color-surface-elevated);
   border-color: var(--color-brand-cyan);
-  box-shadow: 0 0 12px rgba(11, 214, 227, 0.35);
+  box-shadow: 0 0 12px rgba(var(--color-accent-rgb, 11, 214, 227), 0.35);
   animation: blink 1s ease-in-out infinite;
 }
 
@@ -592,9 +592,9 @@ body.is-maximized {
   line-height: 1;
   padding: 4px 8px;
   border-radius: var(--radius-full);
-  background: rgba(11, 214, 227, 0.14);
+  background: rgba(var(--color-accent-rgb, 11, 214, 227), 0.14);
   color: var(--color-brand-cyan);
-  border: 1px solid rgba(11, 214, 227, 0.3);
+  border: 1px solid rgba(var(--color-accent-rgb, 11, 214, 227), 0.3);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -705,7 +705,7 @@ body.is-maximized {
 
 .history-item:hover::before {
   border-color: var(--color-brand-cyan);
-  box-shadow: 0 0 6px rgba(11, 214, 227, 0.4);
+  box-shadow: 0 0 6px rgba(var(--color-accent-rgb, 11, 214, 227), 0.4);
 }
 
 .history-item:last-child {
@@ -1832,10 +1832,10 @@ html.nav-backward ::view-transition-new(content-area) { animation-name: fade-in-
 }
 [data-theme="light"] .hotkey-display:focus-visible,
 [data-theme="light"] .offline-model-card:focus-visible {
-  outline-color: rgba(14, 116, 144, 0.55);
+  outline-color: var(--color-border-focus);
 }
 [data-theme="light"] .history-item-text mark {
-  color: #0E7490;
+  color: var(--color-brand-cyan);
 }
 [data-theme="light"] .history-item-text .candidate-word {
   color: #92400E;

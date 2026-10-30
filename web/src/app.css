@@ -9,6 +9,7 @@
 @import '../../src/css/global.css';
 @import '../../src/css/settings.css';
 @import './ui.css';
+@import './accent-themes.css';
 
 /* React mount node participates in body's flex column exactly as the
  * vanilla titlebar + .app-shell children do. */
@@ -869,7 +870,8 @@ button.history-group-header {
 }
 
 .bubble-legend-dot-a {
-  background: var(--color-brand-cyan);
+  background: var(--color-overlay-agent-cyan);
+  box-shadow: 0 0 0 1px var(--color-text-primary);
 }
 
 /* ── Agents board (Slice 5, Android AgentsScreen parity) ── */

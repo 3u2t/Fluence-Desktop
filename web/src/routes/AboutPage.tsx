@@ -42,7 +42,7 @@ export function AboutPage() {
               </defs>
             </svg>
             <div className="text-headline-md" style={{ fontWeight: 600, fontSize: 24, letterSpacing: '-0.03em', display: 'inline-flex', alignItems: 'baseline' }}>
-              flu<span style={{ color: 'var(--color-brand-cyan)' }}>ence</span>
+              flu<span style={{ color: 'var(--color-logo-cyan)' }}>ence</span>
               <span style={{ fontFamily: "'Allura',cursive", fontWeight: 400, fontSize: 22, marginLeft: 7, lineHeight: 1, color: 'var(--color-on-surface-variant)' }}>Transcribe</span>
             </div>
           </div>

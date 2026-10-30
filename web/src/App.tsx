@@ -20,7 +20,7 @@ import { updaterStore } from '@/ipc/updater';
 import { hideMainWindow } from '@/ipc/tauri';
 import { isHotkeyRecording } from '@/ipc/general';
 import { requestHistorySearchFocus } from '@/ipc/history';
-import { useTheme } from '@/lib/theme';
+import { useAccentTheme, useTheme } from '@/lib/theme';
 
 export type Route =
   | 'dashboard'
@@ -69,6 +69,7 @@ export function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
   const { theme, choice: themeChoice, cycleTheme, toggleTheme } = useTheme();
+  const { accentTheme, setAccentTheme } = useAccentTheme();
 
   useEffect(() => {
     try {
@@ -222,13 +223,13 @@ export function App() {
               {route === 'about' ? (
                 <AboutPage />
               ) : route === 'dashboard' ? (
-                <DashboardPage theme={theme} />
+                <DashboardPage theme={theme} accentTheme={accentTheme} />
               ) : route === 'sync' ? (
                 <SyncPage />
               ) : route === 'dictionary' ? (
                 <DictionaryPage />
               ) : route === 'general' ? (
-                <GeneralPage />
+                <GeneralPage accentTheme={accentTheme} onAccentThemeChange={setAccentTheme} />
               ) : route === 'bubble' ? (
                 <BubblePage />
               ) : route === 'history' ? (

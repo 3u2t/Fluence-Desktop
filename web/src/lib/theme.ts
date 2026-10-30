@@ -6,7 +6,75 @@ export type Theme = 'dark' | 'light';
 // OS dark → app dark, OS light → app light, switching without a restart.
 export type ThemeChoice = Theme | 'auto';
 
+export const ACCENT_THEMES = [
+  { value: 'fluence', label: 'Fluence Original', dark: '#0BD6E3', light: '#0E7490' },
+  { value: 'orange', label: 'Orange', dark: '#FFB45E', light: '#C2410C' },
+  { value: 'olive', label: 'Olive Green', dark: '#B7D36B', light: '#5C7C00' },
+  { value: 'yellow', label: 'Yellow', dark: '#FFD166', light: '#946A00' },
+  { value: 'rose', label: 'Rose', dark: '#FF9FB7', light: '#C1164A' },
+  { value: 'monochrome', label: 'Monochrome', dark: '#FFFFFF', light: '#27272A' },
+] as const;
+
+export type AccentTheme = (typeof ACCENT_THEMES)[number]['value'];
+
 const THEME_KEY = 'fluence_theme';
+const ACCENT_THEME_KEY = 'fluence_accent_theme';
+
+function isAccentTheme(value: unknown): value is AccentTheme {
+  return ACCENT_THEMES.some((theme) => theme.value === value);
+}
+
+export function getStoredAccentTheme(): AccentTheme {
+  try {
+    const raw = window.localStorage.getItem(ACCENT_THEME_KEY);
+    if (isAccentTheme(raw)) return raw;
+  } catch {
+    // Storage unavailable (private mode, etc.) — fall back to Fluence Original.
+  }
+  return 'fluence';
+}
+
+export function applyAccentTheme(accentTheme: AccentTheme): void {
+  const preset = ACCENT_THEMES.find((theme) => theme.value === accentTheme) ?? ACCENT_THEMES[0];
+  const root = document.documentElement;
+  root.dataset.accent = accentTheme;
+  root.style.setProperty('--fluence-accent-dark', preset.dark);
+  root.style.setProperty('--fluence-accent-dark-rgb', hexToRgb(preset.dark));
+  root.style.setProperty('--fluence-accent-light', preset.light);
+  root.style.setProperty('--fluence-accent-light-rgb', hexToRgb(preset.light));
+}
+
+function hexToRgb(hex: string): string {
+  const value = Number.parseInt(hex.slice(1), 16);
+  return `${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}`;
+}
+
+export function getAccentColor(accentTheme: AccentTheme, theme: Theme): string {
+  const preset = ACCENT_THEMES.find((item) => item.value === accentTheme) ?? ACCENT_THEMES[0];
+  return theme === 'dark' ? preset.dark : preset.light;
+}
+
+export function useAccentTheme(): {
+  accentTheme: AccentTheme;
+  setAccentTheme: (accentTheme: AccentTheme) => void;
+} {
+  const [accentTheme, setAccentThemeState] = useState<AccentTheme>(getStoredAccentTheme);
+
+  useEffect(() => {
+    applyAccentTheme(accentTheme);
+    try {
+      window.localStorage.setItem(ACCENT_THEME_KEY, accentTheme);
+    } catch {
+      // Persistence is an enhancement; the shell still works without it.
+    }
+  }, [accentTheme]);
+
+  const setAccentTheme = useCallback((next: AccentTheme) => {
+    setAccentThemeState(next);
+  }, []);
+
+  return { accentTheme, setAccentTheme };
+}
 
 function isThemeChoice(value: unknown): value is ThemeChoice {
   return value === 'dark' || value === 'light' || value === 'auto';
