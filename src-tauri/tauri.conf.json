@@ -24,6 +24,7 @@
         "visible": false,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "url": "dist/index.html",
         "dragDropEnabled": false,
         "theme": "Dark"
@@ -54,6 +55,7 @@
         "visible": false,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "url": "wizard.html",
         "theme": "Dark"
       }

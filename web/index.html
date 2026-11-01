@@ -9,7 +9,10 @@
   <title>Fluence Settings</title>
   <style>
     html, body {
-      background-color: #121212;
+      /* Transparent, not #121212: body:has(.app-shell) chrome relies on the
+       * canvas staying see-through at the 16px rounded corners. An opaque
+       * root here paints the hard-coded color into every corner cutout. */
+      background-color: transparent;
       color: #E2E2E2;
       margin: 0;
       padding: 0;
