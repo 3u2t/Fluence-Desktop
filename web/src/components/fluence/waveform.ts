@@ -81,9 +81,9 @@ export function drawWaveformFrame(
   const glow = level > 0.28 ? level * 7 : 0;
   const altGrad = (hex: string, alpha: number) => {
     const grad = ctx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, 'transparent');
+    grad.addColorStop(0, hexAlpha(hex, alpha * 0.22));
     grad.addColorStop(0.5, hexAlpha(hex, alpha));
-    grad.addColorStop(1, 'transparent');
+    grad.addColorStop(1, hexAlpha(hex, alpha * 0.22));
     return grad;
   };
 
@@ -143,7 +143,8 @@ export function drawWaveformFrame(
     // Mirror of _drawBars: soft primary bed + crisp forefront row gated
     // by the real level.
     const count = W < 60 ? 7 : Math.min(25, Math.max(9, Math.floor(W / 6)));
-    const edge = (x: number) => Math.pow(Math.sin((x / W) * Math.PI), 1.22);
+    const edgeFloor = 0.22;
+    const edge = (x: number) => { const s = Math.pow(Math.sin((x / W) * Math.PI), 0.7); return edgeFloor + (1 - edgeFloor) * s; };
     const clampH = (h: number) => Math.min(h, H * 0.48);
     ctx.strokeStyle = altGrad(PRIMARY, PRIMARY_ALPHA * 1.05);
     ctx.lineWidth = 2.4;

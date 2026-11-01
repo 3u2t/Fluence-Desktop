@@ -177,7 +177,9 @@ class AuraVisualizer {
     // when a recording starts straight into continuous speech, and the meter
     // stays flat until the user's first pause). A loud-but-steady ambience
     // still re-anchors afterwards because spread stays negligible and the
-    // floor follows the steady level up. Until primed the meter stays calm.
+    // floor follows the steady level up. Until primed the gate stays closed;
+    // only the display mirrors the live level (cosmetically compressed), per
+    // the else branch below.
     if (!this.gatePrimed) {
       if (db > DIGITAL_SILENCE_DB) this.primeBuf.push(db);
       if (this.primeBuf.length >= 24) {
@@ -185,6 +187,25 @@ class AuraVisualizer {
         this.slowDb = Math.min(this.primeBuf[0], -55);
         this.fastDb = this.slowDb;
         this.gatePrimed = true;
+      } else {
+        // Display-only reactivity while the noise floor is being learned.
+        // Gate logic (gateOpen, slowDb, fastDb, primeBuf) is completely
+        // untouched - the reference still seeds identically. The paint
+        // mirrors the live level through a fixed compression (half gain,
+        // capped below the gated full scale, with the same calm floor) so
+        // the waveform tracks the user's voice from the first frame instead
+        // of idling flat for the ~0.8 s prime window. The mirror passes
+        // through the SAME asymmetric EMA as the gated meter below, so the
+        // pre- and post-prime displays share identical attack/decay
+        // dynamics and the hand-off is invisible. A hotkey chime may
+        // briefly flash during this window; the real gate still ignores it,
+        // so the meter reference is never misled.
+        const preGate = Math.min(0.6, raw * 0.5);
+        if (preGate > this.smoothedAmplitude) {
+          this.smoothedAmplitude = this.smoothedAmplitude * 0.50 + preGate * 0.50;
+        } else {
+          this.smoothedAmplitude = this.smoothedAmplitude * 0.85 + preGate * 0.15;
+        }
       }
       return;
     }
@@ -558,9 +579,9 @@ class AuraVisualizer {
   // exactly like the waves' parabolic-to-gradient edge treatment.
   _altGrad(ctx, W, hex, alpha) {
     const grad = ctx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, 'transparent');
+    grad.addColorStop(0, hexAlpha(hex, alpha * 0.22));
     grad.addColorStop(0.5, hexAlpha(hex, alpha));
-    grad.addColorStop(1, 'transparent');
+    grad.addColorStop(1, hexAlpha(hex, alpha * 0.22));
     return grad;
   }
 
@@ -573,7 +594,8 @@ class AuraVisualizer {
     const centerY = H / 2;
     // Pitch stays absolute pixels so tier width changes density, not shape.
     const count = W < 60 ? 7 : Math.min(25, Math.max(9, Math.floor(W / 6)));
-    const edge = (x) => Math.pow(Math.sin((x / W) * Math.PI), 1.22);
+    const edgeFloor = 0.22;
+    const edge = (x) => { const s = Math.pow(Math.sin((x / W) * Math.PI), 0.7); return edgeFloor + (1 - edgeFloor) * s; };
     const clampH = (h) => Math.min(h, H * 0.48);
 
     // Soft primary bed: taller, fainter, the background role.

@@ -337,6 +337,17 @@ export function BubblePage() {
             </div>
           </div>
         </div>
+
+        <div className="bubble-legend">
+          <span className="bubble-legend-item">
+            <span className="bubble-legend-dot bubble-legend-dot-t" aria-hidden="true" />
+            Transcription mode
+          </span>
+          <span className="bubble-legend-item">
+            <span className="bubble-legend-dot bubble-legend-dot-a" aria-hidden="true" />
+            Agent mode
+          </span>
+        </div>
       </TabsContent>
       </Tabs>
 
