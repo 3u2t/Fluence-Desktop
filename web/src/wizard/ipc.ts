@@ -58,6 +58,9 @@ export interface WizardSettings {
   audio_device_id: string | null;
   theme: string;
   first_run: boolean;
+  // Carried from the existing settings so a wizard re-run does not reset
+  // an explicit opt-out back to the default (issue #10 field).
+  copy_transcript_to_clipboard: boolean;
 }
 
 export const updateSettings = (settings: WizardSettings) =>

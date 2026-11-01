@@ -140,6 +140,14 @@ pub struct AppSettings {
     /// automatically — so no user data is deleted without user control.
     #[serde(default = "default_false")]
     pub debug_recordings_enabled: bool,
+    /// Keep the transcribed text on the clipboard after paste injection so
+    /// the user can paste it again with Ctrl+V (fallback when the target
+    /// field rejected the paste, and for multi-paste). OFF keeps today's
+    /// behavior: the clipboard returns to whatever the user had copied
+    /// before dictating. Default ON follows issue #10. Device-local by
+    /// design (not added to the sync allowlist).
+    #[serde(default = "default_true")]
+    pub copy_transcript_to_clipboard: bool,
 }
 
 fn default_hotkey() -> String {
@@ -238,6 +246,7 @@ impl Default for AppSettings {
             sync_enabled: default_false(),
             sync_account_key: None,
             debug_recordings_enabled: default_false(),
+            copy_transcript_to_clipboard: default_true(),
         }
     }
 }
@@ -416,6 +425,17 @@ pub fn save_settings(settings: &AppSettings) -> Result<()> {
     write_result
 }
 
+/// The `inject_text` clipboard-restore decision, pure so it is
+/// unit-testable. Some(true) keeps the transcript on the clipboard
+/// (restore skipped, issue #10); Some(false) restores the user's
+/// pre-injection clipboard; None (failed settings read) also restores,
+/// the fail-safe that matches pre-feature behavior.
+pub fn should_restore_clipboard(settings: Option<&AppSettings>) -> bool {
+    !settings
+        .map(|s| s.copy_transcript_to_clipboard)
+        .unwrap_or(false)
+}
+
 // Tauri commands
 #[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
@@ -521,6 +541,46 @@ mod tests {
         assert!(enabled.stt_streaming_enabled);
         assert!(!disabled.stt_streaming_enabled);
         assert!(!AppSettings::default().stt_streaming_enabled);
+    }
+
+    /// Settings files written before copy_transcript_to_clipboard existed
+    /// (issue #10) must parse and load the requested default: ON, so the
+    /// paste-again fallback works for existing installs. An explicit OFF
+    /// in the file is honored (restore-the-user's-clipboard behavior).
+    #[test]
+    fn legacy_settings_without_copy_transcript_flag_default_on() {
+        let legacy = r#"{"language": "fr"}"#;
+        let settings: AppSettings =
+            serde_json::from_str(legacy).expect("legacy settings must parse");
+        assert!(
+            settings.copy_transcript_to_clipboard,
+            "copy-to-clipboard must default ON for legacy settings files"
+        );
+        assert_eq!(settings.language, "fr");
+        let off: AppSettings =
+            serde_json::from_str(r#"{"copy_transcript_to_clipboard": false}"#).unwrap();
+        assert!(!off.copy_transcript_to_clipboard);
+    }
+
+    /// The restore-gate decision used by `inject_text`: ON keeps the
+    /// transcript on the clipboard (restore skipped), OFF restores, and a
+    /// failed settings read (None) restores too. Also asserts the
+    /// `Default` impl agrees with the serde default so the two cannot
+    /// drift (fresh installs take the ON path via `Default`).
+    #[test]
+    fn clipboard_restore_gate_failsafe_restores() {
+        let mut settings = AppSettings::default();
+        assert!(
+            settings.copy_transcript_to_clipboard,
+            "fresh-install default must be ON (issue #10)"
+        );
+        assert!(!should_restore_clipboard(Some(&settings)));
+        settings.copy_transcript_to_clipboard = false;
+        assert!(should_restore_clipboard(Some(&settings)));
+        assert!(
+            should_restore_clipboard(None),
+            "unreadable settings must keep today's restore behavior"
+        );
     }
 
     /// Removed experiment keys (exp_omit_temperature, exp_verbose_json_filter,

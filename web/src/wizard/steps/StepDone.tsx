@@ -2,6 +2,7 @@ import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { WizardData } from '../Wizard';
 import type { WizardSettings } from '../ipc';
+import { invokeCmd } from '@/ipc/tauri';
 import { closeWizard, showMainWindow, updateHotkeys, updateSettings } from '../ipc';
 
 interface StepDoneProps {
@@ -10,6 +11,17 @@ interface StepDoneProps {
 
 // Step 9: summary + finish actions. saveWizardSettings reproduces the
 // vanilla settings blob and hotkey registration verbatim.
+// The wizard blob is partial on purpose, but the clipboard opt-out must
+// not be reset by a wizard re-run: read it before saving.
+async function getStoredCopyTranscript(): Promise<{ copy_transcript_to_clipboard: boolean }> {
+  try {
+    const prev = await invokeCmd<{ copy_transcript_to_clipboard?: boolean }>('get_settings');
+    return { copy_transcript_to_clipboard: prev.copy_transcript_to_clipboard ?? true };
+  } catch {
+    return { copy_transcript_to_clipboard: true };
+  }
+}
+
 export function StepDone({ data }: StepDoneProps) {
   const save = async () => {
     try {
@@ -58,6 +70,7 @@ export function StepDone({ data }: StepDoneProps) {
         audio_device_id: null,
         theme: resolvedTheme,
         first_run: false,
+        ...(await getStoredCopyTranscript()),
       };
       await updateSettings(settings);
       await updateHotkeys({

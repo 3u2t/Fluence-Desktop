@@ -611,6 +611,15 @@ function setupStep6() {
 async function saveWizardSettings() {
   try {
     const usingOffline = !!wizardData.skipApiKey || wizardData.provider === 'Local Offline';
+    // The wizard blob is partial, but the clipboard-retention opt-out
+    // (issue #10) must not be reset by a wizard re-run: read it first.
+    let copyTranscript = true;
+    try {
+      const prev = await invoke('get_settings');
+      copyTranscript = prev.copy_transcript_to_clipboard !== false;
+    } catch {
+      // Unreadable settings: keep the default (ON).
+    }
     const settings = {
       hotkey: wizardData.hotkey,
       recording_mode: wizardData.recordingMode,
@@ -638,6 +647,7 @@ async function saveWizardSettings() {
       audio_device_id: null,
       theme: 'dark',
       first_run: false,
+      copy_transcript_to_clipboard: copyTranscript,
     };
     await invoke('update_settings', { settings });
     await invoke('update_hotkeys', {

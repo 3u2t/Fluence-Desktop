@@ -12,6 +12,7 @@ import { invokeCmd } from '@/ipc/tauri';
 export interface FluenceSettings {
   auto_learn_enabled?: boolean;
   auto_accept_enabled?: boolean;
+  copy_transcript_to_clipboard?: boolean;
   [key: string]: unknown;
 }
 

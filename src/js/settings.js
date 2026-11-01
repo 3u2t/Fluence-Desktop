@@ -168,6 +168,7 @@ function populateUI(s) {
   setChecked('auto-accept-cb', s.auto_accept_enabled === true);
   syncLearnAcceptUI();
   setChecked('sound-on-complete-cb', s.sound_on_complete ?? true);
+  setChecked('copy-transcript-cb', s.copy_transcript_to_clipboard !== false);
   // Retired Moonshine v1 id maps to its English successor (same mapping
   // the backend applies at load; belt-and-braces for any stale payload).
   const offlineEngine = s.offline_engine === 'moonshine_base' ? 'moonshine_v2_small' : (s.offline_engine || 'sensevoice');
@@ -1276,6 +1277,7 @@ const GENERAL_BINDINGS = [
   { id: 'auto-learn-cb',               key: 'auto_learn_enabled',    type: 'checkbox' },
   { id: 'auto-accept-cb',              key: 'auto_accept_enabled',   type: 'checkbox' },
   { id: 'sound-on-complete-cb',        key: 'sound_on_complete',     type: 'checkbox' },
+  { id: 'copy-transcript-cb',          key: 'copy_transcript_to_clipboard', type: 'checkbox' },
 ];
 
 function setupAutoApply() {

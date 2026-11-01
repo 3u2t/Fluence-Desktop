@@ -396,25 +396,42 @@ pub async fn inject_text(
         // learning. Agent-generated inserts use the same clipboard command
         // but are not transcription evidence. A paste that was never
         // delivered is not transcription evidence either.
+        //
+        // One settings read per injection covers both post-injection
+        // behaviors (auto-learn and clipboard keep). A failed read keeps
+        // today's behavior for each: no auto-learn, and the clipboard
+        // restore still runs.
+        let settings = crate::settings::load_settings().ok();
         let should_monitor = paste_ok
             && monitor_auto_learn.unwrap_or(false)
-            && crate::settings::load_settings()
+            && settings
+                .as_ref()
                 .map(|settings| settings.auto_learn_enabled)
                 .unwrap_or(false);
         if should_monitor {
             crate::auto_learn::start_post_injection_monitor(text.clone());
         }
 
-        // Restore only if Fluence still owns the clipboard. If the user or
-        // another application copied something during the paste window, do
-        // not overwrite that newer clipboard content. This runs even on a
-        // partial paste so the user's clipboard is returned.
-        sleep(Duration::from_millis(200)).await;
-        if clipboard_sequence_number() == fluence_clipboard_sequence
-            && get_clipboard_text().as_deref() == Some(text.as_str())
-        {
-            if let Some(original) = saved {
-                let _ = set_clipboard_text(&original);
+        // copy_transcript_to_clipboard (issue #10): keep the transcribed
+        // text on the clipboard so the user can paste it again with
+        // Ctrl+V, even when the paste itself failed or was blocked. With
+        // it on, the restore (and its 200ms wait) is skipped; with it
+        // off, today's behavior is unchanged. Agent insert/rewrite share
+        // this command intentionally: the issue scope names "Agent Mode
+        // text transformation" too.
+        let restore_clipboard = crate::settings::should_restore_clipboard(settings.as_ref());
+        if restore_clipboard {
+            // Restore only if Fluence still owns the clipboard. If the user or
+            // another application copied something during the paste window, do
+            // not overwrite that newer clipboard content. This runs even on a
+            // partial paste so the user's clipboard is returned.
+            sleep(Duration::from_millis(200)).await;
+            if clipboard_sequence_number() == fluence_clipboard_sequence
+                && get_clipboard_text().as_deref() == Some(text.as_str())
+            {
+                if let Some(original) = saved {
+                    let _ = set_clipboard_text(&original);
+                }
             }
         }
 

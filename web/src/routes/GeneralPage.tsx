@@ -67,6 +67,9 @@ export function GeneralPage({
   const [duck, setDuck] = useState(false);
   const [autoGrab, setAutoGrab] = useState(false);
   const [sound, setSound] = useState(false);
+  // Seeded with the backend default (ON) so a slow/failing settings load
+  // never displays a misleading OFF for the copy-transcript retention.
+  const [copyTranscript, setCopyTranscript] = useState(true);
 
   // One concern visible at a time (Providers pattern): shortcuts for the
   // hotkeys, audio for input/language/feedback, system for OS behavior.
@@ -142,6 +145,7 @@ export function GeneralPage({
         setDuck(s.duck_enabled === true);
         setAutoGrab(s.auto_grab_highlight !== false);
         setSound((s.sound_on_complete as boolean) ?? true);
+        setCopyTranscript(s.copy_transcript_to_clipboard ?? true);
         const storedDevice =
           typeof s.audio_device_id === 'string' ? s.audio_device_id : '';
         setAudioDevice(storedDevice);
@@ -528,6 +532,22 @@ export function GeneralPage({
                   aria-label="Play a sound when transcription completes"
                   checked={sound}
                   onCheckedChange={bindCheck(setSound, 'sound_on_complete')}
+                />
+              </Field>
+            </div>
+          </div>
+          <div className="setting-row">
+            <div className="setting-info">
+              <div className="setting-label">Copy Transcription to Clipboard</div>
+              <div className="setting-desc">Your dictated text and agent results stay on the clipboard after each dictation, even if the paste fails, so you can paste them again with Ctrl+V. Turn this off to keep your earlier copied text instead.</div>
+            </div>
+            <div className="setting-control">
+              <Field>
+                <Switch
+                  id="copy-transcript-cb"
+                  aria-label="Keep dictated text on the clipboard"
+                  checked={copyTranscript}
+                  onCheckedChange={bindCheck(setCopyTranscript, 'copy_transcript_to_clipboard')}
                 />
               </Field>
             </div>
