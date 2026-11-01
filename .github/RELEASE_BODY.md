@@ -1,27 +1,16 @@
-<!--
-     Release notes convention: this file ALWAYS contains the notes the next
-     pushed tag publishes. release.yml reads it verbatim, so there is exactly
-     one copy, edit here, never in the workflow. Replace this ENTIRE file
-     (this comment included) when cutting a release. Keep the language plain:
-     write for the person using Fluence, not for the person building it. -->
+## Reactive amp bars and voice-following startup
 
-## Waveform animation choices and cleaner completion
+### Your waveform responds from the first moment
 
-### Waves or Amp Bars for your recording overlay
+Recording now starts visibly smooth: the waveform tracks your voice within the first fraction of a second, ramps in cleanly, and no longer stays flat or twitches while the noise floor is still being learned.
 
-You can now customize how the floating recording bubble animates while you speak. In Settings under Floating Bubble, look for the new **Waveform Animation** section:
-- **Waves**: Three layered ripples. The signature animation Fluence ships with.
-- **Amp Bars**: Vertical equalizer bars that rise and fall with your voice volume.
+### Amp bars light up across the whole row
 
-The selected style shows a live preview directly in the settings window, and adapts to your system motion settings.
-
-### Cleaner completion feedback
-
-When Fluence finishes typing your dictation into an app, the overlay now gives you a clean, distraction-free visual checkmark without obscuring your screen with extra text. The text remains fully accessible for screen readers and tooltips.
+In Amp Bars style, the bars near the left and right edges of the overlay now react just like the centre ones, so the entire row dances with your voice instead of only the middle.
 
 ### What stays the same
 
-Your audio detection, dictation shortcuts, language models, history, snippets, and sync data are completely unaffected. The waveform animation pick is saved locally on your device.
+Your audio detection, dictation shortcuts, language models, history, snippets, settings, and sync data are completely unaffected. Quiet rooms still produce a calm, low waveform, and background noise or the hotkey chime does not inflate the meter. The changes in this release are visual only.
 
 ### Known limitations
 
